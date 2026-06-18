@@ -69,7 +69,7 @@ class BlackBoxAI:
         else:
             self.action_lists = action_lists
 
-        # 🔧 Fix: 뮤터블 기본값 문제 — None을 기본으로 사용
+        #  Fix: 뮤터블 기본값 문제 — None을 기본으로 사용
         if hidden_layers is None:
             hidden_layers = [128]
         if isinstance(hidden_layers, int):
@@ -88,7 +88,7 @@ class BlackBoxAI:
 
         # RL 전용 버퍼 (직전 rl() 한 스텝)
         self._rl_log_probs     = []
-        # 🔧 Fix: 에피소드 버퍼에 추가된 실제 객체 참조를 별도 보관
+        #  Fix: 에피소드 버퍼에 추가된 실제 객체 참조를 별도 보관
         self._rl_step_ref       = None
         # 에피소드 버퍼 (with episode(): 내 rl() 누적 — reward() 받은 것은 제외)
         self._episode_log_probs = []
@@ -187,7 +187,7 @@ class BlackBoxAI:
         # 에피소드 진행 중이면 순서대로 누적 (같은 리스트 객체를 참조)
         if self._in_episode:
             self._episode_log_probs.append(current_lps)
-            # 🔧 Fix: 에피소드 버퍼에 추가한 객체 참조를 저장 (reward()에서 제거용)
+            #  Fix: 에피소드 버퍼에 추가한 객체 참조를 저장 (reward()에서 제거용)
             self._rl_step_ref = current_lps
         else:
             self._rl_step_ref = None
@@ -210,7 +210,7 @@ class BlackBoxAI:
         if not args:
             return None
 
-        # 🔧 Fix: 다중 헤드 지원 — 마지막 인자가 리스트(헤드별 정답)이거나
+        #  Fix: 다중 헤드 지원 — 마지막 인자가 리스트(헤드별 정답)이거나
         # 단일 문자열인 경우 모두 처리
         last = args[-1]
         if isinstance(last, (list, tuple)) and len(last) == len(legal_action_lists) \
@@ -278,7 +278,7 @@ class BlackBoxAI:
         loss.backward()
         self.optimizer.step()
 
-        # 🔧 Fix: _rl_step_ref(에피소드 버퍼에 추가된 실제 객체)로 제거
+        #  Fix: _rl_step_ref(에피소드 버퍼에 추가된 실제 객체)로 제거
         # 이전 코드는 _rl_log_probs가 덮어써진 경우 참조가 달라 제거가 안 됐음
         if self._rl_step_ref is not None and self._rl_step_ref in self._episode_log_probs:
             self._episode_log_probs.remove(self._rl_step_ref)
@@ -300,7 +300,7 @@ class BlackBoxAI:
         with ai.episode(): 블록이 끝난 뒤에도 호출 가능.
         reward()를 받지 않은 에피소드 내 모든 rl() 선택에 한꺼번에 역전파합니다.
         """
-        # 🔧 Fix: _in_episode 조건 제거 — with 블록 밖 지연 호출도 허용
+        #  Fix: _in_episode 조건 제거 — with 블록 밖 지연 호출도 허용
         # (독스트링에 명시된 동작과 일치하도록 수정)
         if not self._episode_log_probs:
             print(f" [{self.model_name}] 에피소드 버퍼가 비어 있습니다. "
