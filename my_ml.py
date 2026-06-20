@@ -1,4 +1,4 @@
-﻿import torch
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
@@ -61,22 +61,41 @@ class _Network(nn.Module):
 # [핵심] 통합 AI 클래스
 # ─────────────────────────────────────────────
 class BlackBoxAI:
-    def __init__(self, model_name, action_lists=None, hidden_layers=None, reset=False):
+    # 지원하는 옵티마이저 이름 목록
+    _OPTIMIZER_MAP = {
+        'adam':    optim.Adam,
+        'sgd':     optim.SGD,
+        'rmsprop': optim.RMSprop,
+        'adagrad': optim.Adagrad,
+    }
+
+    def __init__(self, model_name, action_lists=None, hidden_layers=None,
+                 optimizer='adam', lr=0.01, reset=False):
         self.model_name = model_name
-        
+
         if action_lists and isinstance(action_lists[0], str):
             self.action_lists = [action_lists]
         else:
             self.action_lists = action_lists
 
-        #  Fix: 뮤터블 기본값 문제 — None을 기본으로 사용
+        # 뮤터블 기본값 문제 — None을 기본으로 사용
         if hidden_layers is None:
             hidden_layers = [128]
         if isinstance(hidden_layers, int):
             self.hidden_layers = [hidden_layers]
         else:
             self.hidden_layers = list(hidden_layers)
-            
+
+        # 옵티마이저 설정
+        optimizer = optimizer.lower()
+        if optimizer not in self._OPTIMIZER_MAP:
+            raise ValueError(
+                f" [{model_name}] 지원하지 않는 옵티마이저: '{optimizer}'. "
+                f"사용 가능: {list(self._OPTIMIZER_MAP.keys())}"
+            )
+        self.optimizer_name = optimizer
+        self.lr             = lr
+
         self.file_name    = f"{model_name}_ml_memory.pth"
         self.network      = None
         self.optimizer    = None
@@ -93,6 +112,11 @@ class BlackBoxAI:
         # 에피소드 버퍼 (with episode(): 내 rl() 누적 — reward() 받은 것은 제외)
         self._episode_log_probs = []
         self._in_episode        = False
+
+    # ── 내부 공통: 옵티마이저 생성 ──
+    def _build_optimizer(self):
+        cls = self._OPTIMIZER_MAP[self.optimizer_name]
+        return cls(self.network.parameters(), lr=self.lr)
 
     # ── 내부 공통: 네트워크 초기화 및 가중치 로드 ──
     def _ensure_network(self, input_size):
@@ -115,6 +139,11 @@ class BlackBoxAI:
                         self.action_lists = loaded_data.get("action_lists", None)
                     if "hidden_layers" in loaded_data:
                         self.hidden_layers = loaded_data["hidden_layers"]
+                    # 저장된 옵티마이저 정보가 있으면 복원 (make()에서 명시하지 않은 경우)
+                    if "optimizer_name" in loaded_data:
+                        self.optimizer_name = loaded_data["optimizer_name"]
+                    if "lr" in loaded_data:
+                        self.lr = loaded_data["lr"]
                 else:
                     saved_state_dict = loaded_data
 
@@ -137,7 +166,7 @@ class BlackBoxAI:
             raise ValueError(f" [{self.model_name}] 모델을 처음 생성할 때는 action_lists(전체 액션)를 지정해야 합니다.")
 
         self.network   = _Network(input_size, self.hidden_layers, self.action_lists)
-        self.optimizer = optim.Adam(self.network.parameters(), lr=0.01)
+        self.optimizer = self._build_optimizer()
 
         if saved_state_dict is not None:
             self.network.load_state_dict(saved_state_dict)
@@ -319,12 +348,14 @@ class BlackBoxAI:
 
     # ── 저장 ──
     def save(self):
-        """학습된 가중치와 전체 액션 리스트, 은닉층 구조를 파일로 저장합니다."""
+        """학습된 가중치와 전체 액션 리스트, 은닉층 구조, 옵티마이저 정보를 파일로 저장합니다."""
         if self.network is not None:
             save_data = {
-                "state_dict": self.network.state_dict(),
-                "action_lists": self.action_lists,
-                "hidden_layers": self.hidden_layers
+                "state_dict"    : self.network.state_dict(),
+                "action_lists"  : self.action_lists,
+                "hidden_layers" : self.hidden_layers,
+                "optimizer_name": self.optimizer_name,
+                "lr"            : self.lr,
             }
             torch.save(save_data, self.file_name)
             print(f" [{self.model_name}] 저장 완료.")
@@ -333,7 +364,8 @@ class BlackBoxAI:
 # ─────────────────────────────────────────────
 # [공개 API] 팩토리 함수
 # ─────────────────────────────────────────────
-def make(model_name, action_lists=None, hidden_layers=None, reset=False):
+def make(model_name, action_lists=None, hidden_layers=None,
+         optimizer='adam', lr=0.01, reset=False):
     """
     BlackBoxAI 인스턴스를 생성합니다.
 
@@ -341,9 +373,12 @@ def make(model_name, action_lists=None, hidden_layers=None, reset=False):
         model_name    : 모델 이름 (가중치 파일명에 사용)
         action_lists  : 가능한 모든 액션 목록의 리스트
         hidden_layers : 은닉층 구조 리스트 예) [128, 64]  (기본값: [128])
+        optimizer     : 옵티마이저 종류  'adam' | 'sgd' | 'rmsprop' | 'adagrad'  (기본값: 'adam')
+        lr            : 학습률  (기본값: 0.01)
         reset         : True이면 기존 가중치를 삭제하고 처음부터 시작
     """
-    return BlackBoxAI(model_name, action_lists, hidden_layers=hidden_layers, reset=reset)
+    return BlackBoxAI(model_name, action_lists, hidden_layers=hidden_layers,
+                      optimizer=optimizer, lr=lr, reset=reset)
 
 
 # ─────────────────────────────────────────────

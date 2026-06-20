@@ -30,12 +30,23 @@ from my_ml import make
 
 ```python
 ai = make(
-    model_name   = "MyModel",          # 가중치 파일 이름에 사용됩니다.
-    action_lists = ["가위", "바위", "보"],  # 가능한 모든 액션의 목록입니다.
+    model_name    = "MyModel",          # 가중치 파일 이름에 사용됩니다.
+    action_lists  = ["가위", "바위", "보"],  # 가능한 모든 액션의 목록입니다.
     hidden_layers = [128, 64],          # 은닉층 구조입니다. 기본값은 [128]입니다.
-    reset        = False               # True로 설정하면 기존 가중치를 삭제합니다.
+    optimizer     = "adam",             # 옵티마이저를 선택합니다. 기본값은 'adam'입니다.
+    lr            = 0.01,               # 학습률입니다. 기본값은 0.01입니다.
+    reset         = False               # True로 설정하면 기존 가중치를 삭제합니다.
 )
 ```
+
+**지원하는 옵티마이저**
+
+| 이름 | 설명 | 권장 상황 |
+|---|---|---|
+| `'adam'` | Adam (기본값) | 대부분의 경우 무난하게 사용 |
+| `'sgd'` | 확률적 경사하강법 | 단순한 문제, 세밀한 조정이 필요할 때 |
+| `'rmsprop'` | RMSprop | 순차 데이터, 비정상(non-stationary) 환경 |
+| `'adagrad'` | Adagrad | 희소(sparse) 데이터가 많은 경우 |
 
 - `action_lists`에 문자열 리스트를 직접 전달하면 단일 출력 헤드로 동작합니다.
 - 다중 출력이 필요한 경우 `[리스트A, 리스트B]` 형태로 전달합니다.
