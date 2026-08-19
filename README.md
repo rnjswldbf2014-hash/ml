@@ -1,254 +1,196 @@
-# BlackBox AI — 사용 설명서
+# dplayg
 
-PyTorch 기반의 간결한 머신러닝 인터페이스입니다.  
-내부 구조를 몰라도 세 가지 모듈 중 하나를 가져와 몇 줄의 코드만으로 AI를 학습시키고 예측에 활용할 수 있습니다.
+D 언어로 구현한 강화학습 / 지도학습 라이브러리입니다.
+`my_ml.d` 를 빌드하면 `my_ml.pyd` 가 나오고, 파이썬에서 `import my_ml` 로 씁니다.
 
 ---
 
-## 모듈 개요
+## 설계 원칙
 
-| 모듈 | 학습 방식 | 권장 용도 |
+이 라이브러리의 함수는 **데이터를 만드는 함수** 와 **모델을 바꾸는 함수** 로 나뉩니다.
+
+| 함수 | 순수? | 하는 일 |
 |---|---|---|
-| `my_ml.py` | 강화학습 + 지도학습 통합 | 합법 액션 마스킹이 필요한 복잡한 환경 |
-| `my_rl.py` | 강화학습 (Policy Gradient) | 보상 신호만으로 학습하는 환경 |
-| `my_sl.py` | 지도학습 (Cross-Entropy) | 정답이 명확히 주어지는 분류 문제 |
+| `rl()` | 순수 | `(입력, 출력)` 데이터만 만듭니다. 가중치를 건드리지 않습니다. |
+| `reward()` | 순수 | `(입력, 출력, 보상)` 데이터만 만듭니다. |
+| `episode()` | 순수 | 여러 스텝에 같은 보상을 매깁니다. |
+| `predict()` | 순수 | 샘플링 없이 최선의 값만 봅니다. |
+| **`save()`** | **아님** | **역전파 + 파일 저장. 모델이 바뀌는 유일한 곳입니다.** |
+
+`rl()` 을 몇 번을 부르든 모델은 그대로입니다. 학습은 `save()` 를 부를 때만 일어납니다.
 
 ---
 
-## my_ml.py — 통합 모듈
-
-강화학습과 지도학습을 하나의 인터페이스로 제공합니다.  
-합법 액션 마스킹, 에피소드 단위 학습, 다중 출력 헤드를 지원합니다.
-
-### 가져오기
-
-```python
-from my_ml import make
-```
-
-### 모델 생성
-
-```python
-ai = make(
-    model_name    = "MyModel",          # 가중치 파일 이름에 사용됩니다.
-    action_lists  = ["가위", "바위", "보"],  # 가능한 모든 액션의 목록입니다.
-    hidden_layers = [128, 64],          # 은닉층 구조입니다. 기본값은 [128]입니다.
-    optimizer     = "adam",             # 옵티마이저를 선택합니다. 기본값은 'adam'입니다.
-    reset         = False               # True로 설정하면 기존 가중치를 삭제합니다.
-)
-```
-
-**지원하는 옵티마이저**
-
-| 이름 | 설명 | 권장 상황 |
-|---|---|---|
-| `'adam'` | Adam (기본값) | 대부분의 경우 무난하게 사용 |
-| `'sgd'` | 확률적 경사하강법 | 단순한 문제, 세밀한 조정이 필요할 때 |
-| `'rmsprop'` | RMSprop | 순차 데이터, 비정상(non-stationary) 환경 |
-| `'adagrad'` | Adagrad | 희소(sparse) 데이터가 많은 경우 |
-
-- `action_lists`에 문자열 리스트를 직접 전달하면 단일 출력 헤드로 동작합니다.
-- 다중 출력이 필요한 경우 `[리스트A, 리스트B]` 형태로 전달합니다.
-- 가중치는 `{model_name}_ml_memory.pth` 파일에 자동으로 저장됩니다.
-
----
-
-### 강화학습 — `rl()` / `reward()`
-
-보상 신호를 통해 학습합니다. 매 스텝마다 합법 액션 목록을 전달하면  
-AI가 확률적으로 하나를 선택하여 반환합니다.
-
-```python
-# 기본 사용 예시
-chosen = ai.rl(legal_actions, *환경값들)
-# 결과 확인 후 보상 부여
-ai.reward(+1.0)   # 양수: 잘한 선택, 음수: 잘못된 선택
-```
-
-```python
-# 예시: 현재 합법 수가 ["가위", "보"]인 경우
-chosen = ai.rl(["가위", "보"], 체력, 라운드, 상대_패턴)
-if chosen == 정답:
-    ai.reward(+1.0)
-else:
-    ai.reward(-1.0)
-```
-
----
-
-### 강화학습 — 에피소드 단위 (`episode()` / `last_reward()`)
-
-여러 스텝에 걸친 결과를 한꺼번에 학습시킬 때 사용합니다.
-
-```python
-with ai.episode():
-    move1 = ai.rl(legal_moves_1, *상태1)
-    move2 = ai.rl(legal_moves_2, *상태2)
-    move3 = ai.rl(legal_moves_3, *상태3)
-    # 중간에 개별 보상을 줄 수도 있습니다.
-    # ai.reward(+0.5)  →  해당 스텝은 last_reward() 대상에서 제외됩니다.
-
-# with 블록 밖에서 지연 호출도 가능합니다.
-ai.last_reward(+1.0)   # 보상받지 않은 모든 스텝에 일괄 역전파합니다.
-```
-
----
-
-### 지도학습 — `sl()`
-
-정답을 마지막 인자로 전달하면 학습하고, 생략하면 예측만 수행합니다.
-
-```python
-# 학습 + 예측
-predicted = ai.sl(legal_actions, *환경값들, 정답)
-
-# 예측만 (학습 없음)
-predicted = ai.sl(legal_actions, *환경값들)
-```
-
-```python
-# 예시
-result = ai.sl(["가위", "바위", "보"], 라운드, 점수, "바위")
-```
-
-**다중 헤드 학습** — 정답을 리스트로 전달합니다.
-
-```python
-result = ai.sl(
-    [["가위", "바위", "보"], ["공격", "방어"]],
-    *환경값들,
-    ["바위", "공격"]   # 각 헤드의 정답을 순서대로 담은 리스트
-)
-```
-
----
-
-### 저장 — `save()`
-
-학습이 끝난 후 호출하면 가중치, 액션 목록, 은닉층 구조를 파일로 저장합니다.  
-다음 실행 시 자동으로 불러옵니다.
-
-```python
-ai.save()
-```
-
----
-
-## my_rl.py — 강화학습 전용 모듈
-
-합법 액션 마스킹 없이 전체 액션 공간에서 강화학습을 수행합니다.
-
-### 가져오기 및 모델 생성
-
-```python
-from my_rl import make
-
-ai = make(
-    model_name   = "MyModel",
-    action_lists = [["가위", "바위", "보"]],
-    reset        = False
-)
-```
-
-### 사용 방법
-
-```python
-# 환경값 전달 → 액션 선택
-outputs = ai.env(체력, 라운드, 점수)
-chosen  = outputs[0]   # 단일 헤드인 경우
-
-# 보상 부여 → 학습
-ai.reward(+1.0)
-
-# 저장
-ai.save()
-```
-
-> **참고** `my_rl.py`는 합법 액션 마스킹을 지원하지 않습니다.  
-> 액션 마스킹이 필요한 경우 `my_ml.py`의 `rl()` 사용을 권장합니다.
-
----
-
-## my_sl.py — 지도학습 전용 모듈
-
-단일 입력값과 정답을 전달하는 간단한 분류 학습에 적합합니다.
-
-### 가져오기 및 모델 생성
-
-```python
-from my_sl import make
-
-ai = make(
-    model_name   = "MyModel",
-    action_lists = [["가위", "바위", "보"]],
-    reset        = False
-)
-```
-
-### 사용 방법
-
-```python
-# 학습 + 예측
-result = ai.env(입력값, "바위")
-
-# 예측만
-result = ai.env(입력값)
-
-# 저장
-ai.save()
-```
-
----
-
-## 모델 초기화
-
-`reset()` 또는 `resset()` 함수가 전역 빌트인으로 등록되어 있어  
-어느 모듈을 불러왔더라도 바로 사용할 수 있습니다.
-
-```python
-import my_ml   # 또는 my_rl, my_sl 중 하나만 불러와도 됩니다.
-
-reset("MyModel")    # MyModel 관련 가중치 파일을 모두 삭제합니다.
-resset("MyModel")   # 동일한 동작입니다.
-```
-
-삭제 대상 파일:
-
-- `MyModel_ml_memory.pth`
-- `MyModel_sl_memory.pth`
-- `MyModel_auto_memory.pth`
-
----
-
-## 전체 사용 예시 (my_ml.py)
+## 모델 만들기
 
 ```python
 from my_ml import make
 
-모든_수 = ["가위", "바위", "보"]
-ai = make("가위바위보_AI", 모든_수)
-
-for 라운드 in range(1000):
-    합법_수 = ["가위", "바위", "보"]   # 상황에 따라 제한 가능
-    선택 = ai.rl(합법_수, 라운드 / 1000)
-
-    정답 = "바위"   # 예시 정답
-    if 선택 == 정답:
-        ai.reward(+1.0)
-    else:
-        ai.reward(-1.0)
-
-ai.save()
+ai = make("MyModel", [12, 128, 128, 3], ["왼쪽", "오른쪽", "정지"])
 ```
 
----
-
-## 가중치 파일 위치
-
-가중치 파일은 스크립트를 실행하는 **현재 작업 디렉터리**에 생성됩니다.
-
-| 모듈 | 파일명 형식 |
+| 인자 | 설명 |
 |---|---|
-| `my_ml.py` | `{model_name}_ml_memory.pth` |
-| `my_rl.py` | `{model_name}_auto_memory.pth` |
-| `my_sl.py` | `{model_name}_sl_memory.pth` |
+| 1번째 | 모델 이름. 가중치 파일명(`이름_ml_memory.pth`)에 씁니다. |
+| 2번째 | 레이어 구조 `[입력수, 은닉..., 출력수]`. 은닉층은 몇 개든 됩니다. |
+| 3번째 | 출력 이름 목록. 개수가 출력수와 같아야 합니다. `"cos"` 면 숫자 모드. |
+| `optimizer` | `'adam'`(기본) / `'sgd'` / `'rmsprop'` / `'adagrad'` |
+
+같은 이름의 파일이 있으면 이어서 학습합니다.
+단, 저장된 구조가 요청한 `layers` 와 다르면 파일을 무시하고 새로 만듭니다.
+
+---
+
+## 강화학습
+
+```python
+step   = ai.rl([0.1, 0.2, ...])        # → Step(input, output)
+scored = ai.reward(step, +1.0)         # → Scored(input, output, point)
+ai.save(scored)                        # 학습 + 저장
+```
+
+`step.input` / `step.output` 으로 꺼내 쓰고, 언패킹도 됩니다.
+
+```python
+입력, 출력 = ai.rl([0.5])
+```
+
+### 묶어서 학습 (권장)
+
+한 번에 여러 스텝을 넘기면 그만큼 빨라집니다.
+
+```python
+batch = []
+for i in range(32):
+    step = ai.rl([i / 32])
+    point = +1.0 if step.output == "왼쪽" else -1.0
+    batch.append(ai.reward(step, point))
+ai.save(batch)
+```
+
+### 에피소드 단위 보상
+
+게임이 끝난 뒤 결과를 알 때 씁니다.
+
+```python
+steps = [ai.rl(상태) for 상태 in 게임진행()]
+ai.save(ai.episode(steps, +1.0 if 이겼으면 else -1.0))
+```
+
+### 고를 수 있는 것이 제한될 때
+
+```python
+step = ai.rl(상태, legal=["왼쪽", "정지"])   # 이 중에서만 고릅니다
+```
+
+---
+
+## 숫자 출력 (cos 모드)
+
+액션 이름 대신 `"cos"` 를 넘기면 실수를 반환합니다.
+
+```python
+ai = make("NumModel", [2, 64, 1], "cos")
+
+step = ai.rl([0.5, 0.5])
+print(step.output)                       # 예: 2.9614  (float)
+
+오차 = abs(step.output - 3.0)
+ai.save(ai.reward(step, 1.0 - 오차))     # 3.0 에 가까울수록 높은 점수
+```
+
+---
+
+## 지도학습
+
+정답을 알고 있을 때 씁니다.
+
+```python
+ai.sl([0.1, 0.2, 0.3], "왼쪽")   # 정답을 주면 학습하고 예측을 반환
+ai.sl([0.1, 0.2, 0.3])           # 정답이 없으면 예측만
+```
+
+## 예측만 하기
+
+학습도 샘플링도 없이, 가장 점수가 높은 것을 반환합니다.
+
+```python
+ai.predict([0.1, 0.2, 0.3])
+```
+
+---
+
+## 그 밖에
+
+```python
+from my_ml import gc_disable, gc_collect
+
+gc_disable()    # 학습 루프 전. D GC 를 멈춰 중간 끊김을 없앱니다.
+...
+gc_collect()    # 학습 후. GC 재개 + 수집.
+
+resset("MyModel")   # 저장된 가중치 파일 삭제
+```
+
+---
+
+## 예전 버전에서 넘어오기
+
+v0.1 과 v0.2 는 API 가 호환되지 않습니다. 예전 코드는 그대로 돌아가지 않습니다.
+예전 버전이 필요하면 `git checkout v0.1` 로 돌아갈 수 있습니다.
+
+### 가중치 파일 변환
+
+```python
+from my_ml import change
+
+change("MyModel")     # MyModel_ml_memory.pth 를 새 포맷으로
+```
+
+원본은 `.bak` 으로 남습니다. 이미 새 포맷이면 아무것도 하지 않습니다.
+예전에 출력 헤드를 여러 개 썼다면 첫 번째만 남고 나머지는 버려집니다.
+
+### 바뀐 것
+
+| v0.1 | v0.2 |
+|---|---|
+| `make("M", ["A","B"], hidden_layers=[128])` | `make("M", [입력수, 128, 2], ["A","B"])` |
+| `chosen = ai.rl(acts, 체력, 라운드)` | `step = ai.rl([체력, 라운드])` |
+| `ai.reward(+1)` — 여기서 학습 | `ai.save(ai.reward(step, +1))` — 여기서 학습 |
+| `with ai.episode():` | `ai.episode(steps, 점수)` |
+| `ai.save()` | `ai.save(scored)` — 인자 필수 |
+| `ai.step()`, `ai.last_reward()` | 없어짐 |
+| `make(..., reset=True)` | 없어짐 (`resset("M")` 로 파일 삭제) |
+
+`reward()` 는 이름이 그대로지만 **더 이상 학습하지 않습니다.** 데이터만 만듭니다.
+예전 코드가 에러 없이 조용히 학습만 안 되는 상태가 되니 주의하세요.
+
+---
+
+## 빌드
+
+```powershell
+$ldc   = "ldc2\ldc2-1.42.0-windows-x64\bin\ldc2.exe"
+$pylib = "$env:LOCALAPPDATA\Programs\Python\Python313\libs\python313.lib"
+& $ldc my_ml.d $pylib --O3 --release --shared --link-defaultlib-shared=false "-of=my_ml.pyd"
+Remove-Item my_ml.obj, my_ml.lib, my_ml.exp -ErrorAction SilentlyContinue
+```
+
+`"-of=my_ml.pyd"` 의 따옴표는 필수입니다. 빼면 PowerShell 이 인자를 쪼개
+`Error: unrecognized file extension pyd` 로 실패합니다.
+
+---
+
+## 성능
+
+배치 1 온라인 학습(이 라이브러리의 주 용도)에서는 파이토치보다 빠릅니다.
+직접 작성한 네이티브 파이토치 코드와 같은 조건으로 비교한 결과입니다.
+
+| 구성 | 이 라이브러리 | 네이티브 PyTorch |
+|---|---|---|
+| `[1, 128, 3]` | **9.0 µs** | 707 µs |
+| `[64, 128, 3]` | **91 µs** | 1,093 µs |
+| `[256, 512, 3]` | 1,284 µs | **1,161 µs** |
+
+망이 커지면(대략 13만 파라미터 이상) 파이토치가 유리해집니다.
+배치 학습이 가능한 작업이라면 파이토치 쪽이 샘플당 훨씬 빠릅니다.

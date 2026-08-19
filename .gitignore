@@ -21,6 +21,8 @@ Thumbs.db
 
 # D build artifacts
 *.pyd
+*.dll
 *.lib
 *.obj
+*.exp
 ldc2/
