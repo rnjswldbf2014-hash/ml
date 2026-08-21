@@ -17,14 +17,14 @@ Remove-Item my_ml.obj, my_ml.lib, my_ml.exp -ErrorAction SilentlyContinue
 
 ## 파일
 
-- `my_ml.d` — D 소스 (신경망 + 트랜스포머 + Python C API + Python 클래스 코드 인라인)
+- `my_ml.d` — D 소스 (신경망 + Python C API + Python 클래스 코드 인라인)
 - `my_ml.pyd` — 빌드 결과물 (gitignore)
 - `main.py` — 빈 파일. 사용자가 여기에 작성한다.
 
 ## API
 
 ```python
-from my_ml import make, cos, attn, make_lm
+from my_ml import make, cos, attn, tok
 
 # layers 는 [입력수, 은닉...] 만. 출력 개수는 outputs 에서 정해진다.
 ai = make("이름", [입력수, 은닉...], ["액션A", "액션B"])     # 고르기 1개
@@ -47,11 +47,11 @@ change("이름")                     # 예전 포맷 가중치 → 현재 포맷
 ai = make("이름", [입력, 128, attn(8), 128], 출력)
 ai = make("이름", [입력, 128, attn(8, 2), 128], 출력)   # 조각 8, 헤드 2
 
-# 언어 모델. 토큰은 0~vocab-1 의 정수 (글자↔번호 변환은 쓰는 쪽 몫)
-lm = make_lm("이름", vocab=100, dim=128, layers=3, heads=4, ctx=48)
-lm.sl(토큰리스트, steps=2000)    # 다음 토큰이 정답이라 라벨 불필요
-lm.gen(시작토큰, 40, temp=0.5)   # 이어 쓰기 -> 숫자 리스트
-lm.save()                        # 이름_lm.pth
+# 토큰 입력: 번호만 넘기고 펼치는 건 안에서 (one-hot 을 넘기면 데이터가 수백 배)
+ai = make("이름", [tok(어휘수, 길이, 폭), 256, attn(8), 256], 출력)
+
+# 묶음 학습: 기울기를 모았다가 갱신 1번. 하나씩 부르는 것보다 10배 이상 빠르다.
+ai.sl([입력1, 입력2, ...], [정답1, 정답2, ...])
 ```
 
 출력이 여러 개면 `output`, `reward` 의 점수, `sl` 의 정답이 모두 리스트다.
@@ -66,6 +66,7 @@ lm.save()                        # 이름_lm.pth
 
 - `cos` 값은 0 근처에서 시작한다. 원하는 범위가 있으면 쓰는 쪽에서 펼쳐 쓴다.
   예) `파워 = 20 + 출력 * 10`
+- `sl()` 을 하나씩 부르면 문제마다 가중치 전체를 갱신해서 매우 느리다. 묶음으로 준다.
 - 드문 행동을 지도학습시킬 때는 여러 번 반복해야 한다.
   안 그러면 흔한 행동만 답하는 쪽으로 굳는다.
   (전체의 4% 인 행동은 "안 한다" 고만 답해도 96점이라 그쪽으로 수렴한다)
