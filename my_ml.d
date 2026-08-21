@@ -693,14 +693,6 @@ class BlackBoxAI {
     Network net;
     bool    ready;
 
-    // 토큰 입력: 번호 tokLen 개 -> 각 tokW 칸으로 펼쳐 신경망에 넣는다.
-    // (파이썬에서 one-hot 을 만들어 넘기면 데이터가 수백 배로 불어나므로 여기서 처리)
-    bool    tokenInput;
-    int     tokV, tokLen, tokW;
-    float[] emb, gEmb, mEmb, vEmb;
-    int     embT;
-    private int[] _tokBuf;
-
     private float[]   _envBuf;
     private float[][] _probBufs;   // 헤드별 확률 스크래치
     private int[][]   _maskBufs;   // 헤드별 마스크 스크래치
@@ -709,11 +701,8 @@ class BlackBoxAI {
 
     this(string name, int inputSz, ubyte[] lk, int[] la, int[] lb, int[] heads,
          string[][] actions, bool[] cos,
-         Opt opt = Opt.adam, float sigma = 1.0f, float ent = 0.01f,
-         int tv = 0, int tl = 0, int tw = 0) {
+         Opt opt = Opt.adam, float sigma = 1.0f, float ent = 0.01f) {
         this.name = name; this.opt = opt;
-        tokV = tv; tokLen = tl; tokW = tw;
-        tokenInput = (tv > 0 && tl > 0 && tw > 0);
         cosSigma = sigma; entropy = ent;
         layKind = lk.dup; layA = la.dup; layB = lb.dup;
         hiddenSizes = [];
@@ -770,36 +759,7 @@ class BlackBoxAI {
         _allocBufs();
     }
 
-    private void _initEmb() {
-        if (!tokenInput || emb.length) return;
-        emb  = new float[tokV*tokW]; gEmb = new float[tokV*tokW];
-        mEmb = new float[tokV*tokW]; vEmb = new float[tokV*tokW];
-        gEmb[] = 0f; mEmb[] = 0f; vEmb[] = 0f;      // D 는 new float[] 를 NaN 으로 채운다
-        float sc = 0.05f;
-        foreach (i; 0..tokV*tokW) emb[i] = uniform(-sc, sc, rng);
-        _tokBuf = new int[tokLen]; _tokBuf[] = 0;
-    }
-
-    // 토큰 번호 -> _envBuf 로 펼치기
-    private void _embed(const(int)[] toks) nothrow @nogc {
-        foreach (k; 0..tokLen) {
-            int id = k < toks.length ? toks[k] : 0;
-            if (id < 0 || id >= tokV) id = 0;
-            _tokBuf[k] = id;
-            foreach (i; 0..tokW) _envBuf[k*tokW + i] = emb[id*tokW + i];
-        }
-    }
-
-    // 입력쪽 기울기를 임베딩에 되돌린다
-    private void _embedBack() nothrow @nogc {
-        foreach (k; 0..tokLen) {
-            int id = _tokBuf[k];
-            foreach (i; 0..tokW) gEmb[id*tokW + i] += net._dA[k*tokW + i];
-        }
-    }
-
     private void _allocBufs() {
-        _initEmb();
         _envBuf   = new float[net.inputSz];
         _probBufs = new float[][nHeads];
         _maskBufs = new int[][nHeads];
@@ -832,11 +792,6 @@ class BlackBoxAI {
         _pickHere(legal, chosen, value);
     }
 
-    void pickAllTok(string[][] legal, const(int)[] toks, int[] chosen, float[] value) {
-        _embed(toks);
-        _pickHere(legal, chosen, value);
-    }
-
     private void _pickHere(string[][] legal, int[] chosen, float[] value) {
         net.forward(_envBuf);
         foreach (h; 0..nHeads) {
@@ -861,11 +816,6 @@ class BlackBoxAI {
     // ── 예측(샘플링 없음) ──
     void predictAll(string[][] legal, float[] input, int[] chosen, float[] value) {
         foreach (k; 0..input.length) _envBuf[k] = input[k];
-        _predHere(legal, chosen, value);
-    }
-
-    void predictAllTok(string[][] legal, const(int)[] toks, int[] chosen, float[] value) {
-        _embed(toks);
         _predHere(legal, chosen, value);
     }
 
@@ -895,18 +845,8 @@ class BlackBoxAI {
         // 배치 크기로 나눠 평균 기울기를 쓴다.
         // (합산만 하면 배치가 커질수록 갱신 폭이 커져 발산한다)
         immutable float inv = 1.0f / cast(float) inputs.length;
-        if (tokenInput) gEmb[] = 0f;
         foreach (i; 0..inputs.length) {
-            if (tokenInput) {
-                foreach (k; 0..tokLen) _tokBuf[k] = cast(int) inputs[i][k];
-                foreach (k; 0..tokLen) {
-                    int id = _tokBuf[k];
-                    if (id < 0 || id >= tokV) { id = 0; _tokBuf[k] = 0; }
-                    foreach (j; 0..tokW) _envBuf[k*tokW + j] = emb[id*tokW + j];
-                }
-            } else {
-                foreach (k; 0..inputs[i].length) _envBuf[k] = inputs[i][k];
-            }
+            foreach (k; 0..inputs[i].length) _envBuf[k] = inputs[i][k];
             net.forward(_envBuf);
             foreach (h; 0..nHeads) {
                 net._dHead[h][] = 0f;
@@ -940,10 +880,8 @@ class BlackBoxAI {
                 }
             }
             net.backward();
-            if (tokenInput) _embedBack();
         }
         net.step(opt, lr);
-        if (tokenInput) { adamVec(emb, gEmb, mEmb, vEmb, opt, lr, embT); embT++; }
     }
 
     // ── 지도학습 1스텝 (헤드별 정답; 이산은 인덱스, cos 는 목표값) ──
@@ -955,16 +893,7 @@ class BlackBoxAI {
         _slHere(legal, ansIdx, ansVal, use);
     }
 
-    void slBatchTok(const(int)[] toks, string[][] legal, int[] ansIdx, float[] ansVal, bool[] use) {
-        bool any = false;
-        foreach (u; use) if (u) { any = true; break; }
-        if (!any) return;
-        _embed(toks);
-        _slHere(legal, ansIdx, ansVal, use);
-    }
-
     private void _slHere(string[][] legal, int[] ansIdx, float[] ansVal, bool[] use) {
-        if (tokenInput) gEmb[] = 0f;
         net.zeroGrad();
         net.forward(_envBuf);
         foreach (h; 0..nHeads) {
@@ -984,9 +913,7 @@ class BlackBoxAI {
             }
         }
         net.backward();
-        if (tokenInput) _embedBack();
         net.step(opt, lr);
-        if (tokenInput) { adamVec(emb, gEmb, mEmb, vEmb, opt, lr, embT); embT++; }
     }
 
     // 여러 문제를 한 번에. 기울기를 모았다가 갱신은 한 번만 한다.
@@ -996,7 +923,6 @@ class BlackBoxAI {
                 float[][] ansVal, bool[][] use) {
         if (inputs.length == 0) return;
         net.zeroGrad();
-        if (tokenInput) gEmb[] = 0f;
         immutable float inv = 1.0f / cast(float) inputs.length;
 
         foreach (i; 0..inputs.length) {
@@ -1004,16 +930,7 @@ class BlackBoxAI {
             foreach (u; use[i]) if (u) { any = true; break; }
             if (!any) continue;
 
-            if (tokenInput) {
-                foreach (k; 0..tokLen) {
-                    int id = k < inputs[i].length ? cast(int) inputs[i][k] : 0;
-                    if (id < 0 || id >= tokV) id = 0;
-                    _tokBuf[k] = id;
-                    foreach (j; 0..tokW) _envBuf[k*tokW + j] = emb[id*tokW + j];
-                }
-            } else {
-                foreach (k; 0..inputs[i].length) _envBuf[k] = inputs[i][k];
-            }
+            foreach (k; 0..inputs[i].length) _envBuf[k] = inputs[i][k];
             net.forward(_envBuf);
 
             foreach (h; 0..nHeads) {
@@ -1034,11 +951,9 @@ class BlackBoxAI {
                 }
             }
             net.backward();
-            if (tokenInput) _embedBack();
         }
 
         net.step(opt, lr);
-        if (tokenInput) { adamVec(emb, gEmb, mEmb, vEmb, opt, lr, embT); embT++; }
     }
 
     void save() {
@@ -1046,9 +961,7 @@ class BlackBoxAI {
         auto f = File(file, "wb");
         void wu(uint v)  { f.rawWrite((&v)[0..1]); }
         void wf(float v) { f.rawWrite((&v)[0..1]); }
-        wu(0xBEEFCAFE); wu(8); wu(cast(uint)opt);
-        wu(tokenInput ? 1u : 0u);
-        wu(cast(uint)tokV); wu(cast(uint)tokLen); wu(cast(uint)tokW);
+        wu(0xBEEFCAFE); wu(9); wu(cast(uint)opt);
         wu(cast(uint)net.inputSz);
         wu(cast(uint)layKind.length);
         foreach (i; 0..layKind.length) {
@@ -1087,12 +1000,6 @@ class BlackBoxAI {
             }
         }
         foreach (ref h; net.heads) wl(h);
-        if (tokenInput) {
-            foreach (v; emb)  wf(v);
-            foreach (v; mEmb) wf(v);
-            foreach (v; vEmb) wf(v);
-            wu(cast(uint)embT);
-        }
     }
 
     private void load() {
@@ -1101,10 +1008,8 @@ class BlackBoxAI {
         float rf()  { float v; f.rawRead((&v)[0..1]); return v; }
         if (ru() != 0xBEEFCAFE) throw new Exception("magic mismatch");
         uint ver = ru();
-        if (ver < 8) throw new Exception("예전 포맷입니다. change() 로 변환하세요");
+        if (ver < 9) throw new Exception("예전 포맷입니다. change() 로 변환하세요");
         opt = cast(Opt)ru();
-        tokenInput = ru() != 0;
-        tokV = ru(); tokLen = ru(); tokW = ru();
         int inputSz = ru();
         int nLay = ru();
         layKind = new ubyte[nLay]; layA = new int[nLay]; layB = new int[nLay];
@@ -1146,13 +1051,6 @@ class BlackBoxAI {
             }
         }
         foreach (ref h; net.heads) rl_(h);
-        if (tokenInput) {
-            _initEmb();
-            foreach (ref v; emb)  v = rf();
-            foreach (ref v; mEmb) v = rf();
-            foreach (ref v; vEmb) v = rf();
-            embT = ru();
-        }
     }
 }
 
@@ -1195,6 +1093,7 @@ string changeFile(string path) {
     Opt        o = Opt.adam;
     int        inputSz, nH, nL;
     int[]      hid;
+    int[]      kK, kA, kB;      // 층 스펙 (종류, A, B)
     int[]      outSizes;
     bool[]     cosModes;
     string[][] als;
@@ -1205,17 +1104,23 @@ string changeFile(string path) {
         uint ru() { uint v; f.rawRead((&v)[0..1]); return v; }
         if (ru() != 0xBEEFCAFE) throw new Exception("my_ml 포맷이 아닙니다");
         uint ver = ru();
-        if (ver >= 7) return "already";
+        if (ver >= 9) return "already";
         if (ver >= 2) o = cast(Opt) ru();
 
         bool cos3 = false; int out3 = 0;
         if (ver == 3) { cos3 = ru() != 0; out3 = ru(); }
         bool ver4 = (ver >= 4);
         bool ver5 = (ver == 5);
+        bool ver7up = (ver >= 7);
+        if (ver == 8) { ru(); ru(); ru(); ru(); }   // 옛 토큰 설정 — 버린다
 
         inputSz = ru();
         nH = ru(); hid = new int[nH];
-        foreach (i; 0..nH) hid[i] = ru();
+        kA = new int[nH]; kB = new int[nH]; kK = new int[nH];
+        foreach (i; 0..nH) {
+            if (ver7up) { kK[i] = ru(); kA[i] = ru(); kB[i] = ru(); hid[i] = kA[i]; }
+            else        { kK[i] = 0;    kA[i] = ru(); kB[i] = 0;    hid[i] = kA[i]; }
+        }
         nL = ru();
         als = new string[][nL]; outSizes = new int[nL]; cosModes = new bool[nL];
         foreach (i; 0..nL) {
@@ -1244,10 +1149,10 @@ string changeFile(string path) {
 
     auto w = File(path, "wb");
     void wu(uint v) { w.rawWrite((&v)[0..1]); }
-    wu(0xBEEFCAFE); wu(7); wu(cast(uint) o);
+    wu(0xBEEFCAFE); wu(9); wu(cast(uint) o);
     wu(cast(uint) inputSz);
     wu(cast(uint) nH);
-    foreach (sz; hid) { wu(0u); wu(cast(uint) sz); wu(0u); }   // 전부 Linear 층
+    foreach (i; 0..nH) { wu(cast(uint) kK[i]); wu(cast(uint) kA[i]); wu(cast(uint) kB[i]); }
     wu(cast(uint) nL);
     foreach (i; 0..nL) {
         wu(cast(uint) outSizes[i]);
@@ -1353,9 +1258,9 @@ PyObject* py_ml_make(PyObject* self, PyObject* args) {
     try {
         PyObject* nm; int inputSz; PyObject* hid; PyObject* heads;
         PyObject* acts; PyObject* coss; PyObject* opt;
-        PyObject* lk; PyObject* lb2; double sigma, ent; int tv, tl, tw;
-        if (!PyArg_ParseTuple(args, "OiOOOOOOOddiii", &nm, &inputSz, &lk, &hid, &lb2,
-                              &heads, &acts, &coss, &opt, &sigma, &ent, &tv, &tl, &tw))
+        PyObject* lk; PyObject* lb2; double sigma, ent;
+        if (!PyArg_ParseTuple(args, "OiOOOOOOOdd", &nm, &inputSz, &lk, &hid, &lb2,
+                              &heads, &acts, &coss, &opt, &sigma, &ent))
             return null;
         string name   = fromStringz(PyUnicode_AsUTF8(nm)).idup;
         string optStr = fromStringz(PyUnicode_AsUTF8(opt)).idup;
@@ -1370,7 +1275,7 @@ PyObject* py_ml_make(PyObject* self, PyObject* args) {
         auto cosB = new bool[cosI.length];
         foreach (i, v; cosI) cosB[i] = v != 0;
         auto ai = new BlackBoxAI(name, inputSz, lkb, la, lbv, hsz, al, cosB, parseOpt(optStr),
-                                 cast(float)sigma, cast(float)ent, tv, tl, tw);
+                                 cast(float)sigma, cast(float)ent);
         GC.addRoot(cast(void*) ai);
         return PyCapsule_New(cast(void*) ai, "BlackBoxAI", &bbai_dtor);
     } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _ml_make"); return null; }
@@ -1394,8 +1299,7 @@ PyObject* py_ml_pick(PyObject* self, PyObject* args) {
         auto ai = cast(BlackBoxAI) PyCapsule_GetPointer(cap, "BlackBoxAI");
         auto chosen = new int[ai.nHeads];
         auto value  = new float[ai.nHeads];
-        if (ai.tokenInput) ai.pickAllTok(pyLals(legal), pyIntList(inp), chosen, value);
-        else               ai.pickAll(pyLals(legal), pyFloatList(inp), chosen, value);
+        ai.pickAll(pyLals(legal), pyFloatList(inp), chosen, value);
         return packPick(ai, chosen, value);
     } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _ml_pick"); return null; }
 }
@@ -1407,8 +1311,7 @@ PyObject* py_ml_predict(PyObject* self, PyObject* args) {
         auto ai = cast(BlackBoxAI) PyCapsule_GetPointer(cap, "BlackBoxAI");
         auto chosen = new int[ai.nHeads];
         auto value  = new float[ai.nHeads];
-        if (ai.tokenInput) ai.predictAllTok(pyLals(legal), pyIntList(inp), chosen, value);
-        else               ai.predictAll(pyLals(legal), pyFloatList(inp), chosen, value);
+        ai.predictAll(pyLals(legal), pyFloatList(inp), chosen, value);
         return packPick(ai, chosen, value);
     } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _ml_predict"); return null; }
 }
@@ -1448,15 +1351,9 @@ PyObject* py_ml_sl(PyObject* self, PyObject* args) {
         auto lals  = pyLals(legal);
         auto chosen = new int[ai.nHeads];
         auto value  = new float[ai.nHeads];
-        if (ai.tokenInput) {
-            auto toks = pyIntList(inp);
-            ai.slBatchTok(toks, lals, pyIntList(ansI), pyFloatList(ansV), use);
-            ai.predictAllTok(lals, toks, chosen, value);
-        } else {
-            auto input = pyFloatList(inp);
-            ai.slBatch(input, lals, pyIntList(ansI), pyFloatList(ansV), use);
-            ai.predictAll(lals, input, chosen, value);
-        }
+        auto input = pyFloatList(inp);
+        ai.slBatch(input, lals, pyIntList(ansI), pyFloatList(ansV), use);
+        ai.predictAll(lals, input, chosen, value);
         return packPick(ai, chosen, value);
     } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _ml_sl"); return null; }
 }
@@ -1619,31 +1516,6 @@ class _Attn:
 attn = _Attn()
 
 
-class _Tok:
-    """토큰 입력 표시. 번호를 넘기면 안에서 벡터로 펼친다.
-
-        tok(어휘수, 길이)          -> 각 토큰을 32칸으로
-        tok(어휘수, 길이, 폭)
-
-    one-hot 을 파이썬에서 만들어 넘기면 데이터가 수백 배로 불어난다.
-    번호만 넘기고 펼치는 일은 안에서 한다.
-    """
-    __slots__ = ("vocab", "length", "width")
-
-    def __init__(self, vocab=0, length=0, width=32):
-        self.vocab, self.length, self.width = int(vocab), int(length), int(width)
-
-    def __call__(self, vocab, length, width=32):
-        if vocab < 2 or length < 1 or width < 1:
-            raise ValueError("tok(어휘수>=2, 길이>=1, 폭>=1)")
-        return _Tok(vocab, length, width)
-
-    def __repr__(self):
-        return f"tok({self.vocab}, {self.length}, {self.width})"
-
-tok = _Tok()
-
-
 class _Each:
     """항목마다 따로 도는 층. 같은 가중치를 항목 수만큼 돌려쓴다.
 
@@ -1702,12 +1574,11 @@ _NAN = float("nan")
 
 
 class BlackBoxAI:
-    def __init__(self, h, name, heads, token=False):
+    def __init__(self, h, name, heads):
         self._h     = h
         self._name  = name
         self._heads = heads          # [(actions or None, cos:bool), ...]
         self._n     = len(heads)
-        self._tok   = token          # 입력이 토큰 번호인가
 
     # 헤드별 원시값 → 사람이 쓰는 출력
     def _decode(self, flat):
@@ -1731,7 +1602,7 @@ class BlackBoxAI:
 
     # ── 순수: (입력, 출력) 데이터만 ──
     def rl(self, input_list, legal=None):
-        inp  = [int(x) for x in input_list] if self._tok else [float(x) for x in input_list]
+        inp  = [float(x) for x in input_list]
         flat = _ml_pick(self._h, self._legal_arg(legal), inp)
         out, units, raw = self._decode(flat)
         return Step(inp, self._one(out), units, raw)
@@ -1784,8 +1655,7 @@ class BlackBoxAI:
             ai.sl(입력, 정답)                 # 하나
             ai.sl([입력1, 입력2, ...], [정답1, 정답2, ...])   # 묶음
         """
-        묶음 = (input_list and isinstance(input_list[0], (list, tuple))
-                and not self._tok) or                (input_list and isinstance(input_list[0], (list, tuple)))
+        묶음 = bool(input_list) and isinstance(input_list[0], (list, tuple))
         if 묶음:
             if answer is None or len(answer) != len(input_list):
                 raise ValueError("묶음으로 줄 때는 정답도 같은 개수만큼 주세요")
@@ -1798,7 +1668,7 @@ class BlackBoxAI:
             _ml_sl_many(self._h, lals, inps, AI, AV, US)
             return None
 
-        inp  = [int(x) for x in input_list] if self._tok else [float(x) for x in input_list]
+        inp  = [float(x) for x in input_list]
         lals = self._legal_arg(legal)
         ansI, ansV, use = self._정답풀기(answer)
         flat = _ml_sl(self._h, lals, inp, ansI, ansV, use)
@@ -1807,7 +1677,7 @@ class BlackBoxAI:
 
     # ── 예측(샘플링 없음) ──
     def predict(self, input_list, legal=None):
-        inp  = [int(x) for x in input_list] if self._tok else [float(x) for x in input_list]
+        inp  = [float(x) for x in input_list]
         flat = _ml_predict(self._h, self._legal_arg(legal), inp)
         out, _, _ = self._decode(flat)
         return self._one(out)
@@ -1846,7 +1716,6 @@ def make(model_name, layers, outputs, optimizer='adam', sigma=1.0, entropy=0.01)
     """
     model_name : 모델 이름 (가중치 파일명)
     layers     : [입력수, 은닉...]   출력은 outputs 에서 정해진다
-                 입력 자리에 tok(어휘수, 길이) 를 쓰면 토큰 번호를 받는다
                  은닉 자리에 attn(조각수) 를 넣으면 어텐션 층이 된다
                  each(폭) 은 항목마다 따로 도는 층 (항목 구분을 유지한다)
                  예) [38, 128, attn(8), each(32), 128]
@@ -1858,18 +1727,10 @@ def make(model_name, layers, outputs, optimizer='adam', sigma=1.0, entropy=0.01)
     """
     if len(layers) < 1:
         raise ValueError("layers 는 [입력수, 은닉...] 형태입니다")
-    첫칸 = layers[0]
-    if isinstance(첫칸, _Tok):
-        if 첫칸.vocab < 2:
-            raise ValueError("tok(어휘수, 길이) 로 어휘수와 길이를 주세요")
-        tokV, tokLen, tokW = 첫칸.vocab, 첫칸.length, 첫칸.width
-        inputSz = tokLen * tokW
-    else:
-        tokV = tokLen = tokW = 0
-        inputSz = int(첫칸)
+    inputSz = int(layers[0])
     lay_kind, lay_a, lay_b = [], [], []
     폭 = inputSz
-    항목수 = tokLen if tokLen else 0        # tok 이면 토큰 개수가 곧 항목 수
+    항목수 = 0        # attn 을 만나야 항목 구조가 생긴다
     for i, L in enumerate(layers[1:], 1):
         if isinstance(L, _Attn):
             if 폭 % L.items:
@@ -1911,8 +1772,8 @@ def make(model_name, layers, outputs, optimizer='adam', sigma=1.0, entropy=0.01)
         sizes.append(n)
 
     h = _ml_make(model_name, inputSz, lay_kind, lay_a, lay_b, sizes, al_arg, cos_arg,
-                 optimizer, float(sigma), float(entropy), tokV, tokLen, tokW)
-    return BlackBoxAI(h, model_name, heads, tokV > 0)
+                 optimizer, float(sigma), float(entropy))
+    return BlackBoxAI(h, model_name, heads)
 
 
 def change(model_name):
