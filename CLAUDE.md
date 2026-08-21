@@ -27,18 +27,18 @@ Remove-Item my_ml.obj, my_ml.lib, my_ml.exp -ErrorAction SilentlyContinue
 from my_ml import make, cos, attn, each
 
 # layers 는 [입력수, 은닉...] 만. 출력 개수는 outputs 에서 정해진다.
-ai = make("이름", [입력수, 은닉...], ["액션A", "액션B"])     # 고르기 1개
-ai = make("이름", [입력수, 은닉...], cos)                    # 숫자 1개
-ai = make("이름", [입력수, 은닉...],                          # 출력 여러 개
-          [cos, ["a","b"], ["c","d","e"]])
+# outputs 는 항상 리스트. 하나여도 감싼다. 반환·보상·정답·legal 도 전부 리스트.
+ai = make("이름", [입력수, 은닉...], [["액션A", "액션B"]])   # 고르기 1개
+ai = make("이름", [입력수, 은닉...], [cos])                  # 숫자 1개
+ai = make("이름", [입력수, 은닉...], [cos, ["a","b"]])       # 출력 2개
 
 step   = ai.rl([입력...])          # 순수 → Step(input, output)
 scored = ai.reward(step, 점수)     # 순수 → Scored(input, output, point)
 ai.save(scored)                    # 역전파 + 파일 자동 저장 (여기서만 모델이 바뀜)
 ai.save([scored, ...])             # 묶음도 가능
 
-ai.predict([입력...])              # 샘플링/학습 없이 최선값
-ai.sl([입력...], "정답")           # 지도학습 1스텝 후 예측
+ai.predict([입력...])              # 샘플링/학습 없이 최선값 (리스트)
+ai.sl([입력...], ["정답"])         # 지도학습 1스텝 후 예측
 ai.episode(steps, 점수)            # [Step...] → [Scored...] 일괄 보상 (순수)
 
 change("이름")                     # 예전 포맷 가중치 → 현재 포맷 (.bak 백업)
@@ -51,8 +51,8 @@ ai = make("이름", [12, attn(6), each(24), attn(6), each(24), 128], 출력)
 ai.sl([입력1, 입력2, ...], [정답1, 정답2, ...])
 ```
 
-출력이 여러 개면 `output`, `reward` 의 점수, `sl` 의 정답이 모두 리스트다.
-점수/정답에 `None` 을 주면 그 출력은 학습에서 빠진다.
+`output`, `reward` 의 점수, `sl` 의 정답, `legal` 은 **항상** 출력 개수만큼의 리스트다
+(출력이 하나여도). 점수/정답에 `None` 을 주면 그 출력은 학습에서 빠진다.
 
 `rl()`/`reward()`/`episode()` 는 모델을 건드리지 않는다. 학습은 `save()` 와 `sl()` 뿐이다.
 

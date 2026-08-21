@@ -1591,25 +1591,28 @@ class BlackBoxAI:
         return out, units, raw
 
     def _legal_arg(self, legal):
+        """legal 은 항상 출력 개수만큼의 리스트. 안 거는 자리는 None."""
         if legal is None:
             return [[] for _ in range(self._n)]
-        if self._n == 1 and legal and isinstance(legal[0], str):
-            return [list(legal)]
+        if len(legal) != self._n:
+            raise ValueError(f"legal 은 출력 개수({self._n})만큼 주세요. 안 걸 자리는 None")
         return [list(x) if x else [] for x in legal]
-
-    def _one(self, lst):
-        return lst[0] if self._n == 1 else lst
 
     # ── 순수: (입력, 출력) 데이터만 ──
     def rl(self, input_list, legal=None):
         inp  = [float(x) for x in input_list]
         flat = _ml_pick(self._h, self._legal_arg(legal), inp)
         out, units, raw = self._decode(flat)
-        return Step(inp, self._one(out), units, raw)
+        return Step(inp, out, units, raw)
 
     # ── 순수: 보상 붙이기 ──
     def reward(self, data, point):
-        return Scored(data.input, data.output, point, data._units, data._raw)
+        """point 는 출력 개수만큼의 리스트. None 이면 그 출력은 학습에서 빠진다."""
+        if not isinstance(point, (list, tuple)):
+            raise ValueError(f"점수는 리스트로 주세요 (출력 {self._n}개)")
+        if len(point) != self._n:
+            raise ValueError(f"점수 개수({len(point)})가 출력 개수({self._n})와 다릅니다")
+        return Scored(data.input, data.output, list(point), data._units, data._raw)
 
     # ── 여기서만 학습 + 저장 ──
     def save(self, scored=None):
@@ -1622,14 +1625,9 @@ class BlackBoxAI:
         for s in batch:
             inputs.append([float(x) for x in s.input])
             chosen.append([int(u) for u in s._units])
-            outs = s.output if self._n > 1 else [s.output]
             values.append([float(v) if c else 0.0
                            for v, (_, c) in zip(s._raw, self._heads)])
-            p = s.point
-            if isinstance(p, (list, tuple)):
-                points.append([_NAN if x is None else float(x) for x in p])
-            else:
-                points.append([float(p)] * self._n)
+            points.append([_NAN if x is None else float(x) for x in s.point])
         _ml_learn(self._h, inputs, chosen, values, points)
         return len(batch)
 
@@ -1639,9 +1637,12 @@ class BlackBoxAI:
         ansV = [0.0] * self._n
         use  = [0] * self._n
         if answer is not None:
-            answers = answer if (self._n > 1 and isinstance(answer, (list, tuple))) else [answer]
-            for i, a in enumerate(answers):
-                if a is None or i >= self._n: continue
+            if not isinstance(answer, (list, tuple)):
+                raise ValueError(f"정답은 리스트로 주세요 (출력 {self._n}개)")
+            if len(answer) != self._n:
+                raise ValueError(f"정답 개수({len(answer)})가 출력 개수({self._n})와 다릅니다")
+            for i, a in enumerate(answer):
+                if a is None: continue
                 acts, cos = self._heads[i]
                 use[i] = 1
                 if cos: ansV[i] = float(a)
@@ -1673,14 +1674,14 @@ class BlackBoxAI:
         ansI, ansV, use = self._정답풀기(answer)
         flat = _ml_sl(self._h, lals, inp, ansI, ansV, use)
         out, _, _ = self._decode(flat)
-        return self._one(out)
+        return out
 
     # ── 예측(샘플링 없음) ──
     def predict(self, input_list, legal=None):
         inp  = [float(x) for x in input_list]
         flat = _ml_predict(self._h, self._legal_arg(legal), inp)
         out, _, _ = self._decode(flat)
-        return self._one(out)
+        return out
 
     # ── 스텝 묶음에 같은 보상 (순수) ──
     def episode(self, steps, point):
@@ -1689,7 +1690,7 @@ class BlackBoxAI:
     @property
     def heads(self):    return self._n
     @property
-    def actions(self):  return self._one([a for a, _ in self._heads])
+    def actions(self):  return [a for a, _ in self._heads]
 
 
 def _헤드해석(spec):
@@ -1719,9 +1720,11 @@ def make(model_name, layers, outputs, optimizer='adam', sigma=1.0, entropy=0.01)
                  은닉 자리에 attn(조각수) 를 넣으면 어텐션 층이 된다
                  each(폭) 은 항목마다 따로 도는 층 (항목 구분을 유지한다)
                  예) [38, 128, attn(8), each(32), 128]
-    outputs    : 출력 하나면  ["A","B"]  또는  cos
-                 여러 개면   [cos, ["A","B"], cos, ...]
-                 cos 값의 범위는 쓰는 쪽에서 알아서 정한다
+    outputs    : 항상 리스트. 하나여도 감싼다.
+                   [["A","B"]]         고르기 하나
+                   [cos]               숫자 하나
+                   [["A","B"], cos]    두 개
+                 반환·보상·정답·legal 도 전부 출력 개수만큼의 리스트다.
     sigma      : cos 가 값을 얼마나 넓게 탐험할지 (기본 1.0)
     entropy    : 고르는 쪽이 한 답으로 굳는 것을 막는 힘 (기본 0.01)
     """
@@ -1757,11 +1760,10 @@ def make(model_name, layers, outputs, optimizer='adam', sigma=1.0, entropy=0.01)
             항목수 = 0                       # 일반 층은 항목 구분을 없앤다
             lay_kind.append(0); lay_a.append(폭); lay_b.append(0)
 
-    # 출력 스펙을 헤드 목록으로
-    if _헤드스펙인가(outputs) and isinstance(outputs, (list, tuple))             and not isinstance(outputs, _Cos) and outputs and all(_헤드스펙인가(o) for o in outputs):
-        specs = list(outputs)          # 헤드 여러 개
-    else:
-        specs = [outputs]              # 헤드 하나
+    # outputs 는 항상 [출력1, 출력2, ...]. 하나여도 감싼다.
+    if not isinstance(outputs, (list, tuple)) or not outputs:
+        raise ValueError('outputs 는 리스트로 주세요. 하나여도 [["A","B"]] 처럼 감쌉니다')
+    specs = list(outputs)
 
     heads, al_arg, cos_arg, sizes = [], [], [], []
     for spec in specs:
