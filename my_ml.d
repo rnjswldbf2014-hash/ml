@@ -303,6 +303,57 @@ private void adamVec(float[] w, float[] gr, float[] m, float[] v,
 //     [38, 128, attn(8), 128]   <- 128 을 8조각(각 16) 으로 보고 섞음
 //   순서 개념이 없으므로 마스크를 걸지 않는다 (모두가 모두를 봄).
 // ─────────────────────────────────────────────
+// EachLayer — 항목마다 따로 도는 층
+// ─────────────────────────────────────────────
+//   같은 가중치 하나를 항목 수만큼 돌려쓴다.
+//   일반 Linear 는 전체를 한 덩어리로 섞어서 항목 구분이 사라지는데,
+//   이 층은 항목 경계를 유지한다. attn 사이에 끼우면 조각이 안 무너진다.
+//
+//     폭 128, 항목 8 (조각당 16) 에서 each(64):
+//       16칸 -> 64칸 을 8번  =>  나오는 폭 512
+//       가중치는 16x64 하나뿐 (8항목이 공유)
+// ─────────────────────────────────────────────
+private struct EachLayer {
+    int items;      // 항목 수
+    int inW, outW;  // 항목 하나의 입력폭 / 출력폭
+    Linear lin;
+    float[] pre;    // ReLU 전 값 (역전파에 필요)
+
+    this(int items_, int inW_, int outW_) {
+        items = items_; inW = inW_; outW = outW_;
+        lin = Linear(inW_, outW_);
+        pre = new float[items_ * outW_];
+        pre[] = 0f;
+    }
+
+    int inSize()  const nothrow @nogc { return items * inW; }
+    int outSize() const nothrow @nogc { return items * outW; }
+
+    // x (items*inW) -> y (items*outW), ReLU 포함
+    void fwd(const(float)[] x, float[] y) nothrow @nogc {
+        foreach (t; 0..items) {
+            lin.forward(x[t*inW .. t*inW + inW], pre[t*outW .. t*outW + outW]);
+            foreach (i; 0..outW) {
+                float v = pre[t*outW + i];
+                y[t*outW + i] = v < 0f ? 0f : v;
+            }
+        }
+    }
+
+    // dy -> dx (dx 에 누적)
+    void bwd(const(float)[] x, const(float)[] dy, float[] dx, float[] tmp) nothrow @nogc {
+        foreach (t; 0..items) {
+            foreach (i; 0..outW)
+                tmp[i] = pre[t*outW + i] > 0f ? dy[t*outW + i] : 0f;
+            lin.accum(x[t*inW .. t*inW + inW], tmp[0..outW], dx[t*inW .. t*inW + inW]);
+        }
+    }
+
+    void zeroGrad() nothrow @nogc { lin.zeroGrad(); }
+    void step(Opt o, float lr) nothrow { lin.step(o, lr); }
+}
+
+// ─────────────────────────────────────────────
 private struct AttnLayer {
     int dim;        // 전체 폭 (입력 = 출력)
     int items;      // 조각 수
@@ -432,6 +483,7 @@ private class Network {
     int[]       slot;
     Linear[]    lins;
     AttnLayer[] attns;
+    EachLayer[] eachs;
     Linear[]    heads;
     int         inputSz;
 
@@ -439,7 +491,7 @@ private class Network {
     float[][] _inp, _pre;
     float[]   _hout;
     float[][] _hd, _dHead;
-    float[]   _dA, _dB;
+    float[]   _dA, _dB, _dC;
     bool      fwdCached;
 
     int layerCount() const nothrow @nogc { return cast(int) kinds.length; }
@@ -455,10 +507,17 @@ private class Network {
                 kinds ~= 0; slot ~= cast(int)(lins.length - 1);
                 _inSz ~= prev; _outSz ~= specA[i];
                 prev = specA[i];
-            } else {
+            } else if (specKind[i] == 1) {
                 attns ~= AttnLayer(prev, specA[i], specB[i]);
                 kinds ~= 1; slot ~= cast(int)(attns.length - 1);
                 _inSz ~= prev; _outSz ~= prev;      // 폭 유지
+            } else {
+                // Each: specA=항목수, specB=항목당 출력폭
+                int items = specA[i], ow = specB[i];
+                eachs ~= EachLayer(items, prev / items, ow);
+                kinds ~= 2; slot ~= cast(int)(eachs.length - 1);
+                _inSz ~= prev; _outSz ~= items * ow;
+                prev = items * ow;
             }
         }
         foreach (sz; headSizes) heads ~= Linear(prev, sz);
@@ -493,8 +552,8 @@ private class Network {
             if (_inSz[i] > maxSz) maxSz = _inSz[i];
             if (_outSz[i] > maxSz) maxSz = _outSz[i];
         }
-        _dA = new float[maxSz]; _dB = new float[maxSz];
-        _dA[] = 0f; _dB[] = 0f;
+        _dA = new float[maxSz]; _dB = new float[maxSz]; _dC = new float[maxSz];
+        _dA[] = 0f; _dB[] = 0f; _dC[] = 0f;
         fwdCached = false;
     }
 
@@ -513,8 +572,14 @@ private class Network {
                         foreach (k; 0..oS) _inp[i+1][k] = _pre[i][k] < 0f ? 0f : _pre[i][k];
                     else
                         foreach (k; 0..oS) _hout[k] = _pre[i][k] < 0f ? 0f : _pre[i][k];
-                } else {
+                } else if (kinds[i] == 1) {
                     attns[slot[i]].fwd(_inp[i], _pre[i]);
+                    if (i + 1 < n)
+                        foreach (k; 0..oS) _inp[i+1][k] = _pre[i][k];
+                    else
+                        foreach (k; 0..oS) _hout[k] = _pre[i][k];
+                } else {
+                    eachs[slot[i]].fwd(_inp[i], _pre[i]);   // ReLU 는 안에서
                     if (i + 1 < n)
                         foreach (k; 0..oS) _inp[i+1][k] = _pre[i][k];
                     else
@@ -540,9 +605,12 @@ private class Network {
                 foreach (k; 0..oS) if (_pre[i][k] <= 0f) _dA[k] = 0f;
                 _dB[0..iS] = 0f;
                 lins[slot[i]].accum(_inp[i], _dA[0..oS], _dB[0..iS]);
-            } else {
+            } else if (kinds[i] == 1) {
                 _dB[0..iS] = 0f;
                 attns[slot[i]].bwd(_inp[i], _dA[0..oS], _dB[0..iS]);
+            } else {
+                _dB[0..iS] = 0f;
+                eachs[slot[i]].bwd(_inp[i], _dA[0..oS], _dB[0..iS], _dC);
             }
             foreach (k; 0..iS) _dA[k] = _dB[k];
         }
@@ -552,12 +620,14 @@ private class Network {
     void zeroGrad() nothrow @nogc {
         foreach (ref h; lins)  h.zeroGrad();
         foreach (ref a; attns) a.zeroGrad();
+        foreach (ref e; eachs) e.zeroGrad();
         foreach (ref h; heads) h.zeroGrad();
     }
 
     void step(Opt opt, float lr) nothrow {
         foreach (ref h; lins)  h.step(opt, lr);
         foreach (ref a; attns) a.step(opt, lr);
+        foreach (ref e; eachs) e.step(opt, lr);
         foreach (ref h; heads) h.step(opt, lr);
     }
 }
@@ -657,8 +727,9 @@ class BlackBoxAI {
             string r = "[";
             foreach (i; 0..layKind.length) {
                 if (i) r ~= ", ";
-                r ~= layKind[i] == 0 ? to!string(layA[i])
-                                     : "attn(" ~ to!string(layA[i]) ~ "," ~ to!string(layB[i]) ~ ")";
+                if      (layKind[i] == 0) r ~= to!string(layA[i]);
+                else if (layKind[i] == 1) r ~= "attn(" ~ to!string(layA[i]) ~ "," ~ to!string(layB[i]) ~ ")";
+                else                      r ~= "each(" ~ to!string(layB[i]) ~ ")";
             }
             return r ~ "]";
         }
@@ -1008,9 +1079,11 @@ class BlackBoxAI {
         }
         foreach (i; 0..net.layerCount) {
             if (net.kinds[i] == 0) wl(net.lins[net.slot[i]]);
-            else {
+            else if (net.kinds[i] == 1) {
                 auto a = &net.attns[net.slot[i]];
                 wn(a.ln); wl(a.wq); wl(a.wk); wl(a.wv); wl(a.wo);
+            } else {
+                wl(net.eachs[net.slot[i]].lin);
             }
         }
         foreach (ref h; net.heads) wl(h);
@@ -1065,9 +1138,11 @@ class BlackBoxAI {
         }
         foreach (i; 0..net.layerCount) {
             if (net.kinds[i] == 0) rl_(net.lins[net.slot[i]]);
-            else {
+            else if (net.kinds[i] == 1) {
                 auto a = &net.attns[net.slot[i]];
                 rn_(a.ln); rl_(a.wq); rl_(a.wk); rl_(a.wv); rl_(a.wo);
+            } else {
+                rl_(net.eachs[net.slot[i]].lin);
             }
         }
         foreach (ref h; net.heads) rl_(h);
@@ -1569,6 +1644,30 @@ class _Tok:
 tok = _Tok()
 
 
+class _Each:
+    """항목마다 따로 도는 층. 같은 가중치를 항목 수만큼 돌려쓴다.
+
+        each(64)   -> 항목 하나를 64칸으로
+
+    일반 층은 전체를 한 덩어리로 섞어서 항목 구분이 사라진다.
+    attn 사이에 이걸 끼우면 항목이 끝까지 유지된다.
+    앞에 tok 이나 attn 이 있어야 항목 수를 알 수 있다.
+    """
+    __slots__ = ("width",)
+
+    def __init__(self, width=0):
+        self.width = int(width)
+
+    def __call__(self, width):
+        if width < 1: raise ValueError("each(폭) 은 1 이상이어야 합니다")
+        return _Each(width)
+
+    def __repr__(self):
+        return f"each({self.width})"
+
+each = _Each()
+
+
 class Step:
     """rl() 이 돌려주는 (입력, 출력) 쌍. 그냥 데이터."""
     __slots__ = ("input", "output", "_units", "_raw")
@@ -1749,7 +1848,8 @@ def make(model_name, layers, outputs, optimizer='adam', sigma=1.0, entropy=0.01)
     layers     : [입력수, 은닉...]   출력은 outputs 에서 정해진다
                  입력 자리에 tok(어휘수, 길이) 를 쓰면 토큰 번호를 받는다
                  은닉 자리에 attn(조각수) 를 넣으면 어텐션 층이 된다
-                 예) [38, 128, attn(8), 128]
+                 each(폭) 은 항목마다 따로 도는 층 (항목 구분을 유지한다)
+                 예) [38, 128, attn(8), each(32), 128]
     outputs    : 출력 하나면  ["A","B"]  또는  cos
                  여러 개면   [cos, ["A","B"], cos, ...]
                  cos 값의 범위는 쓰는 쪽에서 알아서 정한다
@@ -1769,6 +1869,7 @@ def make(model_name, layers, outputs, optimizer='adam', sigma=1.0, entropy=0.01)
         inputSz = int(첫칸)
     lay_kind, lay_a, lay_b = [], [], []
     폭 = inputSz
+    항목수 = tokLen if tokLen else 0        # tok 이면 토큰 개수가 곧 항목 수
     for i, L in enumerate(layers[1:], 1):
         if isinstance(L, _Attn):
             if 폭 % L.items:
@@ -1779,9 +1880,20 @@ def make(model_name, layers, outputs, optimizer='adam', sigma=1.0, entropy=0.01)
                 raise ValueError(
                     f"{i}번째 층 attn: 조각폭 {조각폭} 이 헤드 {L.heads} 로 나뉘지 않습니다")
             lay_kind.append(1); lay_a.append(L.items); lay_b.append(L.heads)
+            항목수 = L.items
             # 폭 그대로
+        elif isinstance(L, _Each):
+            if 항목수 < 1:
+                raise ValueError(
+                    f"{i}번째 층 each: 앞에 tok 이나 attn 이 있어야 항목 수를 압니다")
+            if 폭 % 항목수:
+                raise ValueError(
+                    f"{i}번째 층 each: 폭 {폭} 이 항목 {항목수} 로 나뉘지 않습니다")
+            lay_kind.append(2); lay_a.append(항목수); lay_b.append(L.width)
+            폭 = 항목수 * L.width
         else:
             폭 = int(L)
+            항목수 = 0                       # 일반 층은 항목 구분을 없앤다
             lay_kind.append(0); lay_a.append(폭); lay_b.append(0)
 
     # 출력 스펙을 헤드 목록으로
