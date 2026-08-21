@@ -31,7 +31,7 @@ version(Windows) {
 }
 
 import std.stdio     : writefln, File;
-import std.math      : exp, sqrt, pow, log, cos, PI;
+import std.math      : exp, sqrt, pow, log, cos, PI, abs;
 import std.random    : Random, uniform, uniform01, unpredictableSeed;
 import std.file      : exists, remove, rename;
 import std.algorithm : countUntil, min;
@@ -189,49 +189,337 @@ private struct Linear {
 // ─────────────────────────────────────────────
 // Network — hot path is @nogc
 // ─────────────────────────────────────────────
-private class Network {
-    Linear[] hidden;
-    Linear[] heads;
-    int      inputSz;
+// ── LayerNorm ─────────────────────────────────
+private struct LN {
+    int D;
+    float[] g, b;             // 배울 값 (gamma, beta)
+    float[] gg, gb;           // 기울기
+    float[] mg, vg, mb, vb;   // 옵티마이저 상태
+    int t;
 
+    // 순전파 때 저장 — 역전파에 필요
+    float[] mu, rstd;
+
+    this(int d, int maxT) {
+        D = d;
+        g = new float[d]; b = new float[d];
+        gg = new float[d]; gb = new float[d];
+        mg = new float[d]; vg = new float[d];
+        mb = new float[d]; vb = new float[d];
+        // D 는 new float[] 를 NaN 으로 채운다. 반드시 직접 0 을 넣어야 한다.
+        gg[] = 0f; gb[] = 0f; mg[] = 0f; vg[] = 0f; mb[] = 0f; vb[] = 0f;
+        foreach (i; 0..d) { g[i] = 1f; b[i] = 0f; }
+        mu = new float[maxT]; rstd = new float[maxT];
+        mu[] = 0f; rstd[] = 0f;
+    }
+
+    // x, y 는 T*D 평면 배열
+    void fwd(const(float)[] x, float[] y, int T) nothrow @nogc {
+        foreach (t_; 0..T) {
+            auto xs = x[t_*D .. t_*D + D];
+            float m = 0f;
+            foreach (v; xs) m += v;
+            m /= D;
+            float s = 0f;
+            foreach (v; xs) { float d_ = v - m; s += d_*d_; }
+            float r = 1f / sqrt(s/D + 1e-5f);
+            mu[t_] = m; rstd[t_] = r;
+            foreach (i; 0..D) y[t_*D + i] = g[i] * ((xs[i] - m) * r) + b[i];
+        }
+    }
+
+    // dy -> dx (기울기 gg, gb 에 누적)
+    void bwd(const(float)[] x, const(float)[] dy, float[] dx, int T) nothrow @nogc {
+        foreach (t_; 0..T) {
+            auto xs = x[t_*D .. t_*D + D];
+            float m = mu[t_], r = rstd[t_];
+            float sum1 = 0f, sum2 = 0f;
+            foreach (i; 0..D) {
+                float xh = (xs[i] - m) * r;
+                float dyg = dy[t_*D + i] * g[i];
+                gg[i] += dy[t_*D + i] * xh;
+                gb[i] += dy[t_*D + i];
+                sum1 += dyg;
+                sum2 += dyg * xh;
+            }
+            sum1 /= D; sum2 /= D;
+            foreach (i; 0..D) {
+                float xh = (xs[i] - m) * r;
+                float dyg = dy[t_*D + i] * g[i];
+                dx[t_*D + i] += r * (dyg - sum1 - xh * sum2);
+            }
+        }
+    }
+
+    void zero() nothrow @nogc { gg[] = 0f; gb[] = 0f; }
+
+    void step(Opt o, float lr) nothrow {
+        adamVec(g, gg, mg, vg, o, lr, t);
+        adamVec(b, gb, mb, vb, o, lr, t);
+        t++;
+    }
+}
+
+// 벡터 하나에 대한 옵티마이저 갱신 (Linear.step 과 같은 규칙)
+private void adamVec(float[] w, float[] gr, float[] m, float[] v,
+                     Opt o, float lr, int t) nothrow {
+    enum float B1=0.9f, B2=0.999f, EPS=1e-8f, RHO=0.99f;
+    final switch (o) {
+        case Opt.adam:
+            float bc1 = 1f - B1^^(t+1), bc2 = 1f - B2^^(t+1);
+            foreach (i; 0..w.length) {
+                float gv = gr[i];
+                m[i] = B1*m[i] + (1-B1)*gv;
+                v[i] = B2*v[i] + (1-B2)*gv*gv;
+                w[i] -= lr * (m[i]/bc1) / (sqrt(v[i]/bc2) + EPS);
+            }
+            break;
+        case Opt.sgd:
+            foreach (i; 0..w.length) w[i] -= lr * gr[i];
+            break;
+        case Opt.rmsprop:
+            foreach (i; 0..w.length) {
+                float gv = gr[i];
+                v[i] = RHO*v[i] + (1-RHO)*gv*gv;
+                w[i] -= lr * gv / (sqrt(v[i]) + EPS);
+            }
+            break;
+        case Opt.adagrad:
+            foreach (i; 0..w.length) {
+                float gv = gr[i];
+                v[i] += gv*gv;
+                w[i] -= lr * gv / (sqrt(v[i]) + EPS);
+            }
+            break;
+    }
+}
+
+
+// ─────────────────────────────────────────────
+// AttnLayer — 어텐션을 일반 층으로
+// ─────────────────────────────────────────────
+//   폭 dim 짜리 벡터를 items 조각으로 나눠 서로 참조하게 한다.
+//   들어온 폭 그대로 나가므로 Linear 층 사이에 그냥 끼울 수 있다.
+//     [38, 128, attn(8), 128]   <- 128 을 8조각(각 16) 으로 보고 섞음
+//   순서 개념이 없으므로 마스크를 걸지 않는다 (모두가 모두를 봄).
+// ─────────────────────────────────────────────
+private struct AttnLayer {
+    int dim;        // 전체 폭 (입력 = 출력)
+    int items;      // 조각 수
+    int w;          // 조각 하나의 폭 = dim/items
+    int heads;      // 어텐션 헤드
+    int hw;         // 헤드 하나의 폭 = w/heads
+
+    LN     ln;
+    Linear wq, wk, wv, wo;
+
+    // 순전파 캐시
+    float[] x1, q, k, v, att, ao, po;
+    // 역전파 임시
+    float[] dq, dk, dv, datt, dao, dx1;
+
+    this(int dim_, int items_, int heads_) {
+        dim = dim_; items = items_; w = dim_ / items_; heads = heads_; hw = w / heads_;
+        ln = LN(w, items);
+        wq = Linear(w, w); wk = Linear(w, w); wv = Linear(w, w); wo = Linear(w, w);
+
+        x1 = new float[dim]; q = new float[dim]; k = new float[dim]; v = new float[dim];
+        att = new float[heads*items*items];
+        ao = new float[dim]; po = new float[dim];
+        dq = new float[dim]; dk = new float[dim]; dv = new float[dim];
+        datt = new float[heads*items*items];
+        dao = new float[dim]; dx1 = new float[dim];
+        foreach (a; [x1,q,k,v,att,ao,po,dq,dk,dv,datt,dao,dx1]) a[] = 0f;
+    }
+
+    // y = x + 어텐션(LayerNorm(x))
+    void fwd(const(float)[] x, float[] y) nothrow @nogc {
+        ln.fwd(x, x1, items);
+        foreach (t; 0..items) {
+            wq.forward(x1[t*w .. t*w+w], q[t*w .. t*w+w]);
+            wk.forward(x1[t*w .. t*w+w], k[t*w .. t*w+w]);
+            wv.forward(x1[t*w .. t*w+w], v[t*w .. t*w+w]);
+        }
+        float scale = 1f / sqrt(cast(float) hw);
+        foreach (h; 0..heads) {
+            foreach (t; 0..items) {
+                float mx = -1e30f;
+                foreach (s; 0..items) {
+                    float dot = 0f;
+                    foreach (i; 0..hw) dot += q[t*w + h*hw + i] * k[s*w + h*hw + i];
+                    dot *= scale;
+                    att[h*items*items + t*items + s] = dot;
+                    if (dot > mx) mx = dot;
+                }
+                float sum = 0f;
+                foreach (s; 0..items) {
+                    float e = exp(att[h*items*items + t*items + s] - mx);
+                    att[h*items*items + t*items + s] = e;
+                    sum += e;
+                }
+                float inv = 1f / sum;
+                foreach (s; 0..items) att[h*items*items + t*items + s] *= inv;
+                foreach (i; 0..hw) {
+                    float acc = 0f;
+                    foreach (s; 0..items)
+                        acc += att[h*items*items + t*items + s] * v[s*w + h*hw + i];
+                    ao[t*w + h*hw + i] = acc;
+                }
+            }
+        }
+        foreach (t; 0..items) wo.forward(ao[t*w .. t*w+w], po[t*w .. t*w+w]);
+        foreach (i; 0..dim) y[i] = x[i] + po[i];      // 잔차
+    }
+
+    // dy -> dx (dx 에 누적)
+    void bwd(const(float)[] x, const(float)[] dy, float[] dx) nothrow @nogc {
+        dao[] = 0f;
+        foreach (t; 0..items)
+            wo.accum(ao[t*w .. t*w+w], dy[t*w .. t*w+w], dao[t*w .. t*w+w]);
+
+        dq[] = 0f; dk[] = 0f; dv[] = 0f;
+        float scale = 1f / sqrt(cast(float) hw);
+        foreach (h; 0..heads) {
+            foreach (t; 0..items) {
+                foreach (s; 0..items) {
+                    float a = att[h*items*items + t*items + s];
+                    float d_ = 0f;
+                    foreach (i; 0..hw) {
+                        d_ += dao[t*w + h*hw + i] * v[s*w + h*hw + i];
+                        dv[s*w + h*hw + i] += a * dao[t*w + h*hw + i];
+                    }
+                    datt[h*items*items + t*items + s] = d_;
+                }
+                float dot = 0f;
+                foreach (s; 0..items)
+                    dot += datt[h*items*items + t*items + s] * att[h*items*items + t*items + s];
+                foreach (s; 0..items) {
+                    float a = att[h*items*items + t*items + s];
+                    float ds = a * (datt[h*items*items + t*items + s] - dot) * scale;
+                    foreach (i; 0..hw) {
+                        dq[t*w + h*hw + i] += ds * k[s*w + h*hw + i];
+                        dk[s*w + h*hw + i] += ds * q[t*w + h*hw + i];
+                    }
+                }
+            }
+        }
+
+        dx1[] = 0f;
+        foreach (t; 0..items) {
+            wq.accum(x1[t*w .. t*w+w], dq[t*w .. t*w+w], dx1[t*w .. t*w+w]);
+            wk.accum(x1[t*w .. t*w+w], dk[t*w .. t*w+w], dx1[t*w .. t*w+w]);
+            wv.accum(x1[t*w .. t*w+w], dv[t*w .. t*w+w], dx1[t*w .. t*w+w]);
+        }
+        ln.bwd(x, dx1, dx, items);
+        foreach (i; 0..dim) dx[i] += dy[i];           // 잔차 통과분
+    }
+
+    void zeroGrad() nothrow @nogc {
+        ln.zero();
+        wq.zeroGrad(); wk.zeroGrad(); wv.zeroGrad(); wo.zeroGrad();
+    }
+
+    void step(Opt o, float lr) nothrow {
+        ln.step(o, lr);
+        wq.step(o, lr); wk.step(o, lr); wv.step(o, lr); wo.step(o, lr);
+    }
+}
+
+private class Network {
+    // 은닉층은 Linear(+ReLU) 와 Attn 이 섞일 수 있다.
+    // kinds[i] == 0 이면 lins[slot[i]], 1 이면 attns[slot[i]]
+    ubyte[]     kinds;
+    int[]       slot;
+    Linear[]    lins;
+    AttnLayer[] attns;
+    Linear[]    heads;
+    int         inputSz;
+
+    int[]     _inSz, _outSz;
     float[][] _inp, _pre;
     float[]   _hout;
     float[][] _hd, _dHead;
     float[]   _dA, _dB;
     bool      fwdCached;
 
-    this(int inputSz_, int[] hiddenSizes, int[] headSizes) {
+    int layerCount() const nothrow @nogc { return cast(int) kinds.length; }
+
+    // specKind[i]: 0=Linear(specA=출력폭), 1=Attn(specA=조각수, specB=헤드수)
+    this(int inputSz_, const(ubyte)[] specKind, const(int)[] specA, const(int)[] specB,
+         int[] headSizes) {
         inputSz = inputSz_;
         int prev = inputSz;
-        foreach (sz; hiddenSizes) { hidden ~= Linear(prev, sz); prev = sz; }
-        foreach (sz; headSizes)   { heads  ~= Linear(prev, sz); }
+        foreach (i; 0..specKind.length) {
+            if (specKind[i] == 0) {
+                lins ~= Linear(prev, specA[i]);
+                kinds ~= 0; slot ~= cast(int)(lins.length - 1);
+                _inSz ~= prev; _outSz ~= specA[i];
+                prev = specA[i];
+            } else {
+                attns ~= AttnLayer(prev, specA[i], specB[i]);
+                kinds ~= 1; slot ~= cast(int)(attns.length - 1);
+                _inSz ~= prev; _outSz ~= prev;      // 폭 유지
+            }
+        }
+        foreach (sz; headSizes) heads ~= Linear(prev, sz);
         _allocScratch();
     }
 
+    // 예전 형태(전부 Linear) 로 만들 때
+    this(int inputSz_, int[] hiddenSizes, int[] headSizes) {
+        auto kk = new ubyte[hiddenSizes.length];
+        auto aa = new int[hiddenSizes.length];
+        auto bb = new int[hiddenSizes.length];
+        foreach (i, sz; hiddenSizes) { kk[i] = 0; aa[i] = sz; bb[i] = 0; }
+        this(inputSz_, kk, aa, bb, headSizes);
+    }
+
     private void _allocScratch() {
-        _inp = new float[][hidden.length]; _pre = new float[][hidden.length];
-        foreach (i, ref h; hidden) { _inp[i] = new float[h.inSz]; _pre[i] = new float[h.outSz]; }
-        int houtSz = hidden.length > 0 ? hidden[$-1].outSz : inputSz;
-        _hout = new float[houtSz];
-        _hd    = new float[][heads.length]; _dHead = new float[][heads.length];
-        foreach (i, ref h; heads) { _hd[i] = new float[h.outSz]; _dHead[i] = new float[h.outSz]; }
+        int n = layerCount;
+        _inp = new float[][n]; _pre = new float[][n];
+        foreach (i; 0..n) {
+            _inp[i] = new float[_inSz[i]]; _inp[i][] = 0f;
+            _pre[i] = new float[_outSz[i]]; _pre[i][] = 0f;
+        }
+        int houtSz = n > 0 ? _outSz[n-1] : inputSz;
+        _hout = new float[houtSz]; _hout[] = 0f;
+        _hd = new float[][heads.length]; _dHead = new float[][heads.length];
+        foreach (i, ref h; heads) {
+            _hd[i] = new float[h.outSz]; _hd[i][] = 0f;
+            _dHead[i] = new float[h.outSz]; _dHead[i][] = 0f;
+        }
         int maxSz = inputSz;
-        foreach (ref h; hidden) { if (h.inSz > maxSz) maxSz = h.inSz; if (h.outSz > maxSz) maxSz = h.outSz; }
+        foreach (i; 0..n) {
+            if (_inSz[i] > maxSz) maxSz = _inSz[i];
+            if (_outSz[i] > maxSz) maxSz = _outSz[i];
+        }
         _dA = new float[maxSz]; _dB = new float[maxSz];
+        _dA[] = 0f; _dB[] = 0f;
         fwdCached = false;
     }
 
     void forward(const(float)[] x) nothrow @nogc {
-        if (hidden.length == 0) {
+        int n = layerCount;
+        if (n == 0) {
             foreach (k; 0..x.length) _hout[k] = x[k];
         } else {
             foreach (k; 0..x.length) _inp[0][k] = x[k];
-            foreach (i, ref h; hidden) {
-                h.forward(_inp[i][0..h.inSz], _pre[i]);
-                if (i + 1 < hidden.length)
-                    foreach (k; 0..h.outSz) _inp[i+1][k] = _pre[i][k] < 0f ? 0f : _pre[i][k];
-                else
-                    foreach (k; 0..h.outSz) _hout[k] = _pre[i][k] < 0f ? 0f : _pre[i][k];
+            foreach (i; 0..n) {
+                int oS = _outSz[i];
+                if (kinds[i] == 0) {
+                    lins[slot[i]].forward(_inp[i], _pre[i]);
+                    // Linear 뒤에만 ReLU
+                    if (i + 1 < n)
+                        foreach (k; 0..oS) _inp[i+1][k] = _pre[i][k] < 0f ? 0f : _pre[i][k];
+                    else
+                        foreach (k; 0..oS) _hout[k] = _pre[i][k] < 0f ? 0f : _pre[i][k];
+                } else {
+                    attns[slot[i]].fwd(_inp[i], _pre[i]);
+                    if (i + 1 < n)
+                        foreach (k; 0..oS) _inp[i+1][k] = _pre[i][k];
+                    else
+                        foreach (k; 0..oS) _hout[k] = _pre[i][k];
+                }
             }
         }
         foreach (i, ref head; heads) head.forward(_hout, _hd[i]);
@@ -246,18 +534,32 @@ private class Network {
             head.accum(_hout, _dHead[i], _dB[0..houtSz]);
             foreach (k; 0..houtSz) _dA[k] += _dB[k];
         }
-        for (int i = cast(int)hidden.length-1; i >= 0; i--) {
-            int outSz = hidden[i].outSz, inSz = hidden[i].inSz;
-            foreach (k; 0..outSz) if (_pre[i][k] <= 0f) _dA[k] = 0f;
-            _dB[0..inSz] = 0f;
-            hidden[i].accum(_inp[i][0..inSz], _dA[0..outSz], _dB[0..inSz]);
-            foreach (k; 0..inSz) _dA[k] = _dB[k];
+        for (int i = layerCount - 1; i >= 0; i--) {
+            int oS = _outSz[i], iS = _inSz[i];
+            if (kinds[i] == 0) {
+                foreach (k; 0..oS) if (_pre[i][k] <= 0f) _dA[k] = 0f;
+                _dB[0..iS] = 0f;
+                lins[slot[i]].accum(_inp[i], _dA[0..oS], _dB[0..iS]);
+            } else {
+                _dB[0..iS] = 0f;
+                attns[slot[i]].bwd(_inp[i], _dA[0..oS], _dB[0..iS]);
+            }
+            foreach (k; 0..iS) _dA[k] = _dB[k];
         }
         fwdCached = false;
     }
 
-    void zeroGrad() nothrow @nogc { foreach (ref h; hidden) h.zeroGrad(); foreach (ref h; heads) h.zeroGrad(); }
-    void step(Opt opt, float lr) nothrow { foreach (ref h; hidden) h.step(opt, lr); foreach (ref h; heads) h.step(opt, lr); }
+    void zeroGrad() nothrow @nogc {
+        foreach (ref h; lins)  h.zeroGrad();
+        foreach (ref a; attns) a.zeroGrad();
+        foreach (ref h; heads) h.zeroGrad();
+    }
+
+    void step(Opt opt, float lr) nothrow {
+        foreach (ref h; lins)  h.step(opt, lr);
+        foreach (ref a; attns) a.step(opt, lr);
+        foreach (ref h; heads) h.step(opt, lr);
+    }
 }
 
 // ─────────────────────────────────────────────
@@ -309,7 +611,9 @@ class BlackBoxAI {
     string[][] actionLists;   // 헤드별 액션 이름 (cos 헤드는 빈 배열)
     bool[]     cosModes;      // 헤드별 cos 여부
     int[]      outSizes;      // 헤드별 출력 개수
-    int[]      hiddenSizes;
+    int[]      hiddenSizes;   // Linear 층 폭 (호환용)
+    ubyte[]    layKind;       // 0=Linear, 1=Attn
+    int[]      layA, layB;    // Linear: A=폭 / Attn: A=조각수, B=헤드수
     float      lr = 0.01f;
     float      cosSigma = 1.0f;   // cos 헤드 탐험 폭
     float      entropy  = 0.01f;  // 이산 헤드 엔트로피 보너스
@@ -325,29 +629,46 @@ class BlackBoxAI {
 
     int nHeads() const nothrow @nogc { return cast(int) outSizes.length; }
 
-    this(string name, int inputSz, int[] hidden, int[] heads,
+    this(string name, int inputSz, ubyte[] lk, int[] la, int[] lb, int[] heads,
          string[][] actions, bool[] cos,
          Opt opt = Opt.adam, float sigma = 1.0f, float ent = 0.01f) {
         this.name = name; this.opt = opt;
         cosSigma = sigma; entropy = ent;
-        hiddenSizes = hidden.dup;
+        layKind = lk.dup; layA = la.dup; layB = lb.dup;
+        hiddenSizes = [];
+        foreach (i; 0..lk.length) if (lk[i] == 0) hiddenSizes ~= la[i];
         outSizes    = heads.dup;
         actionLists = actions.dup;
         cosModes    = cos.dup;
         file = name ~ "_ml_memory.pth";
+
+        string 층설명() {
+            string r = "[";
+            foreach (i; 0..layKind.length) {
+                if (i) r ~= ", ";
+                r ~= layKind[i] == 0 ? to!string(layA[i])
+                                     : "attn(" ~ to!string(layA[i]) ~ "," ~ to!string(layB[i]) ~ ")";
+            }
+            return r ~ "]";
+        }
 
         if (exists(file)) {
             try {
                 load();
                 bool same = (net.inputSz == inputSz)
                          && (outSizes.length == heads.length)
-                         && (hiddenSizes.length == hidden.length);
-                if (same) foreach (i, sz; hiddenSizes) if (sz != hidden[i]) { same = false; break; }
-                if (same) foreach (i, sz; outSizes)    if (sz != heads[i])  { same = false; break; }
+                         && (layKind.length == lk.length);
+                if (same) foreach (i; 0..lk.length)
+                    if (layKind[i] != lk[i] || layA[i] != la[i] || layB[i] != lb[i]) { same = false; break; }
+                if (same) foreach (i, sz; outSizes) if (sz != heads[i]) { same = false; break; }
                 if (!same) {
-                    writefln(" [%s] 저장된 구조 %s->%s 가 요청한 %s->%s 와 다릅니다. 새로 만듭니다.",
-                             name, hiddenSizes, outSizes, hidden, heads);
-                    hiddenSizes = hidden.dup; outSizes = heads.dup;
+                    string 저장된 = 층설명();
+                    layKind = lk.dup; layA = la.dup; layB = lb.dup;
+                    hiddenSizes = [];
+                    foreach (i; 0..lk.length) if (lk[i] == 0) hiddenSizes ~= la[i];
+                    writefln(" [%s] 저장된 구조 %s 가 요청한 %s 와 다릅니다. 새로 만듭니다.",
+                             name, 저장된, 층설명());
+                    outSizes = heads.dup;
                     actionLists = actions.dup; cosModes = cos.dup;
                     net = null; ready = false;
                 } else {
@@ -360,8 +681,8 @@ class BlackBoxAI {
             }
         }
         if (!ready) {
-            net = new Network(inputSz, hiddenSizes, outSizes);
-            writefln(" [%s] 새로 생성되었습니다. %s->%s", name, hiddenSizes, outSizes);
+            net = new Network(inputSz, layKind, layA, layB, outSizes);
+            writefln(" [%s] 새로 생성되었습니다. %s->%s", name, 층설명(), outSizes);
             ready = true;
         }
         _allocBufs();
@@ -517,10 +838,12 @@ class BlackBoxAI {
         auto f = File(file, "wb");
         void wu(uint v)  { f.rawWrite((&v)[0..1]); }
         void wf(float v) { f.rawWrite((&v)[0..1]); }
-        wu(0xBEEFCAFE); wu(6); wu(cast(uint)opt);
+        wu(0xBEEFCAFE); wu(7); wu(cast(uint)opt);
         wu(cast(uint)net.inputSz);
-        wu(cast(uint)hiddenSizes.length);
-        foreach (sz; hiddenSizes) wu(cast(uint)sz);
+        wu(cast(uint)layKind.length);
+        foreach (i; 0..layKind.length) {
+            wu(cast(uint)layKind[i]); wu(cast(uint)layA[i]); wu(cast(uint)layB[i]);
+        }
         wu(cast(uint)nHeads);
         foreach (h; 0..nHeads) {
             wu(cast(uint)outSizes[h]);
@@ -539,8 +862,19 @@ class BlackBoxAI {
             foreach (v; l.vB)   wf(v);
             wu(cast(uint)l.t);
         }
-        foreach (ref h; net.hidden) wl(h);
-        foreach (ref h; net.heads)  wl(h);
+        void wn(ref LN n) {
+            foreach (v; n.g) wf(v); foreach (v; n.mg) wf(v); foreach (v; n.vg) wf(v);
+            foreach (v; n.b) wf(v); foreach (v; n.mb) wf(v); foreach (v; n.vb) wf(v);
+            wu(cast(uint)n.t);
+        }
+        foreach (i; 0..net.layerCount) {
+            if (net.kinds[i] == 0) wl(net.lins[net.slot[i]]);
+            else {
+                auto a = &net.attns[net.slot[i]];
+                wn(a.ln); wl(a.wq); wl(a.wk); wl(a.wv); wl(a.wo);
+            }
+        }
+        foreach (ref h; net.heads) wl(h);
     }
 
     private void load() {
@@ -549,11 +883,16 @@ class BlackBoxAI {
         float rf()  { float v; f.rawRead((&v)[0..1]); return v; }
         if (ru() != 0xBEEFCAFE) throw new Exception("magic mismatch");
         uint ver = ru();
-        if (ver < 6) throw new Exception("예전 포맷입니다. change() 로 변환하세요");
+        if (ver < 7) throw new Exception("예전 포맷입니다. change() 로 변환하세요");
         opt = cast(Opt)ru();
         int inputSz = ru();
-        int nH = ru(); hiddenSizes = new int[nH];
-        foreach (i; 0..nH) hiddenSizes[i] = ru();
+        int nLay = ru();
+        layKind = new ubyte[nLay]; layA = new int[nLay]; layB = new int[nLay];
+        hiddenSizes = [];
+        foreach (i; 0..nLay) {
+            layKind[i] = cast(ubyte)ru(); layA[i] = ru(); layB[i] = ru();
+            if (layKind[i] == 0) hiddenSizes ~= layA[i];
+        }
         int nL = ru();
         outSizes = new int[nL]; cosModes = new bool[nL]; actionLists = new string[][nL];
         foreach (i; 0..nL) {
@@ -562,7 +901,7 @@ class BlackBoxAI {
             int nA = ru(); actionLists[i] = new string[nA];
             foreach (j; 0..nA) { auto buf = new ubyte[ru()]; f.rawRead(buf); actionLists[i][j] = cast(string)buf.dup; }
         }
-        net = new Network(inputSz, hiddenSizes, outSizes);
+        net = new Network(inputSz, layKind, layA, layB, outSizes);
         void rl_(ref Linear l) {
             foreach (ref row; l.w)  foreach (ref v; row) v = rf();
             foreach (ref v; l.b)    v = rf();
@@ -572,8 +911,19 @@ class BlackBoxAI {
             foreach (ref v; l.vB)   v = rf();
             l.t = ru();
         }
-        foreach (ref h; net.hidden) rl_(h);
-        foreach (ref h; net.heads)  rl_(h);
+        void rn_(ref LN n) {
+            foreach (ref v; n.g) v = rf(); foreach (ref v; n.mg) v = rf(); foreach (ref v; n.vg) v = rf();
+            foreach (ref v; n.b) v = rf(); foreach (ref v; n.mb) v = rf(); foreach (ref v; n.vb) v = rf();
+            n.t = ru();
+        }
+        foreach (i; 0..net.layerCount) {
+            if (net.kinds[i] == 0) rl_(net.lins[net.slot[i]]);
+            else {
+                auto a = &net.attns[net.slot[i]];
+                rn_(a.ln); rl_(a.wq); rl_(a.wk); rl_(a.wv); rl_(a.wo);
+            }
+        }
+        foreach (ref h; net.heads) rl_(h);
     }
 }
 
@@ -626,12 +976,12 @@ string changeFile(string path) {
         uint ru() { uint v; f.rawRead((&v)[0..1]); return v; }
         if (ru() != 0xBEEFCAFE) throw new Exception("my_ml 포맷이 아닙니다");
         uint ver = ru();
-        if (ver >= 6) return "already";
+        if (ver >= 7) return "already";
         if (ver >= 2) o = cast(Opt) ru();
 
         bool cos3 = false; int out3 = 0;
         if (ver == 3) { cos3 = ru() != 0; out3 = ru(); }
-        bool ver4 = (ver == 4 || ver == 5);
+        bool ver4 = (ver >= 4);
         bool ver5 = (ver == 5);
 
         inputSz = ru();
@@ -665,10 +1015,10 @@ string changeFile(string path) {
 
     auto w = File(path, "wb");
     void wu(uint v) { w.rawWrite((&v)[0..1]); }
-    wu(0xBEEFCAFE); wu(6); wu(cast(uint) o);
+    wu(0xBEEFCAFE); wu(7); wu(cast(uint) o);
     wu(cast(uint) inputSz);
     wu(cast(uint) nH);
-    foreach (sz; hid) wu(cast(uint) sz);
+    foreach (sz; hid) { wu(0u); wu(cast(uint) sz); wu(0u); }   // 전부 Linear 층
     wu(cast(uint) nL);
     foreach (i; 0..nL) {
         wu(cast(uint) outSizes[i]);
@@ -767,24 +1117,479 @@ extern(C) void bbai_dtor(PyObject* cap) nothrow @trusted {
 // ─────────────────────────────────────────────
 // Python extension functions
 // ─────────────────────────────────────────────
+// GPT — 트랜스포머 언어 모델
+// ─────────────────────────────────────────────
+//   토큰 열 -> 다음 토큰 확률
+//   구조: 임베딩 + (LayerNorm -> 어텐션 -> LayerNorm -> FFN) x L -> 출력
+//   전부 손으로 역전파한다. 기울기는 수치미분으로 검증했다.
+// ─────────────────────────────────────────────
+
+// ── 트랜스포머 블록 하나 ──────────────────────
+private final class Block {
+    int D, H, dh, F, maxT;
+    LN ln1, ln2;
+    Linear wq, wk, wv, wo;   // 어텐션
+    Linear fc1, fc2;         // FFN
+
+    // 순전파 캐시
+    float[] x1;      // ln1 출력          T*D
+    float[] q, k, v; // T*D
+    float[] att;     // H*T*T  (softmax 결과)
+    float[] ao;      // 어텐션 출력 (헤드 합침) T*D
+    float[] po;      // wo 통과            T*D
+    float[] r1;      // 잔차 1             T*D
+    float[] x2;      // ln2 출력          T*D
+    float[] h1;      // fc1 출력          T*F
+    float[] h2;      // relu(h1)          T*F
+    float[] fo;      // fc2 출력          T*D
+
+    // 역전파 임시
+    float[] dx1, dq, dk, dv, datt, dao, dpo, dx2, dh1, dh2;
+
+    this(int d, int h, int maxT_) {
+        D = d; H = h; dh = d / h; F = 4 * d; maxT = maxT_;
+        ln1 = LN(d, maxT); ln2 = LN(d, maxT);
+        wq = Linear(d, d); wk = Linear(d, d); wv = Linear(d, d); wo = Linear(d, d);
+        fc1 = Linear(d, F); fc2 = Linear(F, d);
+
+        x1 = new float[maxT*d]; q = new float[maxT*d];
+        k  = new float[maxT*d]; v = new float[maxT*d];
+        att = new float[h*maxT*maxT];
+        ao = new float[maxT*d]; po = new float[maxT*d]; r1 = new float[maxT*d];
+        x2 = new float[maxT*d]; h1 = new float[maxT*F]; h2 = new float[maxT*F];
+        fo = new float[maxT*d];
+
+        dx1 = new float[maxT*d]; dq = new float[maxT*d];
+        dk  = new float[maxT*d]; dv = new float[maxT*d];
+        datt = new float[h*maxT*maxT];
+        dao = new float[maxT*d]; dpo = new float[maxT*d];
+        dx2 = new float[maxT*d]; dh1 = new float[maxT*F]; dh2 = new float[maxT*F];
+        // NaN 으로 시작하지 않도록 전부 0
+        foreach (a; [x1,q,k,v,att,ao,po,r1,x2,h1,h2,fo,
+                     dx1,dq,dk,dv,datt,dao,dpo,dx2,dh1,dh2]) a[] = 0f;
+    }
+
+    // 입력 x (T*D) -> 출력 y (T*D). x 는 역전파에서 다시 쓰므로 보존해야 한다.
+    void fwd(const(float)[] x, float[] y, int T) nothrow @nogc {
+        ln1.fwd(x, x1, T);
+        foreach (t_; 0..T) {
+            wq.forward(x1[t_*D .. t_*D+D], q[t_*D .. t_*D+D]);
+            wk.forward(x1[t_*D .. t_*D+D], k[t_*D .. t_*D+D]);
+            wv.forward(x1[t_*D .. t_*D+D], v[t_*D .. t_*D+D]);
+        }
+
+        float scale = 1f / sqrt(cast(float) dh);
+        foreach (hh; 0..H) {
+            foreach (t_; 0..T) {
+                // 인과 마스크: s <= t 만 본다
+                float mx = -1e30f;
+                foreach (s; 0..t_+1) {
+                    float dot = 0f;
+                    foreach (i; 0..dh)
+                        dot += q[t_*D + hh*dh + i] * k[s*D + hh*dh + i];
+                    dot *= scale;
+                    att[hh*maxT*maxT + t_*maxT + s] = dot;
+                    if (dot > mx) mx = dot;
+                }
+                float sum = 0f;
+                foreach (s; 0..t_+1) {
+                    float e = exp(att[hh*maxT*maxT + t_*maxT + s] - mx);
+                    att[hh*maxT*maxT + t_*maxT + s] = e;
+                    sum += e;
+                }
+                float inv = 1f / sum;
+                foreach (s; 0..t_+1) att[hh*maxT*maxT + t_*maxT + s] *= inv;
+                // 가중합
+                foreach (i; 0..dh) {
+                    float acc = 0f;
+                    foreach (s; 0..t_+1)
+                        acc += att[hh*maxT*maxT + t_*maxT + s] * v[s*D + hh*dh + i];
+                    ao[t_*D + hh*dh + i] = acc;
+                }
+            }
+        }
+
+        foreach (t_; 0..T) wo.forward(ao[t_*D .. t_*D+D], po[t_*D .. t_*D+D]);
+        foreach (i; 0..T*D) r1[i] = x[i] + po[i];      // 잔차 1
+
+        ln2.fwd(r1, x2, T);
+        foreach (t_; 0..T) {
+            fc1.forward(x2[t_*D .. t_*D+D], h1[t_*F .. t_*F+F]);
+            foreach (i; 0..F) h2[t_*F + i] = h1[t_*F + i] < 0f ? 0f : h1[t_*F + i];
+            fc2.forward(h2[t_*F .. t_*F+F], fo[t_*D .. t_*D+D]);
+        }
+        foreach (i; 0..T*D) y[i] = r1[i] + fo[i];      // 잔차 2
+    }
+
+    // dy -> dx
+    void bwd(const(float)[] x, const(float)[] dy, float[] dx, int T) nothrow @nogc {
+        // 잔차 2: dr1 += dy, dfo = dy
+        dx2[0..T*D] = 0f;
+        foreach (t_; 0..T) {
+            dh2[t_*F .. t_*F+F] = 0f;
+            fc2.accum(h2[t_*F .. t_*F+F], dy[t_*D .. t_*D+D], dh2[t_*F .. t_*F+F]);
+            foreach (i; 0..F) dh1[t_*F + i] = h1[t_*F + i] > 0f ? dh2[t_*F + i] : 0f;
+            fc1.accum(x2[t_*D .. t_*D+D], dh1[t_*F .. t_*F+F], dx2[t_*D .. t_*D+D]);
+        }
+        // ln2 를 통과해 r1 로
+        auto dr1 = dpo;                 // 임시 재사용
+        dr1[0..T*D] = 0f;
+        ln2.bwd(r1, dx2[0..T*D], dr1[0..T*D], T);
+        foreach (i; 0..T*D) dr1[i] += dy[i];     // 잔차 2 의 통과분
+
+        // 잔차 1: dx += dr1, dpo_att = dr1
+        dao[0..T*D] = 0f;
+        foreach (t_; 0..T)
+            wo.accum(ao[t_*D .. t_*D+D], dr1[t_*D .. t_*D+D], dao[t_*D .. t_*D+D]);
+
+        // 어텐션 역전파
+        dq[0..T*D] = 0f; dk[0..T*D] = 0f; dv[0..T*D] = 0f;
+        float scale = 1f / sqrt(cast(float) dh);
+        foreach (hh; 0..H) {
+            foreach (t_; 0..T) {
+                // dao -> datt, dv
+                foreach (s; 0..t_+1) {
+                    float a = att[hh*maxT*maxT + t_*maxT + s];
+                    float d_ = 0f;
+                    foreach (i; 0..dh) {
+                        d_ += dao[t_*D + hh*dh + i] * v[s*D + hh*dh + i];
+                        dv[s*D + hh*dh + i] += a * dao[t_*D + hh*dh + i];
+                    }
+                    datt[hh*maxT*maxT + t_*maxT + s] = d_;
+                }
+                // softmax 역전파
+                float dot = 0f;
+                foreach (s; 0..t_+1)
+                    dot += datt[hh*maxT*maxT + t_*maxT + s] * att[hh*maxT*maxT + t_*maxT + s];
+                foreach (s; 0..t_+1) {
+                    float a = att[hh*maxT*maxT + t_*maxT + s];
+                    float ds = a * (datt[hh*maxT*maxT + t_*maxT + s] - dot) * scale;
+                    foreach (i; 0..dh) {
+                        dq[t_*D + hh*dh + i] += ds * k[s*D + hh*dh + i];
+                        dk[s*D + hh*dh + i] += ds * q[t_*D + hh*dh + i];
+                    }
+                }
+            }
+        }
+
+        dx1[0..T*D] = 0f;
+        foreach (t_; 0..T) {
+            wq.accum(x1[t_*D .. t_*D+D], dq[t_*D .. t_*D+D], dx1[t_*D .. t_*D+D]);
+            wk.accum(x1[t_*D .. t_*D+D], dk[t_*D .. t_*D+D], dx1[t_*D .. t_*D+D]);
+            wv.accum(x1[t_*D .. t_*D+D], dv[t_*D .. t_*D+D], dx1[t_*D .. t_*D+D]);
+        }
+        ln1.bwd(x, dx1[0..T*D], dx, T);
+        foreach (i; 0..T*D) dx[i] += dr1[i];     // 잔차 1 의 통과분
+    }
+
+    void zero() nothrow @nogc {
+        ln1.zero(); ln2.zero();
+        wq.zeroGrad(); wk.zeroGrad(); wv.zeroGrad(); wo.zeroGrad();
+        fc1.zeroGrad(); fc2.zeroGrad();
+    }
+
+    void step(Opt o, float lr) nothrow {
+        ln1.step(o, lr); ln2.step(o, lr);
+        wq.step(o, lr); wk.step(o, lr); wv.step(o, lr); wo.step(o, lr);
+        fc1.step(o, lr); fc2.step(o, lr);
+    }
+}
+
+// ── GPT 본체 ──────────────────────────────────
+final class GPT {
+    string name, file;
+    int V, D, H, L, maxT;
+    float lr = 3e-4f;
+    Opt opt;
+
+    float[] tok, pos;            // 임베딩: V*D, maxT*D
+    float[] gTok, gPos;
+    float[] mTok, vTok, mPos, vPos;
+    int embT;
+
+    Block[] blocks;
+    LN lnf;
+    Linear head;                 // D -> V
+
+    // 활성값 (층마다 입력을 남겨야 역전파가 된다)
+    float[][] xs;                // (L+1) 개, 각 maxT*D
+    float[] xf;                  // lnf 출력
+    float[] logits;              // maxT*V
+    float[] probs;               // maxT*V
+    float[] dx, dxf, dlogits;
+
+    this(string name_, int vocab, int dim, int heads, int layers, int ctx,
+         Opt o = Opt.adam, float lr_ = 3e-4f) {
+        name = name_; file = name_ ~ "_lm.pth";
+        V = vocab; D = dim; H = heads; L = layers; maxT = ctx;
+        opt = o; lr = lr_;
+
+        tok = new float[V*D]; pos = new float[maxT*D];
+        gTok = new float[V*D]; gPos = new float[maxT*D];
+        mTok = new float[V*D]; vTok = new float[V*D];
+        mPos = new float[maxT*D]; vPos = new float[maxT*D];
+        gTok[] = 0f; gPos[] = 0f;
+        mTok[] = 0f; vTok[] = 0f; mPos[] = 0f; vPos[] = 0f;
+        float s = 0.02f;
+        foreach (i; 0..V*D)    tok[i] = uniform(-s, s, rng);
+        foreach (i; 0..maxT*D) pos[i] = uniform(-s, s, rng);
+
+        blocks = new Block[layers];
+        foreach (i; 0..layers) blocks[i] = new Block(dim, heads, ctx);
+        lnf = LN(dim, ctx);
+        head = Linear(dim, vocab);
+
+        xs = new float[][](layers+1, ctx*dim);
+        foreach (a; xs) a[] = 0f;
+        xf = new float[ctx*dim];
+        logits = new float[ctx*vocab];
+        probs  = new float[ctx*vocab];
+        dx = new float[ctx*dim]; dxf = new float[ctx*dim];
+        dlogits = new float[ctx*vocab];
+        xf[] = 0f; logits[] = 0f; probs[] = 0f;
+        dx[] = 0f; dxf[] = 0f; dlogits[] = 0f;
+    }
+
+    long paramCount() const {
+        long n = cast(long)V*D + cast(long)maxT*D;          // 임베딩
+        n += cast(long)L * (12L*D*D + 13L*D);               // 블록 (대략)
+        n += 2L*D + cast(long)D*V + V;                      // lnf + head
+        return n;
+    }
+
+    // 순전파. toks 길이 T -> logits (T*V)
+    void forward(const(int)[] toks, int T) nothrow @nogc {
+        foreach (t_; 0..T) {
+            int id = toks[t_];
+            foreach (i; 0..D) xs[0][t_*D + i] = tok[id*D + i] + pos[t_*D + i];
+        }
+        foreach (l; 0..L) blocks[l].fwd(xs[l][0..T*D], xs[l+1][0..T*D], T);
+        lnf.fwd(xs[L][0..T*D], xf, T);
+        foreach (t_; 0..T) head.forward(xf[t_*D .. t_*D+D], logits[t_*V .. t_*V+V]);
+    }
+
+    // 다음 토큰 맞히기 손실. targets[t] = toks[t+1]
+    // 반환: 평균 교차엔트로피. 기울기는 누적된다.
+    float backward(const(int)[] toks, const(int)[] targets, int T) nothrow @nogc {
+        float loss = 0f;
+        foreach (t_; 0..T) {
+            auto lg = logits[t_*V .. t_*V+V];
+            float mx = lg[0];
+            foreach (v_; lg) if (v_ > mx) mx = v_;
+            float sum = 0f;
+            foreach (i; 0..V) { float e = exp(lg[i] - mx); probs[t_*V + i] = e; sum += e; }
+            float inv = 1f / sum;
+            foreach (i; 0..V) probs[t_*V + i] *= inv;
+            int tgt = targets[t_];
+            loss -= log(probs[t_*V + tgt] + 1e-12f);
+            foreach (i; 0..V)
+                dlogits[t_*V + i] = (probs[t_*V + i] - (i == tgt ? 1f : 0f)) / T;
+        }
+
+        dxf[0..T*D] = 0f;
+        foreach (t_; 0..T)
+            head.accum(xf[t_*D .. t_*D+D], dlogits[t_*V .. t_*V+V], dxf[t_*D .. t_*D+D]);
+
+        dx[0..T*D] = 0f;
+        lnf.bwd(xs[L][0..T*D], dxf[0..T*D], dx[0..T*D], T);
+
+        for (int l = L-1; l >= 0; l--) {
+            dxf[0..T*D] = 0f;               // Block.bwd 는 누적하므로 먼저 비운다
+            blocks[l].bwd(xs[l][0..T*D], dx[0..T*D], dxf[0..T*D], T);
+            dx[0..T*D] = dxf[0..T*D];
+        }
+
+        foreach (t_; 0..T) {
+            int id = toks[t_];
+            foreach (i; 0..D) {
+                gTok[id*D + i] += dx[t_*D + i];
+                gPos[t_*D + i] += dx[t_*D + i];
+            }
+        }
+        return loss / T;
+    }
+
+    void zeroGrad() nothrow @nogc {
+        gTok[] = 0f; gPos[] = 0f;
+        foreach (b; blocks) b.zero();
+        lnf.zero(); head.zeroGrad();
+    }
+
+    void step() nothrow {
+        adamVec(tok, gTok, mTok, vTok, opt, lr, embT);
+        adamVec(pos, gPos, mPos, vPos, opt, lr, embT);
+        embT++;
+        foreach (b; blocks) b.step(opt, lr);
+        lnf.step(opt, lr);
+        head.step(opt, lr);
+    }
+
+    // 한 덩어리 학습. 반환 = 손실
+    float trainOn(const(int)[] toks, const(int)[] targets, int T) {
+        zeroGrad();
+        forward(toks, T);
+        float l = backward(toks, targets, T);
+        step();
+        return l;
+    }
+
+    // 다음 토큰 하나 뽑기 (temperature, top-k)
+    int sample(const(int)[] ctx, int T, float temp, int topk) {
+        forward(ctx, T);
+        auto lg = logits[(T-1)*V .. T*V];
+        auto p = new float[V];
+        float mx = -1e30f;
+        foreach (i; 0..V) { p[i] = lg[i] / (temp <= 0f ? 1e-6f : temp); if (p[i] > mx) mx = p[i]; }
+        float sum = 0f;
+        foreach (i; 0..V) { p[i] = exp(p[i] - mx); sum += p[i]; }
+        foreach (i; 0..V) p[i] /= sum;
+
+        if (topk > 0 && topk < V) {
+            // topk 밖은 버린다
+            auto idx = new int[V];
+            foreach (i; 0..V) idx[i] = i;
+            // 부분 선택 정렬 (topk 가 작으니 충분)
+            foreach (a; 0..topk) {
+                int best = a;
+                foreach (b2; a+1..V) if (p[idx[b2]] > p[idx[best]]) best = b2;
+                auto tmp = idx[a]; idx[a] = idx[best]; idx[best] = tmp;
+            }
+            float keep = 0f;
+            foreach (a; 0..topk) keep += p[idx[a]];
+            foreach (a; topk..V) p[idx[a]] = 0f;
+            foreach (i; 0..V) p[i] /= keep;
+        }
+
+        double r = uniform01!double(rng), cum = 0.0;
+        foreach (i; 0..V) { cum += p[i]; if (r < cum) return i; }
+        return V-1;
+    }
+}
+
+// ── GPT 저장 / 불러오기 ───────────────────────
+// 파일: 이름_lm.pth   (magic 0x11ADCAFE)
+private void wLinear(ref File f, ref Linear l) {
+    void wf(float v) { f.rawWrite((&v)[0..1]); }
+    void wu(uint v)  { f.rawWrite((&v)[0..1]); }
+    foreach (row; l.w)  foreach (v; row) wf(v);
+    foreach (row; l.mW) foreach (v; row) wf(v);
+    foreach (row; l.vW) foreach (v; row) wf(v);
+    foreach (v; l.b)  wf(v);
+    foreach (v; l.mB) wf(v);
+    foreach (v; l.vB) wf(v);
+    wu(cast(uint) l.t);
+}
+
+private void rLinear(ref File f, ref Linear l) {
+    float rf() { float v; f.rawRead((&v)[0..1]); return v; }
+    uint  ru() { uint v;  f.rawRead((&v)[0..1]); return v; }
+    foreach (ref row; l.w)  foreach (ref v; row) v = rf();
+    foreach (ref row; l.mW) foreach (ref v; row) v = rf();
+    foreach (ref row; l.vW) foreach (ref v; row) v = rf();
+    foreach (ref v; l.b)  v = rf();
+    foreach (ref v; l.mB) v = rf();
+    foreach (ref v; l.vB) v = rf();
+    l.t = ru();
+}
+
+private void wVec(ref File f, float[] a) { foreach (v; a) f.rawWrite((&v)[0..1]); }
+private void rVec(ref File f, float[] a) { foreach (ref v; a) { float t; f.rawRead((&t)[0..1]); v = t; } }
+
+private void wLN(ref File f, ref LN n) {
+    void wu(uint v) { f.rawWrite((&v)[0..1]); }
+    wVec(f, n.g); wVec(f, n.mg); wVec(f, n.vg);
+    wVec(f, n.b); wVec(f, n.mb); wVec(f, n.vb);
+    wu(cast(uint) n.t);
+}
+private void rLN(ref File f, ref LN n) {
+    uint ru() { uint v; f.rawRead((&v)[0..1]); return v; }
+    rVec(f, n.g); rVec(f, n.mg); rVec(f, n.vg);
+    rVec(f, n.b); rVec(f, n.mb); rVec(f, n.vb);
+    n.t = ru();
+}
+
+void saveGPT(GPT g, string[] vocab) {
+    auto f = File(g.file, "wb");
+    void wu(uint v) { f.rawWrite((&v)[0..1]); }
+    void wf(float v) { f.rawWrite((&v)[0..1]); }
+    wu(0x11ADCAFE); wu(1); wu(cast(uint) g.opt); wf(g.lr);
+    wu(cast(uint) g.V); wu(cast(uint) g.D); wu(cast(uint) g.H);
+    wu(cast(uint) g.L); wu(cast(uint) g.maxT);
+    wu(cast(uint) vocab.length);
+    foreach (s; vocab) {
+        auto b = cast(ubyte[]) s;
+        wu(cast(uint) b.length);
+        if (b.length) f.rawWrite(b);
+    }
+    wVec(f, g.tok); wVec(f, g.mTok); wVec(f, g.vTok);
+    wVec(f, g.pos); wVec(f, g.mPos); wVec(f, g.vPos);
+    wu(cast(uint) g.embT);
+    foreach (b; g.blocks) {
+        wLN(f, b.ln1); wLN(f, b.ln2);
+        wLinear(f, b.wq); wLinear(f, b.wk); wLinear(f, b.wv); wLinear(f, b.wo);
+        wLinear(f, b.fc1); wLinear(f, b.fc2);
+    }
+    wLN(f, g.lnf);
+    wLinear(f, g.head);
+}
+
+// 반환: 어휘 목록. 실패하면 예외.
+string[] loadGPT(string name, out GPT g) {
+    string path = name ~ "_lm.pth";
+    auto f = File(path, "rb");
+    uint ru() { uint v; f.rawRead((&v)[0..1]); return v; }
+    float rf() { float v; f.rawRead((&v)[0..1]); return v; }
+    if (ru() != 0x11ADCAFE) throw new Exception("lm 포맷이 아닙니다");
+    uint ver = ru();
+    if (ver != 1) throw new Exception("모르는 lm 버전");
+    Opt o = cast(Opt) ru();
+    float lr = rf();
+    int V = ru(), D = ru(), H = ru(), L = ru(), T = ru();
+    int nv = ru();
+    auto vocab = new string[nv];
+    foreach (i; 0..nv) {
+        int n = ru();
+        if (n == 0) { vocab[i] = ""; continue; }
+        auto b = new ubyte[n]; f.rawRead(b); vocab[i] = cast(string) b.dup;
+    }
+    g = new GPT(name, V, D, H, L, T, o, lr);
+    rVec(f, g.tok); rVec(f, g.mTok); rVec(f, g.vTok);
+    rVec(f, g.pos); rVec(f, g.mPos); rVec(f, g.vPos);
+    g.embT = ru();
+    foreach (b; g.blocks) {
+        rLN(f, b.ln1); rLN(f, b.ln2);
+        rLinear(f, b.wq); rLinear(f, b.wk); rLinear(f, b.wv); rLinear(f, b.wo);
+        rLinear(f, b.fc1); rLinear(f, b.fc2);
+    }
+    rLN(f, g.lnf);
+    rLinear(f, g.head);
+    return vocab;
+}
+
+// ─────────────────────────────────────────────
 extern(C) nothrow @trusted:
 
 PyObject* py_ml_make(PyObject* self, PyObject* args) {
     try {
         PyObject* nm; int inputSz; PyObject* hid; PyObject* heads;
         PyObject* acts; PyObject* coss; PyObject* opt;
-        double sigma, ent;
-        if (!PyArg_ParseTuple(args, "OiOOOOOdd", &nm, &inputSz, &hid, &heads, &acts, &coss, &opt, &sigma, &ent))
+        PyObject* lk; PyObject* lb2; double sigma, ent;
+        if (!PyArg_ParseTuple(args, "OiOOOOOOOdd", &nm, &inputSz, &lk, &hid, &lb2,
+                              &heads, &acts, &coss, &opt, &sigma, &ent))
             return null;
         string name   = fromStringz(PyUnicode_AsUTF8(nm)).idup;
         string optStr = fromStringz(PyUnicode_AsUTF8(opt)).idup;
-        int[] hidden  = pyIntList(hid);
+        int[] kindsI  = pyIntList(lk);
+        int[] la      = pyIntList(hid);
+        int[] lbv     = pyIntList(lb2);
+        auto  lkb     = new ubyte[kindsI.length];
+        foreach (i, v; kindsI) lkb[i] = cast(ubyte) v;
         int[] hsz     = pyIntList(heads);
         string[][] al = pyLals(acts);
         int[] cosI    = pyIntList(coss);
         auto cosB = new bool[cosI.length];
         foreach (i, v; cosI) cosB[i] = v != 0;
-        auto ai = new BlackBoxAI(name, inputSz, hidden, hsz, al, cosB, parseOpt(optStr),
+        auto ai = new BlackBoxAI(name, inputSz, lkb, la, lbv, hsz, al, cosB, parseOpt(optStr),
                                  cast(float)sigma, cast(float)ent);
         GC.addRoot(cast(void*) ai);
         return PyCapsule_New(cast(void*) ai, "BlackBoxAI", &bbai_dtor);
@@ -877,6 +1682,141 @@ PyObject* py_ml_save(PyObject* self, PyObject* args) {
     } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _ml_save"); return null; }
 }
 
+// ─────────────────────────────────────────────
+// LM (GPT) C API
+// ─────────────────────────────────────────────
+extern(C) void gpt_dtor(PyObject* cap) nothrow @trusted {
+    auto g = cast(GPT) PyCapsule_GetPointer(cap, "GPT");
+    if (g) try { GC.removeRoot(cast(void*) g); } catch (Throwable) {}
+}
+
+PyObject* py_lm_make(PyObject* self, PyObject* args) {
+    try {
+        PyObject* nm; int V, D, H, L, T; PyObject* opt; double lr;
+        if (!PyArg_ParseTuple(args, "OiiiiiOd", &nm, &V, &D, &H, &L, &T, &opt, &lr))
+            return null;
+        string name   = fromStringz(PyUnicode_AsUTF8(nm)).idup;
+        string optStr = fromStringz(PyUnicode_AsUTF8(opt)).idup;
+        if (D % H != 0) {
+            PyErr_SetString(_pyRuntimeError, "my_ml: 폭(dim)은 헤드 수로 나누어떨어져야 합니다");
+            return null;
+        }
+        auto g = new GPT(name, V, D, H, L, T, parseOpt(optStr), cast(float) lr);
+        GC.addRoot(cast(void*) g);
+        return PyCapsule_New(cast(void*) g, "GPT", &gpt_dtor);
+    } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _lm_make"); return null; }
+}
+
+// 저장된 파일에서 불러오기. 없으면 None. 성공하면 (캡슐, 어휘목록, 설정)
+PyObject* py_lm_load(PyObject* self, PyObject* args) {
+    try {
+        PyObject* nm;
+        if (!PyArg_ParseTuple(args, "O", &nm)) return null;
+        string name = fromStringz(PyUnicode_AsUTF8(nm)).idup;
+        if (!exists(name ~ "_lm.pth")) { Py_IncRef(_pyNone); return _pyNone; }
+        GPT g;
+        string[] vocab;
+        try { vocab = loadGPT(name, g); }
+        catch (Exception e) { Py_IncRef(_pyNone); return _pyNone; }
+        GC.addRoot(cast(void*) g);
+        auto cap = PyCapsule_New(cast(void*) g, "GPT", &gpt_dtor);
+        auto tup = PyList_New(3);
+        PyList_SetItem(tup, 0, cap);
+        PyList_SetItem(tup, 1, toPyList(vocab));
+        auto cfg = PyList_New(5);
+        PyList_SetItem(cfg, 0, PyLong_FromLong(g.V));
+        PyList_SetItem(cfg, 1, PyLong_FromLong(g.D));
+        PyList_SetItem(cfg, 2, PyLong_FromLong(g.H));
+        PyList_SetItem(cfg, 3, PyLong_FromLong(g.L));
+        PyList_SetItem(cfg, 4, PyLong_FromLong(g.maxT));
+        PyList_SetItem(tup, 2, cfg);
+        return tup;
+    } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _lm_load"); return null; }
+}
+
+// 토큰 열 하나로 한 번 학습. 반환 = 손실
+PyObject* py_lm_train(PyObject* self, PyObject* args) {
+    try {
+        PyObject* cap; PyObject* toks;
+        if (!PyArg_ParseTuple(args, "OO", &cap, &toks)) return null;
+        auto g = cast(GPT) PyCapsule_GetPointer(cap, "GPT");
+        auto ids = pyIntList(toks);
+        int n = cast(int) ids.length;
+        if (n < 2) return PyFloat_FromDouble(0.0);
+        int T = n - 1;
+        if (T > g.maxT) T = g.maxT;
+        auto inp = ids[0 .. T];
+        auto tgt = ids[1 .. T+1];
+        float l = g.trainOn(inp, tgt, T);
+        return PyFloat_FromDouble(cast(double) l);
+    } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _lm_train"); return null; }
+}
+
+// 손실만 계산 (학습 안 함)
+PyObject* py_lm_loss(PyObject* self, PyObject* args) {
+    try {
+        PyObject* cap; PyObject* toks;
+        if (!PyArg_ParseTuple(args, "OO", &cap, &toks)) return null;
+        auto g = cast(GPT) PyCapsule_GetPointer(cap, "GPT");
+        auto ids = pyIntList(toks);
+        int n = cast(int) ids.length;
+        if (n < 2) return PyFloat_FromDouble(0.0);
+        int T = n - 1;
+        if (T > g.maxT) T = g.maxT;
+        g.forward(ids[0 .. T], T);
+        double loss = 0;
+        foreach (t_; 0..T) {
+            auto lg = g.logits[t_*g.V .. t_*g.V + g.V];
+            double mx = lg[0];
+            foreach (v_; lg) if (v_ > mx) mx = v_;
+            double sum = 0;
+            foreach (i; 0..g.V) sum += exp(cast(double) lg[i] - mx);
+            loss -= (cast(double) lg[ids[t_+1]] - mx) - log(sum);
+        }
+        return PyFloat_FromDouble(loss / T);
+    } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _lm_loss"); return null; }
+}
+
+// 다음 토큰 하나 뽑기
+PyObject* py_lm_sample(PyObject* self, PyObject* args) {
+    try {
+        PyObject* cap; PyObject* toks; double temp; int topk;
+        if (!PyArg_ParseTuple(args, "OOdi", &cap, &toks, &temp, &topk)) return null;
+        auto g = cast(GPT) PyCapsule_GetPointer(cap, "GPT");
+        auto ids = pyIntList(toks);
+        int T = cast(int) ids.length;
+        if (T == 0) { PyErr_SetString(_pyRuntimeError, "my_ml: 입력이 비었습니다"); return null; }
+        if (T > g.maxT) { ids = ids[$-g.maxT .. $]; T = g.maxT; }
+        return PyLong_FromLong(g.sample(ids, T, cast(float) temp, topk));
+    } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _lm_sample"); return null; }
+}
+
+PyObject* py_lm_save(PyObject* self, PyObject* args) {
+    try {
+        PyObject* cap; PyObject* vocab;
+        if (!PyArg_ParseTuple(args, "OO", &cap, &vocab)) return null;
+        auto g = cast(GPT) PyCapsule_GetPointer(cap, "GPT");
+        saveGPT(g, pyStrList(vocab));
+        Py_IncRef(_pyNone); return _pyNone;
+    } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _lm_save"); return null; }
+}
+
+PyObject* py_lm_info(PyObject* self, PyObject* args) {
+    try {
+        PyObject* cap;
+        if (!PyArg_ParseTuple(args, "O", &cap)) return null;
+        auto g = cast(GPT) PyCapsule_GetPointer(cap, "GPT");
+        auto d = PyDict_New();
+        void put(string k, long v) {
+            auto o = PyLong_FromLong(v);
+            PyDict_SetItemString(d, toStringz(k), o); Py_DecRef(o);
+        }
+        put("vocab", g.V); put("dim", g.D); put("heads", g.H);
+        put("layers", g.L); put("ctx", g.maxT); put("params", g.paramCount());
+        return d;
+    } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _lm_info"); return null; }
+}
+
 PyObject* py_ml_change(PyObject* self, PyObject* args) {
     try {
         PyObject* po;
@@ -916,7 +1856,7 @@ PyObject* py_ml_export_weights(PyObject* self, PyObject* args) {
         auto d  = PyDict_New();
         if (!ai || !ai.ready) return d;
         auto net = ai.net;
-        foreach (i, ref h; net.hidden) {
+        foreach (i, ref h; net.lins) {
             auto wflat = PyList_New(h.outSz * h.inSz); Py_ssize_t idx = 0;
             foreach (row; h.w) foreach (v; row) PyList_SetItem(wflat, idx++, PyFloat_FromDouble(v));
             string wkey = "hidden." ~ to!string(2*i) ~ ".weight";
@@ -978,6 +1918,26 @@ class _Cos:
 
 cos = _Cos()
 COS = cos          # 옛 이름
+
+
+class _Attn:
+    """어텐션 층 표시. 폭은 그대로 두고, 값들끼리 서로 참조하게 한다.
+
+        attn(8)      -> 폭을 8조각으로 나눠 서로 참조 (헤드 1)
+        attn(8, 2)   -> 조각 8, 헤드 2
+    """
+    __slots__ = ("items", "heads")
+
+    def __init__(self, items=4, heads=1):
+        self.items, self.heads = int(items), int(heads)
+
+    def __call__(self, items, heads=1):
+        return _Attn(items, heads)
+
+    def __repr__(self):
+        return f"attn({self.items}, {self.heads})"
+
+attn = _Attn()
 
 
 class Step:
@@ -1133,16 +2093,33 @@ def make(model_name, layers, outputs, optimizer='adam', sigma=1.0, entropy=0.01)
     """
     model_name : 모델 이름 (가중치 파일명)
     layers     : [입력수, 은닉...]   출력은 outputs 에서 정해진다
+                 은닉 자리에 attn(조각수) 를 넣으면 어텐션 층이 된다
+                 예) [38, 128, attn(8), 128]
     outputs    : 출력 하나면  ["A","B"]  또는  cos
                  여러 개면   [cos, ["A","B"], cos, ...]
                  cos 값의 범위는 쓰는 쪽에서 알아서 정한다
     sigma      : cos 가 값을 얼마나 넓게 탐험할지 (기본 1.0)
     entropy    : 고르는 쪽이 한 답으로 굳는 것을 막는 힘 (기본 0.01)
     """
-    layers = [int(x) for x in layers]
     if len(layers) < 1:
         raise ValueError("layers 는 [입력수, 은닉...] 형태입니다")
-    inputSz, hidden = layers[0], layers[1:]
+    inputSz = int(layers[0])
+    lay_kind, lay_a, lay_b = [], [], []
+    폭 = inputSz
+    for i, L in enumerate(layers[1:], 1):
+        if isinstance(L, _Attn):
+            if 폭 % L.items:
+                raise ValueError(
+                    f"{i}번째 층 attn({L.items}): 폭 {폭} 이 조각 {L.items} 로 나뉘지 않습니다")
+            조각폭 = 폭 // L.items
+            if 조각폭 % L.heads:
+                raise ValueError(
+                    f"{i}번째 층 attn: 조각폭 {조각폭} 이 헤드 {L.heads} 로 나뉘지 않습니다")
+            lay_kind.append(1); lay_a.append(L.items); lay_b.append(L.heads)
+            # 폭 그대로
+        else:
+            폭 = int(L)
+            lay_kind.append(0); lay_a.append(폭); lay_b.append(0)
 
     # 출력 스펙을 헤드 목록으로
     if _헤드스펙인가(outputs) and isinstance(outputs, (list, tuple))             and not isinstance(outputs, _Cos) and outputs and all(_헤드스펙인가(o) for o in outputs):
@@ -1158,9 +2135,153 @@ def make(model_name, layers, outputs, optimizer='adam', sigma=1.0, entropy=0.01)
         cos_arg.append(1 if is_cos else 0)
         sizes.append(n)
 
-    h = _ml_make(model_name, inputSz, hidden, sizes, al_arg, cos_arg,
+    h = _ml_make(model_name, inputSz, lay_kind, lay_a, lay_b, sizes, al_arg, cos_arg,
                  optimizer, float(sigma), float(entropy))
     return BlackBoxAI(h, model_name, heads)
+
+
+class LM:
+    """글자 단위 언어 모델.
+
+        lm = make_lm("내모델")
+        lm.sl(텍스트)            # 텍스트로 학습
+        lm.gen("안녕", 50)       # 이어서 쓰기
+        lm.save()
+    """
+
+    def __init__(self, name, dim=128, layers=4, heads=4, ctx=64,
+                 optimizer='adam', lr=3e-4):
+        self._name = name
+        self._cfg  = dict(dim=dim, layers=layers, heads=heads, ctx=ctx,
+                          optimizer=optimizer, lr=lr)
+        self._h    = None
+        self._chars = []       # 번호 -> 글자
+        self._idx   = {}       # 글자 -> 번호
+
+        got = _lm_load(name)
+        if got:
+            self._h, self._chars, cfg = got[0], list(got[1]), got[2]
+            self._idx = {c: i for i, c in enumerate(self._chars)}
+            self._cfg.update(dim=cfg[1], layers=cfg[3], heads=cfg[2], ctx=cfg[4])
+            print(f" [{name}] 이전 학습 데이터를 불러왔습니다. (글자 {len(self._chars)}종)")
+
+    # ── 글자 <-> 번호 ─────────────────────────
+    def _배우기(self, text):
+        """새 글자를 어휘에 추가. 모델이 이미 있으면 못 늘린다."""
+        새것 = [c for c in dict.fromkeys(text) if c not in self._idx]
+        if not 새것:
+            return
+        if self._h is not None:
+            무시 = "".join(새것[:10])
+            print(f" [{self._name}] 처음 보는 글자 {len(새것)}개는 무시합니다 ({무시}...)")
+            return
+        for c in 새것:
+            self._idx[c] = len(self._chars)
+            self._chars.append(c)
+
+    def _번호(self, text):
+        return [self._idx[c] for c in text if c in self._idx]
+
+    def _글자(self, ids):
+        return "".join(self._chars[i] for i in ids)
+
+    def _준비(self):
+        if self._h is None:
+            if not self._chars:
+                raise ValueError("먼저 sl(텍스트) 로 학습할 텍스트를 주세요")
+            c = self._cfg
+            self._h = _lm_make(self._name, len(self._chars), c['dim'],
+                               c['heads'], c['layers'], c['ctx'],
+                               c['optimizer'], float(c['lr']))
+            n = _lm_info(self._h)['params']
+            print(f" [{self._name}] 새로 만들었습니다. "
+                  f"글자 {len(self._chars)}종, 파라미터 {n:,}개")
+
+    # ── 학습 ──────────────────────────────────
+    def sl(self, text, steps=None, log=None):
+        """텍스트로 학습. 정답은 '다음 글자' 라서 따로 줄 필요가 없다.
+        steps 를 주면 그만큼 무작위 조각을 뽑아 학습한다."""
+        import random
+        self._배우기(text)
+        self._준비()
+        ids = self._번호(text)
+        ctx = self._cfg['ctx']
+        if len(ids) < 2:
+            raise ValueError("텍스트가 너무 짧습니다")
+
+        조각 = ctx + 1
+        if steps is None:
+            # 한 번 훑기
+            자리 = list(range(0, max(1, len(ids) - 조각 + 1), max(1, ctx // 2)))
+        else:
+            상한 = max(1, len(ids) - 조각)
+            자리 = [random.randrange(상한) for _ in range(steps)]
+
+        총, 수 = 0.0, 0
+        for k, s in enumerate(자리):
+            묶음 = ids[s:s + 조각]
+            if len(묶음) < 2:
+                continue
+            총 += _lm_train(self._h, 묶음)
+            수 += 1
+            if log and 수 % log == 0:
+                print(f"   {수}/{len(자리)}  손실 {총/수:.4f}")
+        return 총 / max(1, 수)
+
+    def loss(self, text):
+        """학습 없이 손실만 (낮을수록 잘 맞힘)"""
+        self._준비()
+        ids = self._번호(text)[:self._cfg['ctx'] + 1]
+        if len(ids) < 2:
+            return 0.0
+        return _lm_loss(self._h, ids)
+
+    # ── 생성 ──────────────────────────────────
+    def gen(self, prompt="", n=100, temp=1.0, topk=0):
+        """prompt 뒤에 n 글자를 이어 쓴다.
+        temp 낮으면 뻔하게, 높으면 엉뚱하게. topk>0 이면 상위 k개 중에서만."""
+        self._준비()
+        ids = self._번호(prompt)
+        if not ids:
+            import random
+            ids = [random.randrange(len(self._chars))]
+        나온것 = []
+        for _ in range(n):
+            다음 = _lm_sample(self._h, ids, float(temp), int(topk))
+            나온것.append(다음)
+            ids.append(다음)
+            if len(ids) > self._cfg['ctx']:
+                ids = ids[-self._cfg['ctx']:]
+        return prompt + self._글자(나온것)
+
+    def save(self):
+        self._준비()
+        _lm_save(self._h, self._chars)
+        print(f" [{self._name}] 저장 완료.")
+
+    @property
+    def info(self):
+        self._준비()
+        d = _lm_info(self._h)
+        d['chars'] = len(self._chars)
+        return d
+
+    @property
+    def chars(self):
+        return list(self._chars)
+
+
+def make_lm(name, dim=128, layers=4, heads=4, ctx=64, optimizer='adam', lr=3e-4):
+    """
+    name      : 모델 이름 (가중치 파일 이름_lm.pth)
+    dim       : 폭. heads 로 나누어떨어져야 한다
+    layers    : 층 수
+    heads     : 어텐션 헤드 수
+    ctx       : 한 번에 보는 글자 수
+    """
+    if dim % heads:
+        raise ValueError(f"dim({dim}) 은 heads({heads}) 로 나누어떨어져야 합니다")
+    return LM(name, dim, layers, heads, ctx, optimizer, lr)
 
 
 def change(model_name):
@@ -1185,6 +2306,7 @@ def resset(model_name): _ml_resset(model_name)
 import builtins
 builtins.resset     = resset
 builtins.change     = change
+builtins.make_lm    = make_lm
 builtins.gc_disable = gc_disable
 builtins.gc_collect = gc_collect
 `;
@@ -1192,7 +2314,7 @@ builtins.gc_collect = gc_collect
 // ─────────────────────────────────────────────
 // Module init
 // ─────────────────────────────────────────────
-private __gshared PyMethodDef[13] _methods;
+private __gshared PyMethodDef[20] _methods;
 private __gshared PyModuleDef     _moddef;
 
 extern(C) PyObject* PyInit_my_ml() nothrow @trusted {
@@ -1209,7 +2331,14 @@ extern(C) PyObject* PyInit_my_ml() nothrow @trusted {
         _methods[9 ] = PyMethodDef("_ml_export_weights",  &py_ml_export_weights,  METH_VARARGS, null);
         _methods[10] = PyMethodDef("_ml_get_meta",        &py_ml_get_meta,        METH_VARARGS, null);
         _methods[11] = PyMethodDef("_ml_change",          &py_ml_change,          METH_VARARGS, null);
-        _methods[12] = PyMethodDef(null, null, 0, null);
+        _methods[12] = PyMethodDef("_lm_make",            &py_lm_make,            METH_VARARGS, null);
+        _methods[13] = PyMethodDef("_lm_load",            &py_lm_load,            METH_VARARGS, null);
+        _methods[14] = PyMethodDef("_lm_train",           &py_lm_train,           METH_VARARGS, null);
+        _methods[15] = PyMethodDef("_lm_loss",            &py_lm_loss,            METH_VARARGS, null);
+        _methods[16] = PyMethodDef("_lm_sample",          &py_lm_sample,          METH_VARARGS, null);
+        _methods[17] = PyMethodDef("_lm_save",            &py_lm_save,            METH_VARARGS, null);
+        _methods[18] = PyMethodDef("_lm_info",            &py_lm_info,            METH_VARARGS, null);
+        _methods[19] = PyMethodDef(null, null, 0, null);
 
         _moddef.m_base.ob_base.ob_refcnt = 1;
         _moddef.m_name    = "my_ml";

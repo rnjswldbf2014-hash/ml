@@ -17,14 +17,14 @@ Remove-Item my_ml.obj, my_ml.lib, my_ml.exp -ErrorAction SilentlyContinue
 
 ## 파일
 
-- `my_ml.d` — D 소스 (신경망 + Python C API + Python 클래스 코드 인라인)
+- `my_ml.d` — D 소스 (신경망 + 트랜스포머 + Python C API + Python 클래스 코드 인라인)
 - `my_ml.pyd` — 빌드 결과물 (gitignore)
 - `main.py` — 빈 파일. 사용자가 여기에 작성한다.
 
 ## API
 
 ```python
-from my_ml import make, cos
+from my_ml import make, cos, attn, make_lm
 
 # layers 는 [입력수, 은닉...] 만. 출력 개수는 outputs 에서 정해진다.
 ai = make("이름", [입력수, 은닉...], ["액션A", "액션B"])     # 고르기 1개
@@ -42,6 +42,16 @@ ai.sl([입력...], "정답")           # 지도학습 1스텝 후 예측
 ai.episode(steps, 점수)            # [Step...] → [Scored...] 일괄 보상 (순수)
 
 change("이름")                     # 예전 포맷 가중치 → 현재 포맷 (.bak 백업)
+
+# 어텐션 층: 폭을 조각내어 서로 참조하게 한다. 폭은 그대로 나온다.
+ai = make("이름", [입력, 128, attn(8), 128], 출력)
+ai = make("이름", [입력, 128, attn(8, 2), 128], 출력)   # 조각 8, 헤드 2
+
+# 언어 모델 (글자 단위)
+lm = make_lm("이름", dim=128, layers=3, heads=4, ctx=48)
+lm.sl(텍스트, steps=2000)        # 다음 글자가 정답이라 라벨 불필요
+lm.gen("안녕", 40, temp=0.5)     # 이어 쓰기
+lm.save()                        # 이름_lm.pth
 ```
 
 출력이 여러 개면 `output`, `reward` 의 점수, `sl` 의 정답이 모두 리스트다.
