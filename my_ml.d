@@ -297,53 +297,59 @@ private int[] buildMask(string[] all, string[] legal) {
 }
 
 // ─────────────────────────────────────────────
-// BlackBoxAI — 순수 파이프라인
-//   rl()    : 순전파 + 샘플링. 모델 상태를 바꾸지 않는다.
-//   learn() : (입력, 출력, 보상) 묶음을 받아 역전파 + 파일 저장.
+// BlackBoxAI — 순수 파이프라인 + 다중 출력 헤드
+//   헤드마다 이산(액션 선택) / cos(실수) 를 자유롭게 섞을 수 있다.
+//   pickAll()   : 순전파 + 샘플링. 모델을 바꾸지 않는다.
+//   learnBatch(): (입력, 출력, 보상) 묶음으로 역전파.
 // ─────────────────────────────────────────────
+private enum float GCLIP = 5.0f;   // cos 기울기 상한
+
 class BlackBoxAI {
     string     name;
-    string[][] actionLists;   // 내부는 다중 헤드 구조 유지, 공개 API 는 헤드 1개만 사용
+    string[][] actionLists;   // 헤드별 액션 이름 (cos 헤드는 빈 배열)
+    bool[]     cosModes;      // 헤드별 cos 여부
+    int[]      outSizes;      // 헤드별 출력 개수
     int[]      hiddenSizes;
     float      lr = 0.01f;
+    float      cosSigma = 1.0f;   // cos 헤드 탐험 폭
+    float      entropy  = 0.01f;  // 이산 헤드 엔트로피 보너스
     Opt        opt;
     string     file;
-    bool       cosMode;       // true 면 숫자(연속값) 출력
-    float      cosSigma = 0.1f;
-    int        outSz;
 
     Network net;
     bool    ready;
-    private float[] _envBuf;
-    private float[] _probBuf;
-    private int[]   _maskBuf;
 
-    this(string name, int[] layers, string[] actions, bool cos, Opt opt = Opt.adam) {
-        this.name = name; this.opt = opt; this.cosMode = cos;
+    private float[]   _envBuf;
+    private float[][] _probBufs;   // 헤드별 확률 스크래치
+    private int[][]   _maskBufs;   // 헤드별 마스크 스크래치
+
+    int nHeads() const nothrow @nogc { return cast(int) outSizes.length; }
+
+    this(string name, int inputSz, int[] hidden, int[] heads,
+         string[][] actions, bool[] cos,
+         Opt opt = Opt.adam, float sigma = 1.0f, float ent = 0.01f) {
+        this.name = name; this.opt = opt;
+        cosSigma = sigma; entropy = ent;
+        hiddenSizes = hidden.dup;
+        outSizes    = heads.dup;
+        actionLists = actions.dup;
+        cosModes    = cos.dup;
         file = name ~ "_ml_memory.pth";
-
-        int inputSz = layers[0];
-        outSz       = layers[$-1];
-        hiddenSizes = layers[1..$-1].dup;
-        actionLists = [cos ? cast(string[])[] : actions.dup];
 
         if (exists(file)) {
             try {
                 load();
-                // 저장된 구조와 요청한 layers 가 다르면 파일을 따르지 않는다.
-                // (조용히 다른 신경망이 만들어지는 것을 막는다)
-                bool same = (net.inputSz == inputSz) && (outSz == layers[$-1])
-                         && (hiddenSizes.length == layers.length - 2);
-                if (same) foreach (i, sz; hiddenSizes) if (sz != layers[1+i]) { same = false; break; }
+                bool same = (net.inputSz == inputSz)
+                         && (outSizes.length == heads.length)
+                         && (hiddenSizes.length == hidden.length);
+                if (same) foreach (i, sz; hiddenSizes) if (sz != hidden[i]) { same = false; break; }
+                if (same) foreach (i, sz; outSizes)    if (sz != heads[i])  { same = false; break; }
                 if (!same) {
-                    int[] savedLayers = net.inputSz ~ hiddenSizes ~ outSz;
-                    writefln(" [%s] 저장된 구조 %s 가 요청한 %s 와 다릅니다. 새로 만듭니다.",
-                             name, savedLayers, layers);
-                    outSz       = layers[$-1];
-                    hiddenSizes = layers[1..$-1].dup;
-                    actionLists = [cos ? cast(string[])[] : actions.dup];
-                    cosMode     = cos;
-                    net = null;
+                    writefln(" [%s] 저장된 구조 %s->%s 가 요청한 %s->%s 와 다릅니다. 새로 만듭니다.",
+                             name, hiddenSizes, outSizes, hidden, heads);
+                    hiddenSizes = hidden.dup; outSizes = heads.dup;
+                    actionLists = actions.dup; cosModes = cos.dup;
+                    net = null; ready = false;
                 } else {
                     ready = true;
                     writefln(" [%s] 이전 학습 데이터를 불러왔습니다.", name);
@@ -354,127 +360,156 @@ class BlackBoxAI {
             }
         }
         if (!ready) {
-            net = new Network(inputSz, hiddenSizes, [outSz]);
-            writefln(" [%s] 새로 생성되었습니다. %s", name, layers);
+            net = new Network(inputSz, hiddenSizes, outSizes);
+            writefln(" [%s] 새로 생성되었습니다. %s->%s", name, hiddenSizes, outSizes);
             ready = true;
         }
-        _envBuf  = new float[net.inputSz];
-        _probBuf = new float[outSz];
-        _maskBuf = new int[outSz];
+        _allocBufs();
     }
 
-    // ── 합법 액션 → 인덱스 마스크 ─────────────────────────
-    private int maskOf(string[] legal) {
-        if (cosMode || legal.length == 0) {
-            foreach (k; 0..outSz) _maskBuf[k] = k;
-            return outSz;
+    private void _allocBufs() {
+        _envBuf   = new float[net.inputSz];
+        _probBufs = new float[][nHeads];
+        _maskBufs = new int[][nHeads];
+        foreach (i; 0..nHeads) {
+            _probBufs[i] = new float[outSizes[i]];
+            _maskBufs[i] = new int[outSizes[i]];
         }
-        return buildMaskInto(actionLists[0], legal, _maskBuf);
     }
 
-    // ── B1 rl: 순수. 선택된 인덱스(이산) 또는 샘플값(cos) ──
-    // 모델 가중치를 바꾸지 않는다.
-    int pick(string[] legal, float[] input) {
-        foreach (k; 0..input.length) _envBuf[k] = input[k];
-        net.forward(_envBuf);
-        int mlen = maskOf(legal);
-        foreach (k; 0..mlen) _probBuf[k] = net._hd[0][_maskBuf[k]];
-        softmaxInPlace(_probBuf[0..mlen]);
-        double r = uniform01!double(rng), cum = 0.0;
-        int c = mlen - 1;
-        foreach (k; 0..mlen) { cum += _probBuf[k]; if (r < cum) { c = k; break; } }
-        return _maskBuf[c];          // 전체 액션 목록 기준 인덱스
+    private int maskOf(int h, string[] legal) {
+        if (cosModes[h] || legal.length == 0) {
+            foreach (k; 0..outSizes[h]) _maskBufs[h][k] = k;
+            return outSizes[h];
+        }
+        return buildMaskInto(actionLists[h], legal, _maskBufs[h]);
     }
 
-    // cos 모드: 가우시안 정책 — 평균 mu 에서 표본 추출
-    float pickCos(float[] input, out int unit) {
-        foreach (k; 0..input.length) _envBuf[k] = input[k];
-        net.forward(_envBuf);
-        unit = 0;
-        if (outSz > 1) unit = uniform(0, outSz, rng);
-        float mu = net._hd[0][unit];
-        float u1 = cast(float)uniform01!double(rng);
-        float u2 = cast(float)uniform01!double(rng);
+    private float gauss() {
+        float u1 = cast(float) uniform01!double(rng);
+        float u2 = cast(float) uniform01!double(rng);
         if (u1 < 1e-9f) u1 = 1e-9f;
-        float z = sqrt(-2f * log(u1)) * cos(2f * PI * u2);   // Box-Muller
-        return mu + cosSigma * z;
+        return sqrt(-2f * log(u1)) * cos(2f * PI * u2);
     }
 
-    // ── 예측(학습 없음): argmax 인덱스 / cos 는 평균값 ─────
-    int predict(string[] legal, float[] input) {
+    // ── 모든 헤드에서 한 번에 뽑는다. 모델은 그대로. ──
+    //   이산 헤드 : chosen[h] = 액션 인덱스,  value[h] = 0
+    //   cos  헤드 : chosen[h] = 유닛 번호,    value[h] = 뽑은 실수
+    void pickAll(string[][] legal, float[] input, int[] chosen, float[] value) {
         foreach (k; 0..input.length) _envBuf[k] = input[k];
         net.forward(_envBuf);
-        int mlen = maskOf(legal);
-        int best = 0;
-        foreach (k; 1..mlen)
-            if (net._hd[0][_maskBuf[k]] > net._hd[0][_maskBuf[best]]) best = k;
-        return _maskBuf[best];
+        foreach (h; 0..nHeads) {
+            if (cosModes[h]) {
+                int unit = outSizes[h] > 1 ? uniform(0, outSizes[h], rng) : 0;
+                chosen[h] = unit;
+                value[h] = net._hd[h][unit] + cosSigma * gauss();
+            } else {
+                auto lg = (h < legal.length) ? legal[h] : null;
+                int mlen = maskOf(h, lg);
+                foreach (k; 0..mlen) _probBufs[h][k] = net._hd[h][_maskBufs[h][k]];
+                softmaxInPlace(_probBufs[h][0..mlen]);
+                double r = uniform01!double(rng), cum = 0.0;
+                int c = mlen - 1;
+                foreach (k; 0..mlen) { cum += _probBufs[h][k]; if (r < cum) { c = k; break; } }
+                chosen[h] = _maskBufs[h][c];
+                value[h]  = 0f;
+            }
+        }
     }
 
-    float predictCos(float[] input, int unit) {
+    // ── 예측(샘플링 없음) ──
+    void predictAll(string[][] legal, float[] input, int[] chosen, float[] value) {
         foreach (k; 0..input.length) _envBuf[k] = input[k];
         net.forward(_envBuf);
-        return net._hd[0][unit < outSz ? unit : 0];
+        foreach (h; 0..nHeads) {
+            if (cosModes[h]) {
+                chosen[h] = 0;
+                value[h]  = net._hd[h][0];
+            } else {
+                auto lg = (h < legal.length) ? legal[h] : null;
+                int mlen = maskOf(h, lg);
+                int best = 0;
+                foreach (k; 1..mlen)
+                    if (net._hd[h][_maskBufs[h][k]] > net._hd[h][_maskBufs[h][best]]) best = k;
+                chosen[h] = _maskBufs[h][best];
+                value[h]  = 0f;
+            }
+        }
     }
 
-    // ── B7 learn: (입력, 출력, 보상) 묶음으로 역전파 ───────
-    // 이산: REINFORCE  d = score * (p - onehot)
-    // cos : 가우시안 정책  d = -score * (y - mu) / sigma^2
-    void learnBatch(float[][] inputs, int[] chosen, float[] outVals, float[] scores) {
+    // ── 역전파 ──
+    //   scores[i][h] 가 NaN 이면 그 스텝에서 그 헤드는 건너뛴다.
+    void learnBatch(float[][] inputs, int[][] chosen, float[][] values, float[][] scores) {
         if (inputs.length == 0) return;
         net.zeroGrad();
+        // 배치 크기로 나눠 평균 기울기를 쓴다.
+        // (합산만 하면 배치가 커질수록 갱신 폭이 커져 발산한다)
+        immutable float inv = 1.0f / cast(float) inputs.length;
         foreach (i; 0..inputs.length) {
             foreach (k; 0..inputs[i].length) _envBuf[k] = inputs[i][k];
             net.forward(_envBuf);
-            net._dHead[0][] = 0f;
-            if (cosMode) {
-                int u = chosen[i] < outSz ? chosen[i] : 0;
-                float mu = net._hd[0][u];
-                net._dHead[0][u] = -scores[i] * (outVals[i] - mu) / (cosSigma * cosSigma);
-            } else {
-                foreach (k; 0..outSz) _probBuf[k] = net._hd[0][k];
-                softmaxInPlace(_probBuf[0..outSz]);
-                foreach (k; 0..outSz)
-                    net._dHead[0][k] = scores[i] * (_probBuf[k] - (k == chosen[i] ? 1f : 0f));
+            foreach (h; 0..nHeads) {
+                net._dHead[h][] = 0f;
+                float sc = scores[i][h];
+                if (sc != sc) continue;   // NaN -> 이 헤드는 학습 안 함
+                sc *= inv;
+                if (cosModes[h]) {
+                    int u = chosen[i][h] < outSizes[h] ? chosen[i][h] : 0;
+                    float mu = net._hd[h][u];
+                    float gr = -sc * (values[i][h] - mu) / (cosSigma * cosSigma);
+                    if (gr >  GCLIP) gr =  GCLIP;      // 발산 방지
+                    if (gr < -GCLIP) gr = -GCLIP;
+                    net._dHead[h][u] = gr;
+                } else {
+                    int n = outSizes[h];
+                    foreach (k; 0..n) _probBufs[h][k] = net._hd[h][k];
+                    softmaxInPlace(_probBufs[h][0..n]);
+                    // 엔트로피 H = -sum p log p  (탐험이 죽는 것을 막는다)
+                    float Hh = 0f;
+                    foreach (k; 0..n) {
+                        float pk = _probBufs[h][k];
+                        if (pk > 1e-8f) Hh -= pk * log(pk);
+                    }
+                    foreach (k; 0..n) {
+                        float pk = _probBufs[h][k];
+                        float g  = sc * (pk - (k == chosen[i][h] ? 1f : 0f));
+                        if (entropy != 0f && pk > 1e-8f)
+                            g += entropy * inv * pk * (log(pk) + Hh);
+                        net._dHead[h][k] = g;
+                    }
+                }
             }
             net.backward();
         }
         net.step(opt, lr);
     }
 
-    // ── B4 sl: 정답이 있으면 1스텝 학습 후 예측 ───────────
-    int slStep(string[] legal, float[] input, int answerIdx) {
-        if (answerIdx >= 0) {
-            foreach (k; 0..input.length) _envBuf[k] = input[k];
-            net.zeroGrad();
-            net.forward(_envBuf);
-            int mlen = maskOf(legal);
-            foreach (k; 0..mlen) _probBuf[k] = net._hd[0][_maskBuf[k]];
-            softmaxInPlace(_probBuf[0..mlen]);
-            int tgt = -1;
-            foreach (k; 0..mlen) if (_maskBuf[k] == answerIdx) { tgt = k; break; }
-            net._dHead[0][] = 0f;
-            foreach (k; 0..mlen)
-                net._dHead[0][_maskBuf[k]] = _probBuf[k] - (k == tgt ? 1f : 0f);
-            net.backward();
-            net.step(opt, lr);
-        }
-        return predict(legal, input);
-    }
-
-    // cos 모드 지도학습: 평균제곱오차
-    float slCos(float[] input, int unit, float target, bool train) {
+    // ── 지도학습 1스텝 (헤드별 정답; 이산은 인덱스, cos 는 목표값) ──
+    void slBatch(float[] input, string[][] legal, int[] ansIdx, float[] ansVal, bool[] use) {
+        bool any = false;
+        foreach (u; use) if (u) { any = true; break; }
+        if (!any) return;
         foreach (k; 0..input.length) _envBuf[k] = input[k];
-        if (train) {
-            net.zeroGrad();
-            net.forward(_envBuf);
-            net._dHead[0][] = 0f;
-            net._dHead[0][unit] = net._hd[0][unit] - target;
-            net.backward();
-            net.step(opt, lr);
-        }
+        net.zeroGrad();
         net.forward(_envBuf);
-        return net._hd[0][unit];
+        foreach (h; 0..nHeads) {
+            net._dHead[h][] = 0f;
+            if (!use[h]) continue;
+            if (cosModes[h]) {
+                net._dHead[h][0] = net._hd[h][0] - ansVal[h];
+            } else {
+                auto lg = (h < legal.length) ? legal[h] : null;
+                int mlen = maskOf(h, lg);
+                foreach (k; 0..mlen) _probBufs[h][k] = net._hd[h][_maskBufs[h][k]];
+                softmaxInPlace(_probBufs[h][0..mlen]);
+                int tgt = -1;
+                foreach (k; 0..mlen) if (_maskBufs[h][k] == ansIdx[h]) { tgt = k; break; }
+                foreach (k; 0..mlen)
+                    net._dHead[h][_maskBufs[h][k]] = _probBufs[h][k] - (k == tgt ? 1f : 0f);
+            }
+        }
+        net.backward();
+        net.step(opt, lr);
     }
 
     void save() {
@@ -482,16 +517,18 @@ class BlackBoxAI {
         auto f = File(file, "wb");
         void wu(uint v)  { f.rawWrite((&v)[0..1]); }
         void wf(float v) { f.rawWrite((&v)[0..1]); }
-        wu(0xBEEFCAFE); wu(3); wu(cast(uint)opt);
-        wu(cosMode ? 1u : 0u);
-        wu(cast(uint)outSz);
+        wu(0xBEEFCAFE); wu(6); wu(cast(uint)opt);
         wu(cast(uint)net.inputSz);
         wu(cast(uint)hiddenSizes.length);
         foreach (sz; hiddenSizes) wu(cast(uint)sz);
-        wu(cast(uint)actionLists.length);
-        foreach (al; actionLists) {
-            wu(cast(uint)al.length);
-            foreach (a; al) { auto bytes = cast(ubyte[])a; wu(cast(uint)bytes.length); f.rawWrite(bytes); }
+        wu(cast(uint)nHeads);
+        foreach (h; 0..nHeads) {
+            wu(cast(uint)outSizes[h]);
+            wu(cosModes[h] ? 1u : 0u);
+            wu(cast(uint)actionLists[h].length);
+            foreach (a; actionLists[h]) {
+                auto bytes = cast(ubyte[])a; wu(cast(uint)bytes.length); f.rawWrite(bytes);
+            }
         }
         void wl(ref Linear l) {
             foreach (row; l.w)  foreach (v; row) wf(v);
@@ -512,18 +549,20 @@ class BlackBoxAI {
         float rf()  { float v; f.rawRead((&v)[0..1]); return v; }
         if (ru() != 0xBEEFCAFE) throw new Exception("magic mismatch");
         uint ver = ru();
-        if (ver >= 2) opt = cast(Opt)ru();
-        if (ver >= 3) { cosMode = ru() != 0; outSz = ru(); }
+        if (ver < 6) throw new Exception("예전 포맷입니다. change() 로 변환하세요");
+        opt = cast(Opt)ru();
         int inputSz = ru();
         int nH = ru(); hiddenSizes = new int[nH];
         foreach (i; 0..nH) hiddenSizes[i] = ru();
-        int nL = ru(); actionLists = new string[][nL];
+        int nL = ru();
+        outSizes = new int[nL]; cosModes = new bool[nL]; actionLists = new string[][nL];
         foreach (i; 0..nL) {
+            outSizes[i] = ru();
+            cosModes[i] = ru() != 0;
             int nA = ru(); actionLists[i] = new string[nA];
             foreach (j; 0..nA) { auto buf = new ubyte[ru()]; f.rawRead(buf); actionLists[i][j] = cast(string)buf.dup; }
         }
-        if (ver < 3) outSz = cast(int)actionLists[0].length;
-        net = new Network(inputSz, hiddenSizes, [outSz]);
+        net = new Network(inputSz, hiddenSizes, outSizes);
         void rl_(ref Linear l) {
             foreach (ref row; l.w)  foreach (ref v; row) v = rf();
             foreach (ref v; l.b)    v = rf();
@@ -536,7 +575,6 @@ class BlackBoxAI {
         foreach (ref h; net.hidden) rl_(h);
         foreach (ref h; net.heads)  rl_(h);
     }
-
 }
 
 void resset(string modelName) {
@@ -560,13 +598,13 @@ private bool isTorchFile(string path) nothrow {
 
 
 // ─────────────────────────────────────────────
-// change — 예전 포맷 파일을 현재 포맷으로 변환
-//   ver 1/2 (다중 헤드 가능) → ver 3 (단일 헤드)
+// change — 예전 포맷 파일을 현재 포맷(ver 4)으로 변환
+//   ver 2 : 다중 헤드 → 헤드 전부 보존
+//   ver 3 : 단일 헤드 + cos 플래그
 //   원본은 .bak 으로 남긴다.
 // ─────────────────────────────────────────────
 private int linearBytes(int inSz, int outSz) pure nothrow @nogc {
-    // w + mW + vW = 3*out*in,  b + mB + vB + gradB 중 저장분은 b,mB,vB = 3*out
-    // 실제 저장 순서: w, b, mW, vW, mB, vB, t
+    // 저장 순서: w, b, mW, vW, mB, vB, t
     return cast(int)((3L*outSz*inSz + 3L*outSz) * 4 + 4);
 }
 
@@ -578,63 +616,70 @@ string changeFile(string path) {
     Opt        o = Opt.adam;
     int        inputSz, nH, nL;
     int[]      hid;
+    int[]      outSizes;
+    bool[]     cosModes;
     string[][] als;
-    ubyte[]    hiddenBlob, headBlob;
-    int        droppedHeads;
+    ubyte[]    blob;
 
     {
         auto f = File(path, "rb");
         uint ru() { uint v; f.rawRead((&v)[0..1]); return v; }
         if (ru() != 0xBEEFCAFE) throw new Exception("my_ml 포맷이 아닙니다");
         uint ver = ru();
-        if (ver >= 3) return "already";
+        if (ver >= 6) return "already";
         if (ver >= 2) o = cast(Opt) ru();
+
+        bool cos3 = false; int out3 = 0;
+        if (ver == 3) { cos3 = ru() != 0; out3 = ru(); }
+        bool ver4 = (ver == 4 || ver == 5);
+        bool ver5 = (ver == 5);
+
         inputSz = ru();
-        nH  = ru(); hid = new int[nH];
+        nH = ru(); hid = new int[nH];
         foreach (i; 0..nH) hid[i] = ru();
-        nL  = ru(); als = new string[][nL];
+        nL = ru();
+        als = new string[][nL]; outSizes = new int[nL]; cosModes = new bool[nL];
         foreach (i; 0..nL) {
+            if (ver4) { outSizes[i] = ru(); cosModes[i] = ru() != 0; }
+            if (ver5) { ru(); ru(); }      // 옛 cos 범위 자리 — 버린다
             int nA = ru(); als[i] = new string[nA];
             foreach (j; 0..nA) { auto b = new ubyte[ru()]; f.rawRead(b); als[i][j] = cast(string) b.dup; }
+            if (!ver4) {
+                outSizes[i] = (ver == 3) ? out3 : nA;
+                cosModes[i] = (ver == 3) ? cos3 : false;
+            }
         }
-        if (nL == 0 || als[0].length == 0) throw new Exception("액션 목록이 비어 있습니다");
+        if (nL == 0) throw new Exception("헤드가 없습니다");
 
-        // 은닉층 가중치 통째로
-        int prev = inputSz, hbytes = 0;
-        foreach (sz; hid) { hbytes += linearBytes(prev, sz); prev = sz; }
-        hiddenBlob = new ubyte[hbytes];
-        if (hbytes > 0) f.rawRead(hiddenBlob);
-
-        // 헤드 0 만 남기고 나머지는 버린다
-        headBlob = new ubyte[linearBytes(prev, cast(int) als[0].length)];
-        f.rawRead(headBlob);
-        droppedHeads = nL - 1;
+        // 가중치는 배치가 동일하므로 통째로 옮긴다 (헤드 전부 보존)
+        int prev = inputSz, total = 0;
+        foreach (sz; hid) { total += linearBytes(prev, sz); prev = sz; }
+        foreach (sz; outSizes) total += linearBytes(prev, sz);
+        blob = new ubyte[total];
+        if (total > 0) f.rawRead(blob);
     }
 
-    // 원본 백업
     string bak = path ~ ".bak";
     if (exists(bak)) remove(bak);
     rename(path, bak);
 
     auto w = File(path, "wb");
     void wu(uint v) { w.rawWrite((&v)[0..1]); }
-    wu(0xBEEFCAFE); wu(3); wu(cast(uint) o);
-    wu(0u);                                   // cosMode = false
-    wu(cast(uint) als[0].length);             // outSz
+    wu(0xBEEFCAFE); wu(6); wu(cast(uint) o);
     wu(cast(uint) inputSz);
     wu(cast(uint) nH);
     foreach (sz; hid) wu(cast(uint) sz);
-    wu(1u);                                   // 헤드 1개
-    wu(cast(uint) als[0].length);
-    foreach (a; als[0]) { auto b = cast(ubyte[]) a; wu(cast(uint) b.length); w.rawWrite(b); }
-    if (hiddenBlob.length) w.rawWrite(hiddenBlob);
-    w.rawWrite(headBlob);
+    wu(cast(uint) nL);
+    foreach (i; 0..nL) {
+        wu(cast(uint) outSizes[i]);
+        wu(cosModes[i] ? 1u : 0u);
+        wu(cast(uint) als[i].length);
+        foreach (a; als[i]) { auto b = cast(ubyte[]) a; wu(cast(uint) b.length); w.rawWrite(b); }
+    }
+    w.rawWrite(blob);
     w.close();
 
-    int[] layers = inputSz ~ hid ~ cast(int) als[0].length;
-    if (droppedHeads > 0)
-        return to!string(layers) ~ " (헤드 " ~ to!string(droppedHeads) ~ "개 버림)";
-    return to!string(layers);
+    return to!string(inputSz) ~ "->" ~ to!string(hid) ~ "->" ~ to!string(outSizes);
 }
 
 // ─────────────────────────────────────────────
@@ -726,58 +771,62 @@ extern(C) nothrow @trusted:
 
 PyObject* py_ml_make(PyObject* self, PyObject* args) {
     try {
-        PyObject* nm; PyObject* lay; PyObject* acts; int cosFlag; PyObject* opt;
-        if (!PyArg_ParseTuple(args, "OOOiO", &nm, &lay, &acts, &cosFlag, &opt)) return null;
+        PyObject* nm; int inputSz; PyObject* hid; PyObject* heads;
+        PyObject* acts; PyObject* coss; PyObject* opt;
+        double sigma, ent;
+        if (!PyArg_ParseTuple(args, "OiOOOOOdd", &nm, &inputSz, &hid, &heads, &acts, &coss, &opt, &sigma, &ent))
+            return null;
         string name   = fromStringz(PyUnicode_AsUTF8(nm)).idup;
         string optStr = fromStringz(PyUnicode_AsUTF8(opt)).idup;
-        int[] layers  = pyIntList(lay);
-        if (layers.length < 2) {
-            PyErr_SetString(_pyRuntimeError, "my_ml: layers 는 [입력, ..., 출력] 최소 2개가 필요합니다");
-            return null;
-        }
-        string[] actions = cosFlag ? null : pyStrList(acts);
-        auto ai = new BlackBoxAI(name, layers, actions, cosFlag != 0, parseOpt(optStr));
+        int[] hidden  = pyIntList(hid);
+        int[] hsz     = pyIntList(heads);
+        string[][] al = pyLals(acts);
+        int[] cosI    = pyIntList(coss);
+        auto cosB = new bool[cosI.length];
+        foreach (i, v; cosI) cosB[i] = v != 0;
+        auto ai = new BlackBoxAI(name, inputSz, hidden, hsz, al, cosB, parseOpt(optStr),
+                                 cast(float)sigma, cast(float)ent);
         GC.addRoot(cast(void*) ai);
         return PyCapsule_New(cast(void*) ai, "BlackBoxAI", &bbai_dtor);
     } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _ml_make"); return null; }
 }
 
-// B1 rl (이산): 선택된 인덱스 반환. 모델 상태 불변.
+// 헤드별 [선택인덱스, 실수값] 을 평탄한 리스트로 돌려준다: [i0,v0, i1,v1, ...]
+private PyObject* packPick(BlackBoxAI ai, int[] chosen, float[] value) {
+    int n = ai.nHeads;
+    auto lst = PyList_New(n * 2);
+    foreach (h; 0..n) {
+        PyList_SetItem(lst, h*2,   PyLong_FromLong(chosen[h]));
+        PyList_SetItem(lst, h*2+1, PyFloat_FromDouble(cast(double) value[h]));
+    }
+    return lst;
+}
+
 PyObject* py_ml_pick(PyObject* self, PyObject* args) {
     try {
         PyObject* cap; PyObject* legal; PyObject* inp;
         if (!PyArg_ParseTuple(args, "OOO", &cap, &legal, &inp)) return null;
         auto ai = cast(BlackBoxAI) PyCapsule_GetPointer(cap, "BlackBoxAI");
-        return PyLong_FromLong(ai.pick(pyStrList(legal), pyFloatList(inp)));
+        auto chosen = new int[ai.nHeads];
+        auto value  = new float[ai.nHeads];
+        ai.pickAll(pyLals(legal), pyFloatList(inp), chosen, value);
+        return packPick(ai, chosen, value);
     } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _ml_pick"); return null; }
 }
 
-// B1 rl (cos): (샘플값, 유닛번호) 반환. 모델 상태 불변.
-PyObject* py_ml_pick_cos(PyObject* self, PyObject* args) {
-    try {
-        PyObject* cap; PyObject* inp;
-        if (!PyArg_ParseTuple(args, "OO", &cap, &inp)) return null;
-        auto ai = cast(BlackBoxAI) PyCapsule_GetPointer(cap, "BlackBoxAI");
-        int unit;
-        float v = ai.pickCos(pyFloatList(inp), unit);
-        auto t = PyList_New(2);
-        PyList_SetItem(t, 0, PyFloat_FromDouble(cast(double)v));
-        PyList_SetItem(t, 1, PyLong_FromLong(unit));
-        return t;
-    } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _ml_pick_cos"); return null; }
-}
-
-// 예측(학습 없음)
 PyObject* py_ml_predict(PyObject* self, PyObject* args) {
     try {
         PyObject* cap; PyObject* legal; PyObject* inp;
         if (!PyArg_ParseTuple(args, "OOO", &cap, &legal, &inp)) return null;
         auto ai = cast(BlackBoxAI) PyCapsule_GetPointer(cap, "BlackBoxAI");
-        return PyLong_FromLong(ai.predict(pyStrList(legal), pyFloatList(inp)));
+        auto chosen = new int[ai.nHeads];
+        auto value  = new float[ai.nHeads];
+        ai.predictAll(pyLals(legal), pyFloatList(inp), chosen, value);
+        return packPick(ai, chosen, value);
     } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _ml_predict"); return null; }
 }
 
-// B7 learn: (입력, 출력, 보상) 묶음으로 역전파 후 파일 저장
+// inputs[i], chosen[i][h], values[i][h], scores[i][h]  (score 가 NaN 이면 그 헤드는 제외)
 PyObject* py_ml_learn(PyObject* self, PyObject* args) {
     try {
         PyObject* cap; PyObject* inps; PyObject* chos; PyObject* vals; PyObject* scrs;
@@ -785,34 +834,38 @@ PyObject* py_ml_learn(PyObject* self, PyObject* args) {
         auto ai = cast(BlackBoxAI) PyCapsule_GetPointer(cap, "BlackBoxAI");
         Py_ssize_t n = PyList_Size(inps);
         auto inputs = new float[][n];
-        foreach (i; 0..n) inputs[i] = pyFloatList(PyList_GetItem(inps, i));
-        auto chosen = pyIntList(chos);
-        auto outv   = pyFloatList(vals);
-        auto score  = pyFloatList(scrs);
-        ai.learnBatch(inputs, chosen, outv, score);
+        auto chosen = new int[][n];
+        auto values = new float[][n];
+        auto score  = new float[][n];
+        foreach (i; 0..n) {
+            inputs[i] = pyFloatList(PyList_GetItem(inps, i));
+            chosen[i] = pyIntList(PyList_GetItem(chos, i));
+            values[i] = pyFloatList(PyList_GetItem(vals, i));
+            score[i]  = pyFloatList(PyList_GetItem(scrs, i));
+        }
+        ai.learnBatch(inputs, chosen, values, score);
         ai.save();
         Py_IncRef(_pyNone); return _pyNone;
     } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _ml_learn"); return null; }
 }
 
-// B4 sl (이산): 정답 인덱스가 >=0 이면 1스텝 학습 후 예측
 PyObject* py_ml_sl(PyObject* self, PyObject* args) {
     try {
-        PyObject* cap; PyObject* legal; PyObject* inp; int ansIdx;
-        if (!PyArg_ParseTuple(args, "OOOi", &cap, &legal, &inp, &ansIdx)) return null;
+        PyObject* cap; PyObject* legal; PyObject* inp;
+        PyObject* ansI; PyObject* ansV; PyObject* useL;
+        if (!PyArg_ParseTuple(args, "OOOOOO", &cap, &legal, &inp, &ansI, &ansV, &useL)) return null;
         auto ai = cast(BlackBoxAI) PyCapsule_GetPointer(cap, "BlackBoxAI");
-        return PyLong_FromLong(ai.slStep(pyStrList(legal), pyFloatList(inp), ansIdx));
+        auto useI = pyIntList(useL);
+        auto use  = new bool[useI.length];
+        foreach (i, v; useI) use[i] = v != 0;
+        auto input = pyFloatList(inp);
+        auto lals  = pyLals(legal);
+        ai.slBatch(input, lals, pyIntList(ansI), pyFloatList(ansV), use);
+        auto chosen = new int[ai.nHeads];
+        auto value  = new float[ai.nHeads];
+        ai.predictAll(lals, input, chosen, value);
+        return packPick(ai, chosen, value);
     } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _ml_sl"); return null; }
-}
-
-// B4 sl (cos): 목표값 회귀
-PyObject* py_ml_sl_cos(PyObject* self, PyObject* args) {
-    try {
-        PyObject* cap; PyObject* inp; int unit; double target; int train;
-        if (!PyArg_ParseTuple(args, "OOidi", &cap, &inp, &unit, &target, &train)) return null;
-        auto ai = cast(BlackBoxAI) PyCapsule_GetPointer(cap, "BlackBoxAI");
-        return PyFloat_FromDouble(cast(double) ai.slCos(pyFloatList(inp), unit, cast(float)target, train != 0));
-    } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _ml_sl_cos"); return null; }
 }
 
 PyObject* py_ml_save(PyObject* self, PyObject* args) {
@@ -918,159 +971,201 @@ private enum string PY_CLASS_CODE = `
 # SPDX-License-Identifier: GPL-2.0-only
 import os
 
-COS = "cos"          # make() 에 actions 대신 넘기면 숫자(연속값) 모드
+class _Cos:
+    """숫자(연속값) 출력 표시. 값의 범위는 쓰는 쪽에서 정한다."""
+    __slots__ = ()
+    def __repr__(self): return "cos"
+
+cos = _Cos()
+COS = cos          # 옛 이름
 
 
 class Step:
     """rl() 이 돌려주는 (입력, 출력) 쌍. 그냥 데이터."""
-    __slots__ = ("input", "output", "_unit")
+    __slots__ = ("input", "output", "_units", "_raw")
 
-    def __init__(self, inp, out, unit=0):
-        self.input, self.output, self._unit = inp, out, unit
+    def __init__(self, inp, out, units, raw):
+        self.input, self.output, self._units, self._raw = inp, out, units, raw
 
     def __iter__(self):        return iter((self.input, self.output))
     def __len__(self):         return 2
     def __getitem__(self, i):  return (self.input, self.output)[i]
-    def __eq__(self, o):
-        if isinstance(o, Step):  return (self.input, self.output) == (o.input, o.output)
-        if isinstance(o, tuple): return (self.input, self.output) == o
-        return NotImplemented
     def __repr__(self):
         return f"Step(input={self.input!r}, output={self.output!r})"
 
 
 class Scored:
-    """reward() 가 돌려주는 (입력, 출력, 보상). 그냥 데이터."""
-    __slots__ = ("input", "output", "point", "_unit")
+    """reward() 가 돌려주는 (입력, 출력, 보상). 그냥 데이터.
+    point 는 숫자 하나이거나, 헤드별 리스트(None 이면 그 헤드는 학습 제외)."""
+    __slots__ = ("input", "output", "point", "_units", "_raw")
 
-    def __init__(self, inp, out, point, unit=0):
-        self.input, self.output, self.point, self._unit = inp, out, point, unit
+    def __init__(self, inp, out, point, units, raw):
+        self.input, self.output, self.point = inp, out, point
+        self._units, self._raw = units, raw
 
     def __iter__(self):        return iter((self.input, self.output, self.point))
     def __len__(self):         return 3
     def __getitem__(self, i):  return (self.input, self.output, self.point)[i]
-    def __eq__(self, o):
-        if isinstance(o, Scored): return tuple(self) == tuple(o)
-        if isinstance(o, tuple):  return tuple(self) == o
-        return NotImplemented
     def __repr__(self):
         return f"Scored(input={self.input!r}, output={self.output!r}, point={self.point!r})"
 
 
+_NAN = float("nan")
+
+
 class BlackBoxAI:
-    def __init__(self, h, name, actions, cos, out_size):
-        self._h       = h
-        self._name    = name
-        self._actions = list(actions or [])
-        self._cos     = cos
-        self._out     = out_size
+    def __init__(self, h, name, heads):
+        self._h     = h
+        self._name  = name
+        self._heads = heads          # [(actions or None, cos:bool), ...]
+        self._n     = len(heads)
 
-    # ── B1: 순수. 가중치를 바꾸지 않고 (입력, 출력) 만 만든다 ──
+    # 헤드별 원시값 → 사람이 쓰는 출력
+    def _decode(self, flat):
+        out, units, raw = [], [], []
+        for i, (acts, cos) in enumerate(self._heads):
+            idx, val = int(flat[i*2]), float(flat[i*2+1])
+            units.append(idx)
+            raw.append(val)
+            out.append(val if cos else acts[idx])
+        return out, units, raw
+
+    def _legal_arg(self, legal):
+        if legal is None:
+            return [[] for _ in range(self._n)]
+        if self._n == 1 and legal and isinstance(legal[0], str):
+            return [list(legal)]
+        return [list(x) if x else [] for x in legal]
+
+    def _one(self, lst):
+        return lst[0] if self._n == 1 else lst
+
+    # ── 순수: (입력, 출력) 데이터만 ──
     def rl(self, input_list, legal=None):
-        inp = [float(x) for x in input_list]
-        if self._cos:
-            val, unit = _ml_pick_cos(self._h, inp)
-            return Step(inp, val, unit)
-        legal_names = list(legal) if legal else self._actions
-        idx = _ml_pick(self._h, legal_names, inp)
-        return Step(inp, self._actions[idx], idx)
+        inp  = [float(x) for x in input_list]
+        flat = _ml_pick(self._h, self._legal_arg(legal), inp)
+        out, units, raw = self._decode(flat)
+        return Step(inp, self._one(out), units, raw)
 
-    # ── B2: 순수. (입력, 출력) + 점수 → (입력, 출력, 보상) ──
+    # ── 순수: 보상 붙이기 ──
     def reward(self, data, point):
-        return Scored(data.input, data.output, float(point), data._unit)
+        return Scored(data.input, data.output, point, data._units, data._raw)
 
-    # ── B7: 유일하게 모델을 바꾸는 함수. 역전파 + 자동 저장 ──
-    def save(self, scored):
-        if isinstance(scored, Scored):
-            batch = [scored]
-        else:
-            batch = list(scored)
+    # ── 여기서만 학습 + 저장 ──
+    def save(self, scored=None):
+        if scored is None:
+            _ml_save(self._h); return 0
+        batch = [scored] if isinstance(scored, Scored) else list(scored)
         if not batch:
             return 0
         inputs, chosen, values, points = [], [], [], []
         for s in batch:
             inputs.append([float(x) for x in s.input])
-            points.append(float(s.point))
-            if self._cos:
-                chosen.append(int(s._unit))
-                values.append(float(s.output))
+            chosen.append([int(u) for u in s._units])
+            outs = s.output if self._n > 1 else [s.output]
+            values.append([float(v) if c else 0.0
+                           for v, (_, c) in zip(s._raw, self._heads)])
+            p = s.point
+            if isinstance(p, (list, tuple)):
+                points.append([_NAN if x is None else float(x) for x in p])
             else:
-                out = s.output
-                idx = out if isinstance(out, int) else self._actions.index(out)
-                chosen.append(int(idx))
-                values.append(0.0)
+                points.append([float(p)] * self._n)
         _ml_learn(self._h, inputs, chosen, values, points)
         return len(batch)
 
-    # ── B4: 지도학습. 입력도 리스트로 ──
-    def sl(self, input_list, answer=None, legal=None, unit=0):
-        inp = [float(x) for x in input_list]
-        if self._cos:
-            train = answer is not None
-            return _ml_sl_cos(self._h, inp, int(unit), float(answer or 0.0), int(train))
-        legal_names = list(legal) if legal else self._actions
-        ans_idx = self._actions.index(answer) if answer is not None else -1
-        idx = _ml_sl(self._h, legal_names, inp, ans_idx)
-        return self._actions[idx]
+    # ── 지도학습 ──
+    def sl(self, input_list, answer=None, legal=None):
+        inp  = [float(x) for x in input_list]
+        lals = self._legal_arg(legal)
+        ansI = [0] * self._n
+        ansV = [0.0] * self._n
+        use  = [0] * self._n
+        if answer is not None:
+            answers = answer if (self._n > 1 and isinstance(answer, (list, tuple))) else [answer]
+            for i, a in enumerate(answers):
+                if a is None or i >= self._n: continue
+                acts, cos = self._heads[i]
+                use[i] = 1
+                if cos: ansV[i] = float(a)
+                else:   ansI[i] = acts.index(a)
+        flat = _ml_sl(self._h, lals, inp, ansI, ansV, use)
+        out, _, _ = self._decode(flat)
+        return self._one(out)
 
-    # ── 예측 전용(샘플링 없음, 학습 없음) ──
+    # ── 예측(샘플링 없음) ──
     def predict(self, input_list, legal=None):
-        inp = [float(x) for x in input_list]
-        if self._cos:
-            return _ml_sl_cos(self._h, inp, 0, 0.0, 0)
-        legal_names = list(legal) if legal else self._actions
-        return self._actions[_ml_predict(self._h, legal_names, inp)]
+        inp  = [float(x) for x in input_list]
+        flat = _ml_predict(self._h, self._legal_arg(legal), inp)
+        out, _, _ = self._decode(flat)
+        return self._one(out)
 
-    # ── B5: 에피소드 = 스텝을 모으는 리스트. 상태 없음 ──
-    # with 블록 대신 그냥 파이썬 리스트를 쓰면 되므로,
-    # 보상만 한꺼번에 매기는 헬퍼로 남긴다.
+    # ── 스텝 묶음에 같은 보상 (순수) ──
     def episode(self, steps, point):
-        """[Step, ...] 전체에 같은 보상을 매겨 [Scored, ...] 반환. 순수."""
         return [self.reward(s, point) for s in steps]
 
     @property
-    def actions(self): return list(self._actions)
+    def heads(self):    return self._n
     @property
-    def out_size(self): return self._out
+    def actions(self):  return self._one([a for a, _ in self._heads])
 
 
-def make(model_name, layers, actions=None, optimizer='adam'):
+def _헤드해석(spec):
+    """스펙 하나 → (액션목록 또는 None, cos여부, 출력개수)"""
+    if isinstance(spec, _Cos):
+        return None, True, 1
+    if isinstance(spec, str) and spec.lower() == "cos":
+        return None, True, 1
+    if isinstance(spec, (list, tuple)):
+        names = list(spec)
+        if len(names) < 2:
+            raise ValueError(f"고를 것이 2개 이상이어야 합니다: {names}")
+        if not all(isinstance(a, str) for a in names):
+            raise ValueError(f"액션 이름은 문자열이어야 합니다: {names}")
+        return names, False, len(names)
+    raise ValueError(f"알 수 없는 출력 스펙: {spec!r}  (액션 리스트 또는 cos)")
+
+
+def _헤드스펙인가(x):
+    return isinstance(x, (_Cos, list, tuple)) or (isinstance(x, str) and x.lower() == "cos")
+
+
+def make(model_name, layers, outputs, optimizer='adam', sigma=1.0, entropy=0.01):
     """
     model_name : 모델 이름 (가중치 파일명)
-    layers     : [입력수, 은닉..., 출력수]  예) [12, 128, 128, 2]
-    actions    : 액션 이름 리스트 (출력 인덱스와 1:1). "cos" 면 숫자 반환 모드
-    optimizer  : 'adam' | 'sgd' | 'rmsprop' | 'adagrad'
+    layers     : [입력수, 은닉...]   출력은 outputs 에서 정해진다
+    outputs    : 출력 하나면  ["A","B"]  또는  cos
+                 여러 개면   [cos, ["A","B"], cos, ...]
+                 cos 값의 범위는 쓰는 쪽에서 알아서 정한다
+    sigma      : cos 가 값을 얼마나 넓게 탐험할지 (기본 1.0)
+    entropy    : 고르는 쪽이 한 답으로 굳는 것을 막는 힘 (기본 0.01)
     """
     layers = [int(x) for x in layers]
-    if len(layers) < 2:
-        raise ValueError("layers 는 [입력, ..., 출력] 최소 2개가 필요합니다")
-    out_size = layers[-1]
+    if len(layers) < 1:
+        raise ValueError("layers 는 [입력수, 은닉...] 형태입니다")
+    inputSz, hidden = layers[0], layers[1:]
 
-    cos = False
-    if isinstance(actions, str):
-        if actions.lower() == COS:
-            cos, actions = True, []
-        else:
-            raise ValueError(f"actions 가 문자열이면 '{COS}' 만 허용됩니다")
-    elif actions is None:
-        cos, actions = True, []
+    # 출력 스펙을 헤드 목록으로
+    if _헤드스펙인가(outputs) and isinstance(outputs, (list, tuple))             and not isinstance(outputs, _Cos) and outputs and all(_헤드스펙인가(o) for o in outputs):
+        specs = list(outputs)          # 헤드 여러 개
     else:
-        actions = list(actions)
-        if len(actions) != out_size:
-            raise ValueError(
-                f"actions 개수({len(actions)}) 와 출력층 크기({out_size}) 가 다릅니다")
+        specs = [outputs]              # 헤드 하나
 
-    h = _ml_make(model_name, layers, list(actions), int(cos), optimizer)
-    return BlackBoxAI(h, model_name, actions, cos, out_size)
+    heads, al_arg, cos_arg, sizes = [], [], [], []
+    for spec in specs:
+        names, is_cos, n = _헤드해석(spec)
+        heads.append((names, is_cos))
+        al_arg.append(names or [])
+        cos_arg.append(1 if is_cos else 0)
+        sizes.append(n)
+
+    h = _ml_make(model_name, inputSz, hidden, sizes, al_arg, cos_arg,
+                 optimizer, float(sigma), float(entropy))
+    return BlackBoxAI(h, model_name, heads)
 
 
 def change(model_name):
     """예전 버전에서 만든 가중치 파일을 지금 포맷으로 바꿉니다.
-    원본은 .bak 으로 남습니다. 이미 최신이면 아무것도 하지 않습니다.
-
-        change("MyModel")                  # MyModel_ml_memory.pth
-        change("weights/MyModel.pth")      # 경로를 직접 줘도 됩니다
-    """
+    원본은 .bak 으로 남습니다."""
     path = model_name if model_name.endswith(".pth") else f"{model_name}_ml_memory.pth"
     if not os.path.exists(path):
         print(f" [{model_name}] {path} 가 없습니다.")
@@ -1079,7 +1174,7 @@ def change(model_name):
     if r == "already":
         print(f" [{model_name}] 이미 최신 포맷입니다.")
         return False
-    print(f" [{model_name}] 변환 완료 → {r}   (원본: {path}.bak)")
+    print(f" [{model_name}] 변환 완료 -> {r}   (원본: {path}.bak)")
     return True
 
 
@@ -1097,26 +1192,24 @@ builtins.gc_collect = gc_collect
 // ─────────────────────────────────────────────
 // Module init
 // ─────────────────────────────────────────────
-private __gshared PyMethodDef[15] _methods;
+private __gshared PyMethodDef[13] _methods;
 private __gshared PyModuleDef     _moddef;
 
 extern(C) PyObject* PyInit_my_ml() nothrow @trusted {
     try {
-        _methods[0]  = PyMethodDef("_ml_make",           &py_ml_make,           METH_VARARGS, null);
-        _methods[1]  = PyMethodDef("_ml_pick",           &py_ml_pick,           METH_VARARGS, null);
-        _methods[2]  = PyMethodDef("_ml_pick_cos",       &py_ml_pick_cos,       METH_VARARGS, null);
-        _methods[3]  = PyMethodDef("_ml_predict",        &py_ml_predict,        METH_VARARGS, null);
-        _methods[4]  = PyMethodDef("_ml_learn",          &py_ml_learn,          METH_VARARGS, null);
-        _methods[5]  = PyMethodDef("_ml_sl",             &py_ml_sl,             METH_VARARGS, null);
-        _methods[6]  = PyMethodDef("_ml_sl_cos",         &py_ml_sl_cos,         METH_VARARGS, null);
-        _methods[7]  = PyMethodDef("_ml_save",           &py_ml_save,           METH_VARARGS, null);
-        _methods[8]  = PyMethodDef("_ml_resset",         &py_ml_resset,         METH_VARARGS, null);
-        _methods[9]  = PyMethodDef("_ml_gc_disable",     &py_ml_gc_disable,     METH_VARARGS, null);
-        _methods[10] = PyMethodDef("_ml_gc_collect",     &py_ml_gc_collect,     METH_VARARGS, null);
-        _methods[11] = PyMethodDef("_ml_export_weights", &py_ml_export_weights, METH_VARARGS, null);
-        _methods[12] = PyMethodDef("_ml_get_meta",       &py_ml_get_meta,       METH_VARARGS, null);
-        _methods[13] = PyMethodDef("_ml_change",         &py_ml_change,         METH_VARARGS, null);
-        _methods[14] = PyMethodDef(null, null, 0, null);
+        _methods[0 ] = PyMethodDef("_ml_make",            &py_ml_make,            METH_VARARGS, null);
+        _methods[1 ] = PyMethodDef("_ml_pick",            &py_ml_pick,            METH_VARARGS, null);
+        _methods[2 ] = PyMethodDef("_ml_predict",         &py_ml_predict,         METH_VARARGS, null);
+        _methods[3 ] = PyMethodDef("_ml_learn",           &py_ml_learn,           METH_VARARGS, null);
+        _methods[4 ] = PyMethodDef("_ml_sl",              &py_ml_sl,              METH_VARARGS, null);
+        _methods[5 ] = PyMethodDef("_ml_save",            &py_ml_save,            METH_VARARGS, null);
+        _methods[6 ] = PyMethodDef("_ml_resset",          &py_ml_resset,          METH_VARARGS, null);
+        _methods[7 ] = PyMethodDef("_ml_gc_disable",      &py_ml_gc_disable,      METH_VARARGS, null);
+        _methods[8 ] = PyMethodDef("_ml_gc_collect",      &py_ml_gc_collect,      METH_VARARGS, null);
+        _methods[9 ] = PyMethodDef("_ml_export_weights",  &py_ml_export_weights,  METH_VARARGS, null);
+        _methods[10] = PyMethodDef("_ml_get_meta",        &py_ml_get_meta,        METH_VARARGS, null);
+        _methods[11] = PyMethodDef("_ml_change",          &py_ml_change,          METH_VARARGS, null);
+        _methods[12] = PyMethodDef(null, null, 0, null);
 
         _moddef.m_base.ob_base.ob_refcnt = 1;
         _moddef.m_name    = "my_ml";
