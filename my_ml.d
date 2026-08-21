@@ -1508,19 +1508,13 @@ private void rLN(ref File f, ref LN n) {
     n.t = ru();
 }
 
-void saveGPT(GPT g, string[] vocab) {
+void saveGPT(GPT g) {
     auto f = File(g.file, "wb");
     void wu(uint v) { f.rawWrite((&v)[0..1]); }
     void wf(float v) { f.rawWrite((&v)[0..1]); }
     wu(0x11ADCAFE); wu(1); wu(cast(uint) g.opt); wf(g.lr);
     wu(cast(uint) g.V); wu(cast(uint) g.D); wu(cast(uint) g.H);
     wu(cast(uint) g.L); wu(cast(uint) g.maxT);
-    wu(cast(uint) vocab.length);
-    foreach (s; vocab) {
-        auto b = cast(ubyte[]) s;
-        wu(cast(uint) b.length);
-        if (b.length) f.rawWrite(b);
-    }
     wVec(f, g.tok); wVec(f, g.mTok); wVec(f, g.vTok);
     wVec(f, g.pos); wVec(f, g.mPos); wVec(f, g.vPos);
     wu(cast(uint) g.embT);
@@ -1533,8 +1527,7 @@ void saveGPT(GPT g, string[] vocab) {
     wLinear(f, g.head);
 }
 
-// 반환: 어휘 목록. 실패하면 예외.
-string[] loadGPT(string name, out GPT g) {
+void loadGPT(string name, out GPT g) {
     string path = name ~ "_lm.pth";
     auto f = File(path, "rb");
     uint ru() { uint v; f.rawRead((&v)[0..1]); return v; }
@@ -1545,13 +1538,6 @@ string[] loadGPT(string name, out GPT g) {
     Opt o = cast(Opt) ru();
     float lr = rf();
     int V = ru(), D = ru(), H = ru(), L = ru(), T = ru();
-    int nv = ru();
-    auto vocab = new string[nv];
-    foreach (i; 0..nv) {
-        int n = ru();
-        if (n == 0) { vocab[i] = ""; continue; }
-        auto b = new ubyte[n]; f.rawRead(b); vocab[i] = cast(string) b.dup;
-    }
     g = new GPT(name, V, D, H, L, T, o, lr);
     rVec(f, g.tok); rVec(f, g.mTok); rVec(f, g.vTok);
     rVec(f, g.pos); rVec(f, g.mPos); rVec(f, g.vPos);
@@ -1563,7 +1549,6 @@ string[] loadGPT(string name, out GPT g) {
     }
     rLN(f, g.lnf);
     rLinear(f, g.head);
-    return vocab;
 }
 
 // ─────────────────────────────────────────────
@@ -1715,21 +1700,19 @@ PyObject* py_lm_load(PyObject* self, PyObject* args) {
         string name = fromStringz(PyUnicode_AsUTF8(nm)).idup;
         if (!exists(name ~ "_lm.pth")) { Py_IncRef(_pyNone); return _pyNone; }
         GPT g;
-        string[] vocab;
-        try { vocab = loadGPT(name, g); }
+        try { loadGPT(name, g); }
         catch (Exception e) { Py_IncRef(_pyNone); return _pyNone; }
         GC.addRoot(cast(void*) g);
         auto cap = PyCapsule_New(cast(void*) g, "GPT", &gpt_dtor);
-        auto tup = PyList_New(3);
+        auto tup = PyList_New(2);
         PyList_SetItem(tup, 0, cap);
-        PyList_SetItem(tup, 1, toPyList(vocab));
         auto cfg = PyList_New(5);
         PyList_SetItem(cfg, 0, PyLong_FromLong(g.V));
         PyList_SetItem(cfg, 1, PyLong_FromLong(g.D));
         PyList_SetItem(cfg, 2, PyLong_FromLong(g.H));
         PyList_SetItem(cfg, 3, PyLong_FromLong(g.L));
         PyList_SetItem(cfg, 4, PyLong_FromLong(g.maxT));
-        PyList_SetItem(tup, 2, cfg);
+        PyList_SetItem(tup, 1, cfg);
         return tup;
     } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _lm_load"); return null; }
 }
@@ -1793,10 +1776,10 @@ PyObject* py_lm_sample(PyObject* self, PyObject* args) {
 
 PyObject* py_lm_save(PyObject* self, PyObject* args) {
     try {
-        PyObject* cap; PyObject* vocab;
-        if (!PyArg_ParseTuple(args, "OO", &cap, &vocab)) return null;
+        PyObject* cap;
+        if (!PyArg_ParseTuple(args, "O", &cap)) return null;
         auto g = cast(GPT) PyCapsule_GetPointer(cap, "GPT");
-        saveGPT(g, pyStrList(vocab));
+        saveGPT(g);
         Py_IncRef(_pyNone); return _pyNone;
     } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _lm_save"); return null; }
 }
@@ -2141,84 +2124,72 @@ def make(model_name, layers, outputs, optimizer='adam', sigma=1.0, entropy=0.01)
 
 
 class LM:
-    """글자 단위 언어 모델.
+    """토큰 열을 이어 쓰는 모델 (트랜스포머).
 
-        lm = make_lm("내모델")
-        lm.sl(텍스트)            # 텍스트로 학습
-        lm.gen("안녕", 50)       # 이어서 쓰기
-        lm.save()
+    토큰은 0 이상 vocab 미만의 정수다. 글자/단어를 번호로 바꾸는 건 쓰는 쪽 몫이다.
+
+        chars = sorted(set(텍스트))
+        번호  = {c: i for i, c in enumerate(chars)}
+
+        lm = make_lm("내모델", vocab=len(chars))
+        lm.sl([번호[c] for c in 텍스트], steps=2000)
+        나온것 = lm.gen([번호["안"]], 40)
+        print("".join(chars[i] for i in 나온것))
     """
 
-    def __init__(self, name, dim=128, layers=4, heads=4, ctx=64,
+    def __init__(self, name, vocab, dim=128, layers=4, heads=4, ctx=64,
                  optimizer='adam', lr=3e-4):
         self._name = name
-        self._cfg  = dict(dim=dim, layers=layers, heads=heads, ctx=ctx,
-                          optimizer=optimizer, lr=lr)
         self._h    = None
-        self._chars = []       # 번호 -> 글자
-        self._idx   = {}       # 글자 -> 번호
+        self._cfg  = dict(vocab=int(vocab), dim=dim, layers=layers, heads=heads,
+                          ctx=ctx, optimizer=optimizer, lr=lr)
 
         got = _lm_load(name)
         if got:
-            self._h, self._chars, cfg = got[0], list(got[1]), got[2]
-            self._idx = {c: i for i, c in enumerate(self._chars)}
-            self._cfg.update(dim=cfg[1], layers=cfg[3], heads=cfg[2], ctx=cfg[4])
-            print(f" [{name}] 이전 학습 데이터를 불러왔습니다. (글자 {len(self._chars)}종)")
-
-    # ── 글자 <-> 번호 ─────────────────────────
-    def _배우기(self, text):
-        """새 글자를 어휘에 추가. 모델이 이미 있으면 못 늘린다."""
-        새것 = [c for c in dict.fromkeys(text) if c not in self._idx]
-        if not 새것:
-            return
-        if self._h is not None:
-            무시 = "".join(새것[:10])
-            print(f" [{self._name}] 처음 보는 글자 {len(새것)}개는 무시합니다 ({무시}...)")
-            return
-        for c in 새것:
-            self._idx[c] = len(self._chars)
-            self._chars.append(c)
-
-    def _번호(self, text):
-        return [self._idx[c] for c in text if c in self._idx]
-
-    def _글자(self, ids):
-        return "".join(self._chars[i] for i in ids)
+            self._h, cfg = got[0], got[1]
+            self._cfg.update(vocab=cfg[0], dim=cfg[1], heads=cfg[2],
+                             layers=cfg[3], ctx=cfg[4])
+            if cfg[0] != int(vocab):
+                print(f" [{name}] 저장된 어휘 {cfg[0]} 이 요청한 {vocab} 과 다릅니다. 저장된 쪽을 씁니다.")
+            print(f" [{name}] 이전 학습 데이터를 불러왔습니다.")
 
     def _준비(self):
         if self._h is None:
-            if not self._chars:
-                raise ValueError("먼저 sl(텍스트) 로 학습할 텍스트를 주세요")
             c = self._cfg
-            self._h = _lm_make(self._name, len(self._chars), c['dim'],
-                               c['heads'], c['layers'], c['ctx'],
-                               c['optimizer'], float(c['lr']))
+            self._h = _lm_make(self._name, c['vocab'], c['dim'], c['heads'],
+                               c['layers'], c['ctx'], c['optimizer'], float(c['lr']))
             n = _lm_info(self._h)['params']
             print(f" [{self._name}] 새로 만들었습니다. "
-                  f"글자 {len(self._chars)}종, 파라미터 {n:,}개")
+                  f"어휘 {c['vocab']}, 파라미터 {n:,}개")
+
+    def _확인(self, ids):
+        V = self._cfg['vocab']
+        out = [int(t) for t in ids]
+        for t in out:
+            if not (0 <= t < V):
+                raise ValueError(f"토큰 {t} 가 어휘 범위(0~{V-1}) 밖입니다")
+        return out
 
     # ── 학습 ──────────────────────────────────
-    def sl(self, text, steps=None, log=None):
-        """텍스트로 학습. 정답은 '다음 글자' 라서 따로 줄 필요가 없다.
+    def sl(self, tokens, steps=None, log=None):
+        """토큰 열로 학습. 정답은 '다음 토큰' 이라 따로 줄 필요가 없다.
         steps 를 주면 그만큼 무작위 조각을 뽑아 학습한다."""
         import random
-        self._배우기(text)
         self._준비()
-        ids = self._번호(text)
-        ctx = self._cfg['ctx']
+        ids = self._확인(tokens)
         if len(ids) < 2:
-            raise ValueError("텍스트가 너무 짧습니다")
+            raise ValueError("토큰이 2개 이상 필요합니다")
+        조각 = self._cfg['ctx'] + 1
 
-        조각 = ctx + 1
         if steps is None:
-            # 한 번 훑기
-            자리 = list(range(0, max(1, len(ids) - 조각 + 1), max(1, ctx // 2)))
+            걸음 = max(1, self._cfg['ctx'] // 2)
+            자리 = list(range(0, max(1, len(ids) - 조각 + 1), 걸음))
         else:
             상한 = max(1, len(ids) - 조각)
             자리 = [random.randrange(상한) for _ in range(steps)]
 
         총, 수 = 0.0, 0
-        for k, s in enumerate(자리):
+        for s in 자리:
             묶음 = ids[s:s + 조각]
             if len(묶음) < 2:
                 continue
@@ -2228,23 +2199,23 @@ class LM:
                 print(f"   {수}/{len(자리)}  손실 {총/수:.4f}")
         return 총 / max(1, 수)
 
-    def loss(self, text):
+    def loss(self, tokens):
         """학습 없이 손실만 (낮을수록 잘 맞힘)"""
         self._준비()
-        ids = self._번호(text)[:self._cfg['ctx'] + 1]
+        ids = self._확인(tokens)[:self._cfg['ctx'] + 1]
         if len(ids) < 2:
             return 0.0
         return _lm_loss(self._h, ids)
 
     # ── 생성 ──────────────────────────────────
-    def gen(self, prompt="", n=100, temp=1.0, topk=0):
-        """prompt 뒤에 n 글자를 이어 쓴다.
+    def gen(self, tokens, n=100, temp=1.0, topk=0):
+        """tokens 뒤에 n 개를 이어 만든다. 새로 만든 것만 반환한다.
         temp 낮으면 뻔하게, 높으면 엉뚱하게. topk>0 이면 상위 k개 중에서만."""
+        import random
         self._준비()
-        ids = self._번호(prompt)
+        ids = self._확인(tokens)
         if not ids:
-            import random
-            ids = [random.randrange(len(self._chars))]
+            ids = [random.randrange(self._cfg['vocab'])]
         나온것 = []
         for _ in range(n):
             다음 = _lm_sample(self._h, ids, float(temp), int(topk))
@@ -2252,36 +2223,34 @@ class LM:
             ids.append(다음)
             if len(ids) > self._cfg['ctx']:
                 ids = ids[-self._cfg['ctx']:]
-        return prompt + self._글자(나온것)
+        return 나온것
 
     def save(self):
         self._준비()
-        _lm_save(self._h, self._chars)
+        _lm_save(self._h)
         print(f" [{self._name}] 저장 완료.")
 
     @property
     def info(self):
         self._준비()
-        d = _lm_info(self._h)
-        d['chars'] = len(self._chars)
-        return d
-
-    @property
-    def chars(self):
-        return list(self._chars)
+        return _lm_info(self._h)
 
 
-def make_lm(name, dim=128, layers=4, heads=4, ctx=64, optimizer='adam', lr=3e-4):
+def make_lm(name, vocab, dim=128, layers=4, heads=4, ctx=64,
+            optimizer='adam', lr=3e-4):
     """
     name      : 모델 이름 (가중치 파일 이름_lm.pth)
+    vocab     : 토큰 종류 수. 토큰은 0 ~ vocab-1 의 정수
     dim       : 폭. heads 로 나누어떨어져야 한다
     layers    : 층 수
     heads     : 어텐션 헤드 수
-    ctx       : 한 번에 보는 글자 수
+    ctx       : 한 번에 보는 토큰 수
     """
     if dim % heads:
         raise ValueError(f"dim({dim}) 은 heads({heads}) 로 나누어떨어져야 합니다")
-    return LM(name, dim, layers, heads, ctx, optimizer, lr)
+    if int(vocab) < 2:
+        raise ValueError("vocab 은 2 이상이어야 합니다")
+    return LM(name, vocab, dim, layers, heads, ctx, optimizer, lr)
 
 
 def change(model_name):
