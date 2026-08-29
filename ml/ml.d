@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 rnjswldbf2014-hash
-module my_ml;
+module ml;
 
 import std.string : fromStringz, toStringz;
 import core.memory : GC;
@@ -36,6 +36,34 @@ import std.random    : Random, uniform, uniform01, unpredictableSeed;
 import std.file      : exists, remove, rename;
 import std.algorithm : countUntil, min;
 import std.conv      : to;
+import std.process   : environment;
+import std.parallelism : taskPool, defaultPoolThreads, totalCPUs, parallel;
+import std.range     : iota;
+
+__gshared bool _noBatch = false;
+__gshared int  _nThreads = 1;
+shared static this() {
+    try { _noBatch = environment.get("MYML_NOBATCH", "") == "1"; } catch (Exception e) {}
+    try {
+        auto s = environment.get("MYML_THREADS", "");
+        _nThreads = (s.length ? s.to!int : totalCPUs);
+    } catch (Exception e) { _nThreads = totalCPUs; }
+    if (_nThreads < 1) _nThreads = 1;
+    try { defaultPoolThreads(cast(size_t)(_nThreads > 0 ? _nThreads - 1 : 0)); } catch (Exception e) {}
+}
+
+// [0,n) 을 _nThreads 조각으로 나눠 병렬 실행. 각 조각은 겹치지 않는 출력을 담당한다
+// (합산 순서가 보존되므로 직렬과 비트 단위로 동일하다).
+void _parChunk(int n, scope void delegate(int lo, int hi) body) {
+    int T = _nThreads;
+    if (T <= 1 || n < 2 * T) { body(0, n); return; }
+    int per = (n + T - 1) / T;
+    foreach (t; taskPool.parallel(iota(T), 1)) {
+        int lo = cast(int)t * per; int hi = lo + per;
+        if (hi > n) hi = n;
+        if (lo < hi) body(lo, hi);
+    }
+}
 
 private Random rng;
 static this() { rng = Random(unpredictableSeed); }
@@ -617,6 +645,150 @@ private class Network {
         fwdCached = false;
     }
 
+    // ── 묶음(batch) 경로 — 가중치 행을 배치 전체에 재사용해 5배 빠르다 ──
+    // 순수 Linear 망일 때만 (attn/each 없음). 결과는 per-sample 과 동일.
+    bool pureLinear() const nothrow @nogc {
+        foreach (k; kinds) if (k != 0) return false;
+        return true;
+    }
+
+    int       _bcap;
+    float[][] _bInp, _bPre, _bDZ;    // 층별 [_bcap*inSz], [_bcap*outSz], dZ[_bcap*outSz]
+    float[]   _bHout, _bDHout;       // [_bcap*houtSz]
+    float[][] _bHd;                  // 헤드별 [_bcap*outSz]  (출력)
+    float[][] _bDHead;               // 헤드별 [_bcap*outSz]  (호출자가 채움)
+
+    void _allocBatch(int B) {
+        if (B <= _bcap) return;
+        int n = layerCount;
+        _bInp = new float[][n]; _bPre = new float[][n]; _bDZ = new float[][n];
+        foreach (i; 0..n) {
+            _bInp[i] = new float[B*_inSz[i]];
+            _bPre[i] = new float[B*_outSz[i]];
+            _bDZ[i]  = new float[B*_outSz[i]];
+        }
+        int houtSz = n > 0 ? _outSz[n-1] : inputSz;
+        _bHout = new float[B*houtSz]; _bDHout = new float[B*houtSz];
+        _bHd = new float[][heads.length]; _bDHead = new float[][heads.length];
+        foreach (i, ref h; heads) {
+            _bHd[i]    = new float[B*h.outSz];
+            _bDHead[i] = new float[B*h.outSz];
+        }
+        _bcap = B;
+    }
+
+    // X: B 개 입력 (각 inputSz). 헤드 출력은 _bHd 에.
+    void forwardBatch(float[][] X, int B) {
+        int n = layerCount;
+        int houtSz = n > 0 ? _outSz[n-1] : inputSz;
+        if (n == 0) {
+            foreach (b; 0..B) foreach (k; 0..inputSz) _bHout[b*houtSz + k] = X[b][k];
+        } else {
+            foreach (b; 0..B) foreach (k; 0..inputSz) _bInp[0][b*inputSz + k] = X[b][k];
+            foreach (i; 0..n) {
+                int iS = _inSz[i], oS = _outSz[i];
+                auto L = &lins[slot[i]];
+                auto inp = _bInp[i]; auto pre = _bPre[i];
+                // pre[b][j] = bias[j] + dot(w[j], inp[b])  — j 를 스레드로 나눔 (w[j] 재사용)
+                _parChunk(oS, (int jlo, int jhi) {
+                    foreach (j; jlo .. jhi) {
+                        auto wj = L.w[j]; float bj = L.b[j];
+                        foreach (b; 0..B)
+                            pre[b*oS + j] = bj + _dot(wj, inp[b*iS .. b*iS + iS]);
+                    }
+                });
+                bool 마지막 = (i + 1 == n);
+                auto 다음 = 마지막 ? _bHout : _bInp[i+1];
+                int nextW = 마지막 ? houtSz : _outSz[i+1];
+                _parChunk(B, (int blo, int bhi) {           // ReLU — b 를 스레드로 나눔
+                    foreach (b; blo .. bhi) foreach (k; 0..oS) {
+                        float v = pre[b*oS + k];
+                        다음[b*nextW + k] = v < 0f ? 0f : v;
+                    }
+                });
+            }
+        }
+        foreach (hi, ref head; heads) {
+            int hoS = head.outSz;
+            foreach (j; 0..hoS) {
+                auto wj = head.w[j]; float bj = head.b[j];
+                foreach (b; 0..B)
+                    _bHd[hi][b*hoS + j] = bj + _dot(wj, _bHout[b*houtSz .. b*houtSz + houtSz]);
+            }
+        }
+    }
+
+    // _bDHead (헤드별 [B*outSz], 호출자가 채움) -> 가중치 기울기 누적. step 은 밖에서.
+    void backwardBatch(int B) {
+        int n = layerCount;
+        int houtSz = n > 0 ? _outSz[n-1] : inputSz;
+        _bDHout[0 .. B*houtSz] = 0f;
+        // 헤드: dHout 누적은 b 로 나눈다 (dHout[b] 서로 겹침 없음), gradW 는 직렬(작다)
+        foreach (hi, ref head; heads) {
+            int hoS = head.outSz;
+            foreach (j; 0..hoS) {
+                auto wj = head.w[j]; float gb = 0f;
+                foreach (b; 0..B) {
+                    float d = _bDHead[hi][b*hoS + j];
+                    _saxpy(head.gradW[j], _bHout[b*houtSz .. b*houtSz+houtSz], d);
+                    gb += d;
+                }
+                head.gradB[j] += gb;
+            }
+        }
+        foreach (hi, ref head; heads) {
+            int hoS = head.outSz;
+            _parChunk(B, (int blo, int bhi) {
+                foreach (b; blo .. bhi) foreach (j; 0..hoS) {
+                    float d = _bDHead[hi][b*hoS + j];
+                    _saxpy(_bDHout[b*houtSz .. b*houtSz+houtSz], head.w[j], d);
+                }
+            });
+        }
+        if (n == 0) return;
+        for (int i = n-1; i >= 0; i--) {
+            int iS = _inSz[i], oS = _outSz[i];
+            auto L = &lins[slot[i]];
+            bool 첫층 = (i == 0);
+            bool 마지막 = (i + 1 == n);
+            auto pre = _bPre[i]; auto dZ = _bDZ[i]; auto inp = _bInp[i];
+            // dZ[b][k] = 들어온 기울기 * (pre>0)  — b 로 나눔
+            _parChunk(B, (int blo, int bhi) {
+                foreach (b; blo .. bhi) foreach (k; 0..oS) {
+                    float g = 마지막 ? _bDHout[b*houtSz + k] : dZ[b*oS + k];
+                    dZ[b*oS + k] = (pre[b*oS + k] > 0f) ? g : 0f;
+                }
+            });
+            // ① gradW: j 를 스레드로 나눔 — gradW[j] 를 L1 에 두고 재사용
+            _parChunk(oS, (int jlo, int jhi) {
+                foreach (j; jlo .. jhi) {
+                    auto gj = L.gradW[j]; float gb = 0f;
+                    foreach (b; 0..B) {
+                        float d = dZ[b*oS + j];
+                        if (d == 0f) continue;
+                        _saxpy(gj, inp[b*iS .. b*iS+iS], d);
+                        gb += d;
+                    }
+                    L.gradB[j] += gb;
+                }
+            });
+            // ② dInput: b 를 스레드로 나눔 — dInp[b] 를 L1 에 두고 W 스트리밍
+            if (!첫층) {
+                auto dInp = _bDZ[i-1];
+                _parChunk(B, (int blo, int bhi) {
+                    foreach (b; blo .. bhi) {
+                        auto o = dInp[b*iS .. b*iS+iS];
+                        o[] = 0f;
+                        foreach (j; 0..oS) {
+                            float d = dZ[b*oS + j];
+                            if (d != 0f) _saxpy(o, L.w[j], d);
+                        }
+                    }
+                });
+            }
+        }
+    }
+
     void zeroGrad() nothrow @nogc {
         foreach (ref h; lins)  h.zeroGrad();
         foreach (ref a; attns) a.zeroGrad();
@@ -924,6 +1096,38 @@ class BlackBoxAI {
         if (inputs.length == 0) return;
         net.zeroGrad();
         immutable float inv = 1.0f / cast(float) inputs.length;
+
+        // ── 묶음 경로: 순수 Linear 망이면 가중치 행을 배치 전체에 재사용 (≈5배) ──
+        // MYML_NOBATCH 환경변수로 끌 수 있다 (per-sample 와 동치 검증용).
+        if (net.pureLinear() && !_noBatch) {
+            int B = cast(int) inputs.length;
+            net._allocBatch(B);
+            net.forwardBatch(inputs, B);
+            foreach (h; 0..nHeads) {
+                int oS = outSizes[h];
+                net._bDHead[h][0 .. B*oS] = 0f;
+                foreach (i; 0..B) {
+                    if (!use[i][h]) continue;
+                    auto slice = net._bHd[h][i*oS .. i*oS + oS];
+                    auto dst   = net._bDHead[h][i*oS .. i*oS + oS];
+                    if (cosModes[h]) {
+                        dst[0] = (slice[0] - ansVal[i][h]) * inv;
+                    } else {
+                        auto lg = (h < legal.length) ? legal[h] : null;
+                        int mlen = maskOf(h, lg);
+                        foreach (k; 0..mlen) _probBufs[h][k] = slice[_maskBufs[h][k]];
+                        softmaxInPlace(_probBufs[h][0..mlen]);
+                        int tgt = -1;
+                        foreach (k; 0..mlen) if (_maskBufs[h][k] == ansIdx[i][h]) { tgt = k; break; }
+                        foreach (k; 0..mlen)
+                            dst[_maskBufs[h][k]] = (_probBufs[h][k] - (k == tgt ? 1f : 0f)) * inv;
+                    }
+                }
+            }
+            net.backwardBatch(B);
+            net.step(opt, lr);
+            return;
+        }
 
         foreach (i; 0..inputs.length) {
             bool any = false;
@@ -1810,7 +2014,7 @@ builtins.gc_collect = gc_collect
 private __gshared PyMethodDef[14] _methods;
 private __gshared PyModuleDef     _moddef;
 
-extern(C) PyObject* PyInit_my_ml() nothrow @trusted {
+extern(C) export PyObject* PyInit_ml() nothrow @trusted {
     try {
         _methods[0] = PyMethodDef("_ml_make",            &py_ml_make,            METH_VARARGS, null);
         _methods[1] = PyMethodDef("_ml_pick",            &py_ml_pick,            METH_VARARGS, null);

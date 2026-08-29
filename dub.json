@@ -1,0 +1,9 @@
+{
+    "name": "rnjswldbf_2014_ml",
+    "description": "A reinforcement learning library in D",
+    "authors": ["권지율"],
+    "license": "GPL-2.0",
+    "targetType": "library",
+    "sourcePaths": ["ml"],
+    "importPaths": ["ml"]
+}
