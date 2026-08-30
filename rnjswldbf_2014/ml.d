@@ -39,15 +39,34 @@ import std.conv      : to;
 import std.process   : environment;
 import std.parallelism : taskPool, defaultPoolThreads, totalCPUs, parallel;
 import std.range     : iota;
+import gpucl;
 
 __gshared bool _noBatch = false;
 __gshared int  _nThreads = 1;
+// GPU 사용 여부: "0"=완전 비활성(OpenCL.dll 프로브도 안 함), "1"=강제(문턱값 무시),
+// 미설정="auto"(문턱값 넘는 큰 배치에서만 지연 프로브). 배치=1 온라인 경로는 절대
+// 안 건드린다 — GPU 디스패치 오버헤드가 이 라이브러리의 핵심 사용처보다 훨씬 크다.
+__gshared string _gpuMode = "auto";
+__gshared long   _gpuMinFlops = 50_000_000;
+__gshared int    _gpuMinB = 64;
 shared static this() {
     try { _noBatch = environment.get("MYML_NOBATCH", "") == "1"; } catch (Exception e) {}
     try {
         auto s = environment.get("MYML_THREADS", "");
         _nThreads = (s.length ? s.to!int : totalCPUs);
     } catch (Exception e) { _nThreads = totalCPUs; }
+    try {
+        auto g = environment.get("MYML_GPU", "");
+        if (g.length) _gpuMode = g;
+    } catch (Exception e) {}
+    try {
+        auto f = environment.get("MYML_GPU_MIN_FLOPS", "");
+        if (f.length) _gpuMinFlops = f.to!long;
+    } catch (Exception e) {}
+    try {
+        auto b = environment.get("MYML_GPU_MIN_B", "");
+        if (b.length) _gpuMinB = b.to!int;
+    } catch (Exception e) {}
     if (_nThreads < 1) _nThreads = 1;
     try { defaultPoolThreads(cast(size_t)(_nThreads > 0 ? _nThreads - 1 : 0)); } catch (Exception e) {}
 }
@@ -63,6 +82,13 @@ void _parChunk(int n, scope void delegate(int lo, int hi) body) {
         if (hi > n) hi = n;
         if (lo < hi) body(lo, hi);
     }
+}
+
+// nothrow 컨텍스트용 _parChunk. std.parallelism 자체는 nothrow 가 아니라서
+// (그리고 Task 할당 때문에 @nogc 도 아니라서), 병렬 실행 중 예외가 나면
+// 그 청크는 포기하지 않고 직렬로 다시 돌려 결과를 보존한다.
+void _parChunkNT(int n, scope void delegate(int lo, int hi) nothrow body) nothrow {
+    try { _parChunk(n, body); } catch (Throwable) { body(0, n); }
 }
 
 private Random rng;
@@ -168,49 +194,100 @@ private struct Linear {
             case Opt.adam:
                 t++;
                 float bc1 = 1f - B1^^t, bc2 = 1f - B2^^t;
-                foreach (j; 0..outSz) {
-                    foreach (k; 0..inSz) {
-                        float g = gradW[j][k];
-                        mW[j][k] = B1*mW[j][k] + (1-B1)*g;
-                        vW[j][k] = B2*vW[j][k] + (1-B2)*g*g;
-                        w[j][k] -= lr * (mW[j][k]/bc1) / (sqrt(vW[j][k]/bc2) + EPS);
+                _parChunkNT(outSz, (int jlo, int jhi) nothrow {
+                    foreach (j; jlo .. jhi) {
+                        foreach (k; 0..inSz) {
+                            float g = gradW[j][k];
+                            mW[j][k] = B1*mW[j][k] + (1-B1)*g;
+                            vW[j][k] = B2*vW[j][k] + (1-B2)*g*g;
+                            w[j][k] -= lr * (mW[j][k]/bc1) / (sqrt(vW[j][k]/bc2) + EPS);
+                        }
+                        float gb = gradB[j];
+                        mB[j] = B1*mB[j] + (1-B1)*gb; vB[j] = B2*vB[j] + (1-B2)*gb*gb;
+                        b[j] -= lr * (mB[j]/bc1) / (sqrt(vB[j]/bc2) + EPS);
                     }
-                    float gb = gradB[j];
-                    mB[j] = B1*mB[j] + (1-B1)*gb; vB[j] = B2*vB[j] + (1-B2)*gb*gb;
-                    b[j] -= lr * (mB[j]/bc1) / (sqrt(vB[j]/bc2) + EPS);
-                }
+                });
                 break;
             case Opt.sgd:
-                foreach (j; 0..outSz) {
-                    foreach (k; 0..inSz) w[j][k] -= lr * gradW[j][k];
-                    b[j] -= lr * gradB[j];
-                }
+                _parChunkNT(outSz, (int jlo, int jhi) nothrow {
+                    foreach (j; jlo .. jhi) {
+                        foreach (k; 0..inSz) w[j][k] -= lr * gradW[j][k];
+                        b[j] -= lr * gradB[j];
+                    }
+                });
                 break;
             case Opt.rmsprop:
-                foreach (j; 0..outSz) {
-                    foreach (k; 0..inSz) {
-                        float g = gradW[j][k];
-                        vW[j][k] = RHO*vW[j][k] + (1-RHO)*g*g;
-                        w[j][k] -= lr * g / (sqrt(vW[j][k]) + EPS);
+                _parChunkNT(outSz, (int jlo, int jhi) nothrow {
+                    foreach (j; jlo .. jhi) {
+                        foreach (k; 0..inSz) {
+                            float g = gradW[j][k];
+                            vW[j][k] = RHO*vW[j][k] + (1-RHO)*g*g;
+                            w[j][k] -= lr * g / (sqrt(vW[j][k]) + EPS);
+                        }
+                        float gb = gradB[j];
+                        vB[j] = RHO*vB[j] + (1-RHO)*gb*gb;
+                        b[j] -= lr * gb / (sqrt(vB[j]) + EPS);
                     }
-                    float gb = gradB[j];
-                    vB[j] = RHO*vB[j] + (1-RHO)*gb*gb;
-                    b[j] -= lr * gb / (sqrt(vB[j]) + EPS);
-                }
+                });
                 break;
             case Opt.adagrad:
-                foreach (j; 0..outSz) {
-                    foreach (k; 0..inSz) {
-                        float g = gradW[j][k];
-                        vW[j][k] += g*g;
-                        w[j][k] -= lr * g / (sqrt(vW[j][k]) + EPS);
+                _parChunkNT(outSz, (int jlo, int jhi) nothrow {
+                    foreach (j; jlo .. jhi) {
+                        foreach (k; 0..inSz) {
+                            float g = gradW[j][k];
+                            vW[j][k] += g*g;
+                            w[j][k] -= lr * g / (sqrt(vW[j][k]) + EPS);
+                        }
+                        float gb = gradB[j];
+                        vB[j] += gb*gb;
+                        b[j] -= lr * gb / (sqrt(vB[j]) + EPS);
                     }
-                    float gb = gradB[j];
-                    vB[j] += gb*gb;
-                    b[j] -= lr * gb / (sqrt(vB[j]) + EPS);
-                }
+                });
                 break;
         }
+    }
+
+    // ── 배치 코어 (count 개 항목 — Network 의 샘플 배치든 EachLayer 의 항목 배치든) ──
+    // pre[c*outSz+j] = b[j] + dot(w[j], xs[c*inSz..]).  j 기준 병렬 (w[j] 재사용).
+    void batchForward(const(float)[] xs, float[] pre, int count) {
+        _parChunk(outSz, (int jlo, int jhi) {
+            foreach (j; jlo .. jhi) {
+                auto wj = w[j]; float bj = b[j];
+                foreach (c; 0..count)
+                    pre[c*outSz + j] = bj + _dot(wj, xs[c*inSz .. c*inSz + inSz]);
+            }
+        });
+    }
+
+    // dZ(count*outSz, 활성함수까지 적용된 기울기) -> gradW/gradB 누적, 선택적으로 dIn 전파.
+    // ① gradW: j 기준 병렬 (gradW[j] 재사용).  ② dIn: c 기준 병렬 (w[j] 스트리밍).
+    // zeroDIn=false 면 dIn 을 먼저 비우지 않고 누적만 한다 (여러 헤드가 같은 dHout
+    // 버퍼를 공유해서 더해 넣어야 할 때 — 그 경우 호출자가 미리 한 번 0으로 채워둔다).
+    void batchAccum(const(float)[] xs, const(float)[] dZ, float[] dIn, int count,
+                     bool needDIn = true, bool zeroDIn = true) {
+        _parChunk(outSz, (int jlo, int jhi) {
+            foreach (j; jlo .. jhi) {
+                auto gj = gradW[j]; float gb = 0f;
+                foreach (c; 0..count) {
+                    float d = dZ[c*outSz + j];
+                    if (d == 0f) continue;
+                    _saxpy(gj, xs[c*inSz .. c*inSz+inSz], d);
+                    gb += d;
+                }
+                gradB[j] += gb;
+            }
+        });
+        if (!needDIn) return;
+        _parChunk(count, (int clo, int chi) {
+            foreach (c; clo .. chi) {
+                auto o = dIn[c*inSz .. c*inSz+inSz];
+                if (zeroDIn) o[] = 0f;
+                foreach (j; 0..outSz) {
+                    float d = dZ[c*outSz + j];
+                    if (d != 0f) _saxpy(o, w[j], d);
+                }
+            }
+        });
     }
 }
 
@@ -225,10 +302,7 @@ private struct LN {
     float[] mg, vg, mb, vb;   // 옵티마이저 상태
     int t;
 
-    // 순전파 때 저장 — 역전파에 필요
-    float[] mu, rstd;
-
-    this(int d, int maxT) {
+    this(int d) {
         D = d;
         g = new float[d]; b = new float[d];
         gg = new float[d]; gb = new float[d];
@@ -237,46 +311,66 @@ private struct LN {
         // D 는 new float[] 를 NaN 으로 채운다. 반드시 직접 0 을 넣어야 한다.
         gg[] = 0f; gb[] = 0f; mg[] = 0f; vg[] = 0f; mb[] = 0f; vb[] = 0f;
         foreach (i; 0..d) { g[i] = 1f; b[i] = 0f; }
-        mu = new float[maxT]; rstd = new float[maxT];
-        mu[] = 0f; rstd[] = 0f;
     }
 
-    // x, y 는 T*D 평면 배열
-    void fwd(const(float)[] x, float[] y, int T) nothrow @nogc {
-        foreach (t_; 0..T) {
-            auto xs = x[t_*D .. t_*D + D];
-            float m = 0f;
-            foreach (v; xs) m += v;
-            m /= D;
-            float s = 0f;
-            foreach (v; xs) { float d_ = v - m; s += d_*d_; }
-            float r = 1f / sqrt(s/D + 1e-5f);
-            mu[t_] = m; rstd[t_] = r;
-            foreach (i; 0..D) y[t_*D + i] = g[i] * ((xs[i] - m) * r) + b[i];
-        }
+    // mu, rstd, xh 는 전부 호출자(AttnLayer) 소유의 스크래치다 (per-sample 용과
+    // fwdBatch/bwdBatch 용이 서로 다른 버퍼 — 절대 안 섞이도록 여기서는 그냥 넘겨받기만
+    // 한다. 예전에는 LN 이 내부에서 알아서 키우는 공유 버퍼였는데, per-sample 경로가
+    // 배치 경로가 키워둔 버퍼를 재사용하다가 두 경로의 예측 결과가 갈라지는 문제가 있어
+    // 아예 분리했다).
+
+    // x, y 는 T*D 평면 배열, mu/rstd 는 [T] 이상 — t_ 마다 서로 겹치지 않아 병렬 안전
+    void fwd(const(float)[] x, float[] y, float[] mu, float[] rstd, int T) {
+        _parChunk(T, (int tlo, int thi) {
+            foreach (t_; tlo .. thi) {
+                auto xs = x[t_*D .. t_*D + D];
+                float m = 0f;
+                foreach (v; xs) m += v;
+                m /= D;
+                float s = 0f;
+                foreach (v; xs) { float d_ = v - m; s += d_*d_; }
+                float r = 1f / sqrt(s/D + 1e-5f);
+                mu[t_] = m; rstd[t_] = r;
+                foreach (i; 0..D) y[t_*D + i] = g[i] * ((xs[i] - m) * r) + b[i];
+            }
+        });
     }
 
-    // dy -> dx (기울기 gg, gb 에 누적)
-    void bwd(const(float)[] x, const(float)[] dy, float[] dx, int T) nothrow @nogc {
-        foreach (t_; 0..T) {
-            auto xs = x[t_*D .. t_*D + D];
-            float m = mu[t_], r = rstd[t_];
-            float sum1 = 0f, sum2 = 0f;
-            foreach (i; 0..D) {
-                float xh = (xs[i] - m) * r;
-                float dyg = dy[t_*D + i] * g[i];
-                gg[i] += dy[t_*D + i] * xh;
-                gb[i] += dy[t_*D + i];
-                sum1 += dyg;
-                sum2 += dyg * xh;
+    // dy -> dx (기울기 gg, gb 에 누적). mu/rstd 는 직전 fwd() 가 채운 것, xh 는 [T*D] 이상
+    // (1단계에서 계산해 2단계로 넘기는 캐시).
+    // gg/gb 는 D축(i) 로만 인덱싱되고 모든 t_ 가 같은 자리에 누적하므로 t_ 기준
+    // 병렬화가 안전하지 않다. dx 계산은 t_ 마다 disjoint 라 안전 — 그래서 2단계로 나눈다:
+    // 1단계(t_ 기준 병렬) dx 계산 + xh 캐시,  2단계(i 기준 병렬) gg/gb 를 t_ 오름차순으로 누적
+    // (원래 직렬 코드와 같은 순서로 더해야 부동소수 결과가 비트 단위로 같다).
+    void bwd(const(float)[] x, const(float)[] dy, float[] dx,
+             const(float)[] mu, const(float)[] rstd, float[] xh, int T) {
+        _parChunk(T, (int tlo, int thi) {
+            foreach (t_; tlo .. thi) {
+                auto xs = x[t_*D .. t_*D + D];
+                float m = mu[t_], r = rstd[t_];
+                float sum1 = 0f, sum2 = 0f;
+                foreach (i; 0..D) {
+                    float xhv = (xs[i] - m) * r;
+                    xh[t_*D + i] = xhv;
+                    float dyg = dy[t_*D + i] * g[i];
+                    sum1 += dyg;
+                    sum2 += dyg * xhv;
+                }
+                sum1 /= D; sum2 /= D;
+                foreach (i; 0..D) {
+                    float dyg = dy[t_*D + i] * g[i];
+                    dx[t_*D + i] += r * (dyg - sum1 - xh[t_*D + i] * sum2);
+                }
             }
-            sum1 /= D; sum2 /= D;
-            foreach (i; 0..D) {
-                float xh = (xs[i] - m) * r;
-                float dyg = dy[t_*D + i] * g[i];
-                dx[t_*D + i] += r * (dyg - sum1 - xh * sum2);
+        });
+        _parChunk(D, (int ilo, int ihi) {
+            foreach (i; ilo .. ihi) {
+                foreach (t_; 0..T) {
+                    gg[i] += dy[t_*D + i] * xh[t_*D + i];
+                    gb[i] += dy[t_*D + i];
+                }
             }
-        }
+        });
     }
 
     void zero() nothrow @nogc { gg[] = 0f; gb[] = 0f; }
@@ -295,29 +389,37 @@ private void adamVec(float[] w, float[] gr, float[] m, float[] v,
     final switch (o) {
         case Opt.adam:
             float bc1 = 1f - B1^^(t+1), bc2 = 1f - B2^^(t+1);
-            foreach (i; 0..w.length) {
-                float gv = gr[i];
-                m[i] = B1*m[i] + (1-B1)*gv;
-                v[i] = B2*v[i] + (1-B2)*gv*gv;
-                w[i] -= lr * (m[i]/bc1) / (sqrt(v[i]/bc2) + EPS);
-            }
+            _parChunkNT(cast(int) w.length, (int ilo, int ihi) nothrow {
+                foreach (i; ilo .. ihi) {
+                    float gv = gr[i];
+                    m[i] = B1*m[i] + (1-B1)*gv;
+                    v[i] = B2*v[i] + (1-B2)*gv*gv;
+                    w[i] -= lr * (m[i]/bc1) / (sqrt(v[i]/bc2) + EPS);
+                }
+            });
             break;
         case Opt.sgd:
-            foreach (i; 0..w.length) w[i] -= lr * gr[i];
+            _parChunkNT(cast(int) w.length, (int ilo, int ihi) nothrow {
+                foreach (i; ilo .. ihi) w[i] -= lr * gr[i];
+            });
             break;
         case Opt.rmsprop:
-            foreach (i; 0..w.length) {
-                float gv = gr[i];
-                v[i] = RHO*v[i] + (1-RHO)*gv*gv;
-                w[i] -= lr * gv / (sqrt(v[i]) + EPS);
-            }
+            _parChunkNT(cast(int) w.length, (int ilo, int ihi) nothrow {
+                foreach (i; ilo .. ihi) {
+                    float gv = gr[i];
+                    v[i] = RHO*v[i] + (1-RHO)*gv*gv;
+                    w[i] -= lr * gv / (sqrt(v[i]) + EPS);
+                }
+            });
             break;
         case Opt.adagrad:
-            foreach (i; 0..w.length) {
-                float gv = gr[i];
-                v[i] += gv*gv;
-                w[i] -= lr * gv / (sqrt(v[i]) + EPS);
-            }
+            _parChunkNT(cast(int) w.length, (int ilo, int ihi) nothrow {
+                foreach (i; ilo .. ihi) {
+                    float gv = gr[i];
+                    v[i] += gv*gv;
+                    w[i] -= lr * gv / (sqrt(v[i]) + EPS);
+                }
+            });
             break;
     }
 }
@@ -345,7 +447,10 @@ private struct EachLayer {
     int items;      // 항목 수
     int inW, outW;  // 항목 하나의 입력폭 / 출력폭
     Linear lin;
-    float[] pre;    // ReLU 전 값 (역전파에 필요)
+    float[] pre;    // ReLU 전 값 (역전파에 필요) — 단일 샘플(serial) 경로용
+
+    int _bcap;
+    float[] preB;   // [_bcap*items*outW] — fwdBatch/bwdBatch 용 (ReLU 전 값)
 
     this(int items_, int inW_, int outW_) {
         items = items_; inW = inW_; outW = outW_;
@@ -354,27 +459,64 @@ private struct EachLayer {
         pre[] = 0f;
     }
 
+    void _allocBatch(int B) {
+        if (B <= _bcap) return;
+        preB = new float[B * items * outW];
+        preB[] = 0f;
+        _bcap = B;
+    }
+
+    // X: [B*items*inW] (샘플마다 items*inW). Y: [B*items*outW].
+    // items 뿐 아니라 B 도 전부 같은 lin 을 공유하는 독립 항목이라 count=B*items 로
+    // batchForward/batchAccum 을 한 번에 돌린다 (EachLayer 안에는 항목간 상호작용이 없다
+    // — 그게 AttnLayer 와 다른 점이라 배치 처리가 더 간단하다).
+    void fwdBatch(const(float)[] X, float[] Y, int B) {
+        _allocBatch(B);
+        int count = B * items;
+        lin.batchForward(X, preB, count);
+        _parChunk(count, (int clo, int chi) {
+            foreach (c; clo .. chi) foreach (i; 0..outW) {
+                float v = preB[c*outW + i];
+                Y[c*outW + i] = v < 0f ? 0f : v;
+            }
+        });
+    }
+
+    // dY -> dX. tmp 는 호출자 스크래치, 최소 [B*items*outW] 필요
+    // (Network._bDZ[i] 가 이미 B*_outSz[i] = B*items*outW 로 잡혀 있어 그대로 쓸 수 있다).
+    void bwdBatch(const(float)[] X, const(float)[] dY, float[] dX, float[] tmp, int B) {
+        int count = B * items;
+        _parChunk(count, (int clo, int chi) {
+            foreach (c; clo .. chi) foreach (i; 0..outW)
+                tmp[c*outW + i] = preB[c*outW + i] > 0f ? dY[c*outW + i] : 0f;
+        });
+        lin.batchAccum(X, tmp[0 .. count*outW], dX, count);
+    }
+
     int inSize()  const nothrow @nogc { return items * inW; }
     int outSize() const nothrow @nogc { return items * outW; }
 
-    // x (items*inW) -> y (items*outW), ReLU 포함
-    void fwd(const(float)[] x, float[] y) nothrow @nogc {
-        foreach (t; 0..items) {
-            lin.forward(x[t*inW .. t*inW + inW], pre[t*outW .. t*outW + outW]);
-            foreach (i; 0..outW) {
+    // x (items*inW) -> y (items*outW), ReLU 포함.
+    // items 개 항목이 전부 같은 lin 을 공유하므로(가중치 재사용), Linear 를 "샘플 B" 대신
+    // "항목 count=items" 로 배치 처리하는 것과 수학적으로 같다 — batchForward 재사용.
+    void fwd(const(float)[] x, float[] y) {
+        lin.batchForward(x, pre, items);
+        _parChunk(items, (int tlo, int thi) {
+            foreach (t; tlo .. thi) foreach (i; 0..outW) {
                 float v = pre[t*outW + i];
                 y[t*outW + i] = v < 0f ? 0f : v;
             }
-        }
+        });
     }
 
-    // dy -> dx (dx 에 누적)
-    void bwd(const(float)[] x, const(float)[] dy, float[] dx, float[] tmp) nothrow @nogc {
-        foreach (t; 0..items) {
-            foreach (i; 0..outW)
-                tmp[i] = pre[t*outW + i] > 0f ? dy[t*outW + i] : 0f;
-            lin.accum(x[t*inW .. t*inW + inW], tmp[0..outW], dx[t*inW .. t*inW + inW]);
-        }
+    // dy -> dx. tmp 는 [items*outW] 이상 (호출자의 스크래치 버퍼가 이미 그만큼 크다 —
+    // Network._dC 는 각 층의 outSize() 전체를 기준으로 잡혀 있다).
+    void bwd(const(float)[] x, const(float)[] dy, float[] dx, float[] tmp) {
+        _parChunk(items, (int tlo, int thi) {
+            foreach (t; tlo .. thi) foreach (i; 0..outW)
+                tmp[t*outW + i] = pre[t*outW + i] > 0f ? dy[t*outW + i] : 0f;
+        });
+        lin.batchAccum(x, tmp[0 .. items*outW], dx, items);
     }
 
     void zeroGrad() nothrow @nogc { lin.zeroGrad(); }
@@ -394,34 +536,73 @@ private struct AttnLayer {
 
     // 순전파 캐시
     float[] x1, q, k, v, att, ao, po;
+    float[] mu, rstd;      // LN 순전파 캐시 (per-sample 전용 — LN 은 이제 내부 상태가 없다)
     // 역전파 임시
     float[] dq, dk, dv, datt, dao, dx1;
+    float[] xh;            // LN 역전파 캐시 (per-sample 전용)
+    // bwd() 1단계(datt+dot 계산)에서 구해 2·3단계(dq, dk/dv)로 넘기는 스칼라 캐시 [heads*items]
+    float[] dotBuf;
+
+    // fwdBatch/bwdBatch 용 배치 스크래치 — B 개 샘플, 어텐션은 같은 샘플의 항목끼리만
+    // 섞이므로(다른 샘플과는 절대 안 섞임) 위 필드들을 그냥 B배 키운 버전이다.
+    // LN 의 mu/rstd/xh 도 여기 포함 — per-sample 쪽(mu/rstd/xh)과 절대 같은 버퍼를
+    // 공유하지 않는다 (예전엔 LN 내부에서 공유·재할당하다가 두 경로 예측 결과가
+    // 미세하게 갈라지는 문제가 있었다).
+    int _bcap;
+    float[] x1B, qB, kB, vB, attB, aoB, poB;
+    float[] muB, rstdB;
+    float[] dqB, dkB, dvB, dattB, daoB, dx1B, dotBufB;
+    float[] xhB;
+
+    void _allocBatch(int B) {
+        if (B <= _bcap) return;
+        x1B = new float[B*dim]; qB = new float[B*dim]; kB = new float[B*dim]; vB = new float[B*dim];
+        attB = new float[B*heads*items*items];
+        aoB = new float[B*dim]; poB = new float[B*dim];
+        muB = new float[B*items]; rstdB = new float[B*items];
+        dqB = new float[B*dim]; dkB = new float[B*dim]; dvB = new float[B*dim];
+        dattB = new float[B*heads*items*items];
+        daoB = new float[B*dim]; dx1B = new float[B*dim];
+        dotBufB = new float[B*heads*items];
+        xhB = new float[B*dim];   // T*D = (B*items)*w = B*(items*w) = B*dim
+        foreach (a; [x1B,qB,kB,vB,attB,aoB,poB,muB,rstdB,dqB,dkB,dvB,dattB,daoB,dx1B,dotBufB,xhB])
+            a[] = 0f;
+        _bcap = B;
+    }
 
     this(int dim_, int items_, int heads_) {
         dim = dim_; items = items_; w = dim_ / items_; heads = heads_; hw = w / heads_;
-        ln = LN(w, items);
+        ln = LN(w);
         wq = Linear(w, w); wk = Linear(w, w); wv = Linear(w, w); wo = Linear(w, w);
 
         x1 = new float[dim]; q = new float[dim]; k = new float[dim]; v = new float[dim];
         att = new float[heads*items*items];
         ao = new float[dim]; po = new float[dim];
+        mu = new float[items]; rstd = new float[items];
         dq = new float[dim]; dk = new float[dim]; dv = new float[dim];
         datt = new float[heads*items*items];
         dao = new float[dim]; dx1 = new float[dim];
-        foreach (a; [x1,q,k,v,att,ao,po,dq,dk,dv,datt,dao,dx1]) a[] = 0f;
+        xh = new float[dim];   // T*D = items*w = dim
+        dotBuf = new float[heads*items];
+        foreach (a; [x1,q,k,v,att,ao,po,mu,rstd,dq,dk,dv,datt,dao,dx1,xh,dotBuf]) a[] = 0f;
     }
 
     // y = x + 어텐션(LayerNorm(x))
-    void fwd(const(float)[] x, float[] y) nothrow @nogc {
-        ln.fwd(x, x1, items);
-        foreach (t; 0..items) {
-            wq.forward(x1[t*w .. t*w+w], q[t*w .. t*w+w]);
-            wk.forward(x1[t*w .. t*w+w], k[t*w .. t*w+w]);
-            wv.forward(x1[t*w .. t*w+w], v[t*w .. t*w+w]);
-        }
+    // 항목(t)별로 q/k/v/ao/po 를 서로 겹치지 않게 쓰므로 t (또는 h*items+t) 기준
+    // 병렬화가 안전하다. forward() 는 가중치를 읽기만 해서 항목끼리 공유해도 된다.
+    void fwd(const(float)[] x, float[] y) {
+        ln.fwd(x, x1, mu, rstd, items);
+        _parChunk(items, (int tlo, int thi) {
+            foreach (t; tlo .. thi) {
+                wq.forward(x1[t*w .. t*w+w], q[t*w .. t*w+w]);
+                wk.forward(x1[t*w .. t*w+w], k[t*w .. t*w+w]);
+                wv.forward(x1[t*w .. t*w+w], v[t*w .. t*w+w]);
+            }
+        });
         float scale = 1f / sqrt(cast(float) hw);
-        foreach (h; 0..heads) {
-            foreach (t; 0..items) {
+        _parChunk(heads * items, (int lo, int hi) {
+            foreach (ht; lo .. hi) {
+                int h = ht / items, t = ht % items;
                 float mx = -1e30f;
                 foreach (s; 0..items) {
                     float dot = 0f;
@@ -445,52 +626,186 @@ private struct AttnLayer {
                     ao[t*w + h*hw + i] = acc;
                 }
             }
-        }
-        foreach (t; 0..items) wo.forward(ao[t*w .. t*w+w], po[t*w .. t*w+w]);
+        });
+        _parChunk(items, (int tlo, int thi) {
+            foreach (t; tlo .. thi) wo.forward(ao[t*w .. t*w+w], po[t*w .. t*w+w]);
+        });
         foreach (i; 0..dim) y[i] = x[i] + po[i];      // 잔차
     }
 
-    // dy -> dx (dx 에 누적)
-    void bwd(const(float)[] x, const(float)[] dy, float[] dx) nothrow @nogc {
-        dao[] = 0f;
-        foreach (t; 0..items)
-            wo.accum(ao[t*w .. t*w+w], dy[t*w .. t*w+w], dao[t*w .. t*w+w]);
+    // dy -> dx (dx 에 누적).
+    // wq/wk/wv/wo 는 items 개 항목이 전부 같은 가중치를 공유하므로 batchAccum(count=items)
+    // 재사용 (fwd 와 같은 이유). q/k/v 로의 역전파(dq/dk/dv)는 datt[h,t,s] 를 dq 는 t 로,
+    // dk/dv 는 s 로 읽으므로 그대로 t 기준 병렬화하면 dk/dv 가 모든 t 에서 겹쳐 써진다
+    // (레이스) — 그래서 3단계로 나눈다: 1단계(t 기준) datt+dot 계산, 2단계(t 기준) dq 누적,
+    // 3단계(s 기준, 루프 순서를 h·t 로 뒤집어서) dk/dv 누적. 각 단계는 원래 직렬 코드와
+    // 같은 합산 순서를 지켜서 결과가 비트 단위로 같다.
+    void bwd(const(float)[] x, const(float)[] dy, float[] dx) {
+        wo.batchAccum(ao, dy, dao, items);
 
-        dq[] = 0f; dk[] = 0f; dv[] = 0f;
         float scale = 1f / sqrt(cast(float) hw);
-        foreach (h; 0..heads) {
-            foreach (t; 0..items) {
-                foreach (s; 0..items) {
-                    float a = att[h*items*items + t*items + s];
-                    float d_ = 0f;
-                    foreach (i; 0..hw) {
-                        d_ += dao[t*w + h*hw + i] * v[s*w + h*hw + i];
-                        dv[s*w + h*hw + i] += a * dao[t*w + h*hw + i];
-                    }
-                    datt[h*items*items + t*items + s] = d_;
-                }
+
+        // 1단계: datt[h,t,s] 계산 + dot[h,t] 스칼라를 dotBuf 에 캐시 (dq/dk/dv 는 아직 안 건드림)
+        _parChunk(heads * items, (int lo, int hi) {
+            foreach (ht; lo .. hi) {
+                int h = ht / items, t = ht % items;
                 float dot = 0f;
-                foreach (s; 0..items)
-                    dot += datt[h*items*items + t*items + s] * att[h*items*items + t*items + s];
+                foreach (s; 0..items) {
+                    float d_ = 0f;
+                    foreach (i; 0..hw) d_ += dao[t*w + h*hw + i] * v[s*w + h*hw + i];
+                    datt[h*items*items + t*items + s] = d_;
+                    dot += d_ * att[h*items*items + t*items + s];
+                }
+                dotBuf[h*items + t] = dot;
+            }
+        });
+
+        // 2단계: dq[t...] 는 오직 t 자기 반복 안에서만 쓰인다 — t(또는 h*items+t) 기준 안전
+        dq[] = 0f;
+        _parChunk(heads * items, (int lo, int hi) {
+            foreach (ht; lo .. hi) {
+                int h = ht / items, t = ht % items;
+                float dot = dotBuf[h*items + t];
                 foreach (s; 0..items) {
                     float a = att[h*items*items + t*items + s];
                     float ds = a * (datt[h*items*items + t*items + s] - dot) * scale;
-                    foreach (i; 0..hw) {
-                        dq[t*w + h*hw + i] += ds * k[s*w + h*hw + i];
-                        dk[s*w + h*hw + i] += ds * q[t*w + h*hw + i];
-                    }
+                    foreach (i; 0..hw) dq[t*w + h*hw + i] += ds * k[s*w + h*hw + i];
                 }
             }
-        }
+        });
+
+        // 3단계: dk[s...]/dv[s...] 는 모든 t 에서 누적되므로 s 기준으로 뒤집어서 병렬화
+        // (안쪽은 원래와 같은 h-먼저-t 순서로 돌아 합산 순서를 그대로 보존한다)
+        dk[] = 0f; dv[] = 0f;
+        _parChunk(items, (int slo, int shi) {
+            foreach (s; slo .. shi) {
+                foreach (h; 0..heads) foreach (t; 0..items) {
+                    float a = att[h*items*items + t*items + s];
+                    foreach (i; 0..hw) dv[s*w + h*hw + i] += a * dao[t*w + h*hw + i];
+                    float dot = dotBuf[h*items + t];
+                    float ds = a * (datt[h*items*items + t*items + s] - dot) * scale;
+                    foreach (i; 0..hw) dk[s*w + h*hw + i] += ds * q[t*w + h*hw + i];
+                }
+            }
+        });
 
         dx1[] = 0f;
-        foreach (t; 0..items) {
-            wq.accum(x1[t*w .. t*w+w], dq[t*w .. t*w+w], dx1[t*w .. t*w+w]);
-            wk.accum(x1[t*w .. t*w+w], dk[t*w .. t*w+w], dx1[t*w .. t*w+w]);
-            wv.accum(x1[t*w .. t*w+w], dv[t*w .. t*w+w], dx1[t*w .. t*w+w]);
-        }
-        ln.bwd(x, dx1, dx, items);
+        wq.batchAccum(x1, dq, dx1, items, true, false);
+        wk.batchAccum(x1, dk, dx1, items, true, false);
+        wv.batchAccum(x1, dv, dx1, items, true, false);
+        ln.bwd(x, dx1, dx, mu, rstd, xh, items);
         foreach (i; 0..dim) dx[i] += dy[i];           // 잔차 통과분
+    }
+
+    // X, Y: [B*dim] — B 개 샘플. LayerNorm 과 wq/wk/wv/wo 투영은 B*items 개
+    // 항목이 전부 독립(가중치만 공유)이라 fwd() 와 완전히 같은 방식으로 count=B*items
+    // 로 한 번에 처리한다. 어텐션(QK^T/softmax/weighted-V) 만은 같은 샘플의 항목끼리만
+    // 섞여야 하므로 (b,h,t) 3중 인덱스로 병렬화하고 s 는 그 샘플 안에서만 돈다.
+    void fwdBatch(const(float)[] X, float[] Y, int B) {
+        _allocBatch(B);
+        int BT = B * items;
+        ln.fwd(X, x1B, muB, rstdB, BT);
+        wq.batchForward(x1B, qB, BT);
+        wk.batchForward(x1B, kB, BT);
+        wv.batchForward(x1B, vB, BT);
+
+        float scale = 1f / sqrt(cast(float) hw);
+        _parChunk(B * heads * items, (int lo, int hi) {
+            foreach (bht; lo .. hi) {
+                int b = bht / (heads*items);
+                int rem = bht % (heads*items);
+                int h = rem / items, t = rem % items;
+                int off = b*dim;              // qB/kB/vB/aoB 안에서 샘플 b 의 시작
+                int aoff = b*heads*items*items;  // attB 안에서 샘플 b 의 시작
+                float mx = -1e30f;
+                foreach (s; 0..items) {
+                    float dot = 0f;
+                    foreach (i; 0..hw) dot += qB[off+t*w+h*hw+i] * kB[off+s*w+h*hw+i];
+                    dot *= scale;
+                    attB[aoff + h*items*items + t*items + s] = dot;
+                    if (dot > mx) mx = dot;
+                }
+                float sum = 0f;
+                foreach (s; 0..items) {
+                    float e = exp(attB[aoff + h*items*items + t*items + s] - mx);
+                    attB[aoff + h*items*items + t*items + s] = e;
+                    sum += e;
+                }
+                float inv = 1f / sum;
+                foreach (s; 0..items) attB[aoff + h*items*items + t*items + s] *= inv;
+                foreach (i; 0..hw) {
+                    float acc = 0f;
+                    foreach (s; 0..items)
+                        acc += attB[aoff + h*items*items + t*items + s] * vB[off+s*w+h*hw+i];
+                    aoB[off + t*w + h*hw + i] = acc;
+                }
+            }
+        });
+        wo.batchForward(aoB, poB, BT);
+        foreach (c; 0 .. B*dim) Y[c] = X[c] + poB[c];      // 잔차
+    }
+
+    // dY -> dX (dX 에 누적). bwd() 의 3단계 재구성을 그대로 샘플 차원 b 를 하나 더 얹어 반복한다.
+    void bwdBatch(const(float)[] X, const(float)[] dY, float[] dX, int B) {
+        int BT = B * items;
+        wo.batchAccum(aoB, dY, daoB, BT);
+
+        float scale = 1f / sqrt(cast(float) hw);
+
+        _parChunk(B * heads * items, (int lo, int hi) {
+            foreach (bht; lo .. hi) {
+                int b = bht / (heads*items);
+                int rem = bht % (heads*items);
+                int h = rem / items, t = rem % items;
+                int off = b*dim; int aoff = b*heads*items*items;
+                float dot = 0f;
+                foreach (s; 0..items) {
+                    float d_ = 0f;
+                    foreach (i; 0..hw) d_ += daoB[off+t*w+h*hw+i] * vB[off+s*w+h*hw+i];
+                    dattB[aoff + h*items*items + t*items + s] = d_;
+                    dot += d_ * attB[aoff + h*items*items + t*items + s];
+                }
+                dotBufB[b*heads*items + h*items + t] = dot;
+            }
+        });
+
+        dqB[0 .. B*dim] = 0f;
+        _parChunk(B * heads * items, (int lo, int hi) {
+            foreach (bht; lo .. hi) {
+                int b = bht / (heads*items);
+                int rem = bht % (heads*items);
+                int h = rem / items, t = rem % items;
+                int off = b*dim; int aoff = b*heads*items*items;
+                float dot = dotBufB[b*heads*items + h*items + t];
+                foreach (s; 0..items) {
+                    float a = attB[aoff + h*items*items + t*items + s];
+                    float ds = a * (dattB[aoff + h*items*items + t*items + s] - dot) * scale;
+                    foreach (i; 0..hw) dqB[off+t*w+h*hw+i] += ds * kB[off+s*w+h*hw+i];
+                }
+            }
+        });
+
+        dkB[0 .. B*dim] = 0f; dvB[0 .. B*dim] = 0f;
+        _parChunk(B * items, (int lo, int hi) {
+            foreach (bs; lo .. hi) {
+                int b = bs / items, s = bs % items;
+                int off = b*dim; int aoff = b*heads*items*items;
+                foreach (h; 0..heads) foreach (t; 0..items) {
+                    float a = attB[aoff + h*items*items + t*items + s];
+                    foreach (i; 0..hw) dvB[off+s*w+h*hw+i] += a * daoB[off+t*w+h*hw+i];
+                    float dot = dotBufB[b*heads*items + h*items + t];
+                    float ds = a * (dattB[aoff + h*items*items + t*items + s] - dot) * scale;
+                    foreach (i; 0..hw) dkB[off+s*w+h*hw+i] += ds * qB[off+t*w+h*hw+i];
+                }
+            }
+        });
+
+        dx1B[0 .. B*dim] = 0f;
+        wq.batchAccum(x1B, dqB, dx1B, BT, true, false);
+        wk.batchAccum(x1B, dkB, dx1B, BT, true, false);
+        wv.batchAccum(x1B, dvB, dx1B, BT, true, false);
+        ln.bwd(X, dx1B, dX, muB, rstdB, xhB, BT);
+        foreach (c; 0 .. B*dim) dX[c] += dY[c];           // 잔차 통과분
     }
 
     void zeroGrad() nothrow @nogc {
@@ -585,7 +900,7 @@ private class Network {
         fwdCached = false;
     }
 
-    void forward(const(float)[] x) nothrow @nogc {
+    void forward(const(float)[] x) {
         int n = layerCount;
         if (n == 0) {
             foreach (k; 0..x.length) _hout[k] = x[k];
@@ -619,7 +934,7 @@ private class Network {
         fwdCached = true;
     }
 
-    void backward() nothrow @nogc {
+    void backward() {
         int houtSz = cast(int)_hout.length;
         _dA[0..houtSz] = 0f;
         foreach (i, ref head; heads) {
@@ -646,17 +961,16 @@ private class Network {
     }
 
     // ── 묶음(batch) 경로 — 가중치 행을 배치 전체에 재사용해 5배 빠르다 ──
-    // 순수 Linear 망일 때만 (attn/each 없음). 결과는 per-sample 과 동일.
-    bool pureLinear() const nothrow @nogc {
-        foreach (k; kinds) if (k != 0) return false;
-        return true;
-    }
+    // Linear/Attn/Each 전부 지원 (kinds[i] 로 분기). 결과는 per-sample 과 동일.
 
     int       _bcap;
     float[][] _bInp, _bPre, _bDZ;    // 층별 [_bcap*inSz], [_bcap*outSz], dZ[_bcap*outSz]
     float[]   _bHout, _bDHout;       // [_bcap*houtSz]
     float[][] _bHd;                  // 헤드별 [_bcap*outSz]  (출력)
     float[][] _bDHead;               // 헤드별 [_bcap*outSz]  (호출자가 채움)
+    // 1번째 층(kind 1 또는 2)의 dIn 을 버릴 때 쓰는 스크래치 — Linear 는 !첫층 으로
+    // dIn 계산 자체를 건너뛸 수 있지만 Attn/Each 는 항상 계산하므로 버릴 곳이 필요하다.
+    float[]   _bScratch0;
 
     void _allocBatch(int B) {
         if (B <= _bcap) return;
@@ -674,6 +988,7 @@ private class Network {
             _bHd[i]    = new float[B*h.outSz];
             _bDHead[i] = new float[B*h.outSz];
         }
+        if (n > 0) _bScratch0 = new float[B * _outSz[0]];
         _bcap = B;
     }
 
@@ -686,36 +1001,38 @@ private class Network {
         } else {
             foreach (b; 0..B) foreach (k; 0..inputSz) _bInp[0][b*inputSz + k] = X[b][k];
             foreach (i; 0..n) {
-                int iS = _inSz[i], oS = _outSz[i];
-                auto L = &lins[slot[i]];
-                auto inp = _bInp[i]; auto pre = _bPre[i];
-                // pre[b][j] = bias[j] + dot(w[j], inp[b])  — j 를 스레드로 나눔 (w[j] 재사용)
-                _parChunk(oS, (int jlo, int jhi) {
-                    foreach (j; jlo .. jhi) {
-                        auto wj = L.w[j]; float bj = L.b[j];
-                        foreach (b; 0..B)
-                            pre[b*oS + j] = bj + _dot(wj, inp[b*iS .. b*iS + iS]);
-                    }
-                });
+                int oS = _outSz[i];
                 bool 마지막 = (i + 1 == n);
+                auto inp = _bInp[i];
+                // 다음 층 "입력" 폭 = 이 층 출력 폭(oS) — _inSz[i+1] 와 항상 같다 (Attn 은
+                // 폭을 유지, Each 는 _outSz 를 items*outW 로 이미 그렇게 잡아둔다). 그래서
+                // 마지막이 아니면 _bInp[i+1] 에, 마지막이면 _bHout 에 stride=oS 로 그대로 써도
+                // Attn/Each 의 fwdBatch(count=B) 출력과 레이아웃이 정확히 맞는다.
                 auto 다음 = 마지막 ? _bHout : _bInp[i+1];
-                int nextW = 마지막 ? houtSz : _outSz[i+1];
-                _parChunk(B, (int blo, int bhi) {           // ReLU — b 를 스레드로 나눔
-                    foreach (b; blo .. bhi) foreach (k; 0..oS) {
-                        float v = pre[b*oS + k];
-                        다음[b*nextW + k] = v < 0f ? 0f : v;
-                    }
-                });
+                final switch (kinds[i]) {
+                    case 0:
+                        auto L = &lins[slot[i]];
+                        auto pre = _bPre[i];
+                        L.batchForward(inp, pre, B);
+                        int nextW = 마지막 ? houtSz : oS;
+                        _parChunk(B, (int blo, int bhi) {           // ReLU — b 를 스레드로 나눔
+                            foreach (b; blo .. bhi) foreach (k; 0..oS) {
+                                float v = pre[b*oS + k];
+                                다음[b*nextW + k] = v < 0f ? 0f : v;
+                            }
+                        });
+                        break;
+                    case 1:
+                        attns[slot[i]].fwdBatch(inp, 다음, B);
+                        break;
+                    case 2:
+                        eachs[slot[i]].fwdBatch(inp, 다음, B);
+                        break;
+                }
             }
         }
-        foreach (hi, ref head; heads) {
-            int hoS = head.outSz;
-            foreach (j; 0..hoS) {
-                auto wj = head.w[j]; float bj = head.b[j];
-                foreach (b; 0..B)
-                    _bHd[hi][b*hoS + j] = bj + _dot(wj, _bHout[b*houtSz .. b*houtSz + houtSz]);
-            }
-        }
+        foreach (hi, ref head; heads)
+            head.batchForward(_bHout[0..B*houtSz], _bHd[hi], B);
     }
 
     // _bDHead (헤드별 [B*outSz], 호출자가 채움) -> 가중치 기울기 누적. step 은 밖에서.
@@ -723,68 +1040,47 @@ private class Network {
         int n = layerCount;
         int houtSz = n > 0 ? _outSz[n-1] : inputSz;
         _bDHout[0 .. B*houtSz] = 0f;
-        // 헤드: dHout 누적은 b 로 나눈다 (dHout[b] 서로 겹침 없음), gradW 는 직렬(작다)
-        foreach (hi, ref head; heads) {
-            int hoS = head.outSz;
-            foreach (j; 0..hoS) {
-                auto wj = head.w[j]; float gb = 0f;
-                foreach (b; 0..B) {
-                    float d = _bDHead[hi][b*hoS + j];
-                    _saxpy(head.gradW[j], _bHout[b*houtSz .. b*houtSz+houtSz], d);
-                    gb += d;
-                }
-                head.gradB[j] += gb;
-            }
-        }
-        foreach (hi, ref head; heads) {
-            int hoS = head.outSz;
-            _parChunk(B, (int blo, int bhi) {
-                foreach (b; blo .. bhi) foreach (j; 0..hoS) {
-                    float d = _bDHead[hi][b*hoS + j];
-                    _saxpy(_bDHout[b*houtSz .. b*houtSz+houtSz], head.w[j], d);
-                }
-            });
-        }
+        // 여러 헤드가 같은 _bDHout 를 공유해서 더해 넣는다 (zeroDIn=false — 위에서 이미 0으로 채움)
+        foreach (hi, ref head; heads)
+            head.batchAccum(_bHout[0..B*houtSz], _bDHead[hi][0..B*head.outSz],
+                             _bDHout[0..B*houtSz], B, true, false);
         if (n == 0) return;
         for (int i = n-1; i >= 0; i--) {
-            int iS = _inSz[i], oS = _outSz[i];
-            auto L = &lins[slot[i]];
+            int oS = _outSz[i];
             bool 첫층 = (i == 0);
             bool 마지막 = (i + 1 == n);
-            auto pre = _bPre[i]; auto dZ = _bDZ[i]; auto inp = _bInp[i];
-            // dZ[b][k] = 들어온 기울기 * (pre>0)  — b 로 나눔
-            _parChunk(B, (int blo, int bhi) {
-                foreach (b; blo .. bhi) foreach (k; 0..oS) {
-                    float g = 마지막 ? _bDHout[b*houtSz + k] : dZ[b*oS + k];
-                    dZ[b*oS + k] = (pre[b*oS + k] > 0f) ? g : 0f;
-                }
-            });
-            // ① gradW: j 를 스레드로 나눔 — gradW[j] 를 L1 에 두고 재사용
-            _parChunk(oS, (int jlo, int jhi) {
-                foreach (j; jlo .. jhi) {
-                    auto gj = L.gradW[j]; float gb = 0f;
-                    foreach (b; 0..B) {
-                        float d = dZ[b*oS + j];
-                        if (d == 0f) continue;
-                        _saxpy(gj, inp[b*iS .. b*iS+iS], d);
-                        gb += d;
-                    }
-                    L.gradB[j] += gb;
-                }
-            });
-            // ② dInput: b 를 스레드로 나눔 — dInp[b] 를 L1 에 두고 W 스트리밍
-            if (!첫층) {
-                auto dInp = _bDZ[i-1];
-                _parChunk(B, (int blo, int bhi) {
-                    foreach (b; blo .. bhi) {
-                        auto o = dInp[b*iS .. b*iS+iS];
-                        o[] = 0f;
-                        foreach (j; 0..oS) {
-                            float d = dZ[b*oS + j];
-                            if (d != 0f) _saxpy(o, L.w[j], d);
+            auto inp = _bInp[i];
+            // 이 층 "출력" 으로 들어오는 기울기 — 마지막이면 헤드에서 온 _bDHout, 아니면
+            // 다음 층이 앞서(i+1 을 먼저 처리했으므로) _bDZ[i] 에 이미 써둔 dIn.
+            auto dOut = 마지막 ? _bDHout[0..B*houtSz] : _bDZ[i][0..B*oS];
+            // Linear 는 !첫층 으로 dIn 계산 자체를 건너뛸 수 있지만 Attn/Each 는 항상
+            // 계산하므로, 첫층이면 버릴 스크래치(_bScratch0)를 준다.
+            auto dIn = 첫층 ? _bScratch0[0..B*oS] : _bDZ[i-1];
+            final switch (kinds[i]) {
+                case 0:
+                    auto L = &lins[slot[i]];
+                    auto pre = _bPre[i]; auto dZ = _bDZ[i];
+                    // dZ[b][k] = 들어온 기울기 * (pre>0)  — b 로 나눔
+                    _parChunk(B, (int blo, int bhi) {
+                        foreach (b; blo .. bhi) foreach (k; 0..oS) {
+                            dZ[b*oS + k] = (pre[b*oS + k] > 0f) ? dOut[b*oS + k] : 0f;
                         }
-                    }
-                });
+                    });
+                    L.batchAccum(inp, dZ, 첫층 ? null : _bDZ[i-1], B, !첫층);
+                    break;
+                case 1:
+                    // AttnLayer.bwdBatch 는 (per-sample bwd() 와 마찬가지로) dX 에 누적만
+                    // 하고 스스로 비우지 않는다 — Linear/Each 의 batchAccum 은 내부에서
+                    // zeroDIn=true 로 스스로 비우는 것과 다르다. 호출자가 먼저 비워야 한다.
+                    dIn[] = 0f;
+                    attns[slot[i]].bwdBatch(inp, dOut, dIn, B);
+                    break;
+                case 2:
+                    // tmp 스크래치로 _bDZ[i] 를 재사용한다 — 마지막이 아니면 dOut 과 같은
+                    // 버퍼지만, EachLayer.bwdBatch 는 tmp[c]=f(dY[c]) 형태(같은 인덱스만
+                    // 읽고 쓰는 원소별 변환)라 그 자리에서 덮어써도 안전하다.
+                    eachs[slot[i]].bwdBatch(inp, dOut, dIn, _bDZ[i], B);
+                    break;
             }
         }
     }
@@ -1088,6 +1384,176 @@ class BlackBoxAI {
         net.step(opt, lr);
     }
 
+    // GPU 로 넘길 만한 크기인지 판단. 이 라이브러리는 배치=1 온라인 학습이 핵심
+    // 사용처라(README 벤치마크 참고 — [1,128,3] 이 PyTorch 보다 9µs vs 707µs 로
+    // 압도적으로 빠른 이유가 정확히 "배치/디스패치 오버헤드 없음"), GPU 디스패치
+    // 오버헤드(보통 수십~수백 µs)가 오히려 손해가 되는 경우가 훨씬 많다. 그래서
+    // 총 FLOPs 와 배치 크기 둘 다 문턱값을 넘을 때만 시도한다.
+    private bool _gpuWorthTrying(int n, int B) const {
+        if (_gpuMode == "0") return false;
+        if (_gpuMode == "1") return true;
+        if (B < _gpuMinB) return false;
+        long flops = 0;
+        foreach (i; 0..n) flops += 2L * net._inSz[i] * net._outSz[i];
+        flops *= B;
+        return flops >= _gpuMinFlops;
+    }
+
+    // GPU 배치 학습 경로 — v1 범위: 순수 Linear 망 + 헤드 1개 + cos(실수) 출력만
+    // (attn/each, 다중 헤드, pick 헤드는 아직 없음 — CPU 배치 경로로 자연히 폴백됨).
+    // 매 호출마다 가중치를 업로드/다운로드한다 (가중치 상주 캐싱은 다음 단계 최적화
+    // 대상으로 남겨둠 — sl() 호출마다 step() 이 돌아 매번 갱신되므로 상주시키려면
+    // CPU 쪽 호출과의 동기화 규칙이 더 필요하다). 실패하면 false — 호출자가 CPU
+    // 배치 경로로 그대로 이어간다.
+    private bool _gpuSlMany(float[][] inputs, float[][] ansVal, bool[][] use, int B) {
+        if (nHeads != 1 || !cosModes[0]) return false;
+        foreach (k; net.kinds) if (k != 0) return false;
+
+        int n = net.layerCount;
+        // MYML_GPU=0 이면 여기서 완전히 끝나야 한다 — gpucl.available() 이 OpenCL.dll
+        // 을 프로브하므로, 문턱값 체크보다 먼저 와야 "완전 비활성" 이 진짜로 지켜진다.
+        if (!_gpuWorthTrying(n, B)) return false;
+        if (!gpucl.available()) return false;
+
+        int inputSz = net.inputSz;
+        auto xFlat = new float[B*inputSz];
+        foreach (b; 0..B) foreach (k; 0..inputSz) xFlat[b*inputSz+k] = inputs[b][k];
+
+        auto xBuf = gpucl.allocBuf(B*inputSz);
+        scope(exit) gpucl.freeBuf(xBuf);
+        if (!xBuf.valid || !gpucl.upload(xBuf, xFlat)) return false;
+
+        static struct GLayer {
+            gpucl.GpuBuf w, b, gradW, gradB, mW, vW, mB, vB, pre, act, dZ, dIn;
+            int inSz, outSz;
+            Linear* host;
+        }
+        auto layers = new GLayer[n + 1];  // 마지막 슬롯 = 헤드
+        scope(exit) foreach (ref gl; layers) {
+            foreach (ref buf; [&gl.w,&gl.b,&gl.gradW,&gl.gradB,&gl.mW,&gl.vW,&gl.mB,&gl.vB,
+                               &gl.pre,&gl.act,&gl.dZ,&gl.dIn])
+                gpucl.freeBuf(*buf);
+        }
+
+        gpucl.GpuBuf curIn = xBuf; int curInSz = inputSz;
+        bool ok = true;
+
+        void uploadLinear(ref GLayer gl, Linear* L) {
+            gl.host = L;
+            auto wFlat = new float[gl.outSz*gl.inSz];
+            auto mWFlat = new float[gl.outSz*gl.inSz];
+            auto vWFlat = new float[gl.outSz*gl.inSz];
+            foreach (j; 0..gl.outSz) foreach (k; 0..gl.inSz) {
+                wFlat[j*gl.inSz+k] = L.w[j][k];
+                mWFlat[j*gl.inSz+k] = L.mW[j][k];
+                vWFlat[j*gl.inSz+k] = L.vW[j][k];
+            }
+            if (!gpucl.upload(gl.w, wFlat) || !gpucl.upload(gl.b, L.b) ||
+                !gpucl.upload(gl.mW, mWFlat) || !gpucl.upload(gl.vW, vWFlat) ||
+                !gpucl.upload(gl.mB, L.mB) || !gpucl.upload(gl.vB, L.vB))
+                ok = false;
+        }
+
+        // ── 은닉층 순전파 ──
+        foreach (i; 0..n) {
+            auto L = &net.lins[net.slot[i]];
+            auto gl = &layers[i];
+            gl.inSz = curInSz; gl.outSz = net._outSz[i];
+            size_t wsz = cast(size_t) gl.outSz * gl.inSz;
+            gl.w = gpucl.allocBuf(wsz); gl.b = gpucl.allocBuf(gl.outSz);
+            gl.gradW = gpucl.allocBuf(wsz); gl.gradB = gpucl.allocBuf(gl.outSz);
+            gl.mW = gpucl.allocBuf(wsz); gl.vW = gpucl.allocBuf(wsz);
+            gl.mB = gpucl.allocBuf(gl.outSz); gl.vB = gpucl.allocBuf(gl.outSz);
+            gl.pre = gpucl.allocBuf(cast(size_t) B*gl.outSz);
+            gl.act = gpucl.allocBuf(cast(size_t) B*gl.outSz);
+            gl.dZ  = gpucl.allocBuf(cast(size_t) B*gl.outSz);
+            gl.dIn = gpucl.allocBuf(cast(size_t) B*gl.inSz);
+            if (!gl.w.valid||!gl.b.valid||!gl.gradW.valid||!gl.gradB.valid||!gl.mW.valid||
+                !gl.vW.valid||!gl.mB.valid||!gl.vB.valid||!gl.pre.valid||!gl.act.valid||
+                !gl.dZ.valid||!gl.dIn.valid) return false;
+            // gradW/gradB 는 커널이 "+=" 로 누적하므로 미리 0으로 채워야 한다
+            // (clCreateBuffer 의 초기 내용은 정의돼 있지 않다).
+            if (!gpucl.zeroBuf(gl.gradW, wsz) || !gpucl.zeroBuf(gl.gradB, gl.outSz)) return false;
+            uploadLinear(*gl, L);
+            if (!ok) return false;
+            if (!gpucl.linearForward(gl.w, gl.b, curIn, gl.pre, gl.inSz, gl.outSz, B)) return false;
+            if (!gpucl.relu(gl.pre, gl.act, B*gl.outSz)) return false;
+            curIn = gl.act; curInSz = gl.outSz;
+        }
+
+        // ── 헤드 순전파 (ReLU 없음) ──
+        auto head = &net.heads[0];
+        auto hl = &layers[n];
+        hl.inSz = curInSz; hl.outSz = head.outSz;   // == 1 (cos)
+        size_t hwsz = cast(size_t) hl.outSz * hl.inSz;
+        hl.w = gpucl.allocBuf(hwsz); hl.b = gpucl.allocBuf(hl.outSz);
+        hl.gradW = gpucl.allocBuf(hwsz); hl.gradB = gpucl.allocBuf(hl.outSz);
+        hl.mW = gpucl.allocBuf(hwsz); hl.vW = gpucl.allocBuf(hwsz);
+        hl.mB = gpucl.allocBuf(hl.outSz); hl.vB = gpucl.allocBuf(hl.outSz);
+        hl.pre = gpucl.allocBuf(cast(size_t) B*hl.outSz);
+        hl.dZ  = gpucl.allocBuf(cast(size_t) B*hl.outSz);
+        hl.dIn = gpucl.allocBuf(cast(size_t) B*hl.inSz);
+        if (!hl.w.valid||!hl.b.valid||!hl.gradW.valid||!hl.gradB.valid||!hl.mW.valid||
+            !hl.vW.valid||!hl.mB.valid||!hl.vB.valid||!hl.pre.valid||!hl.dZ.valid||!hl.dIn.valid)
+            return false;
+        if (!gpucl.zeroBuf(hl.gradW, hwsz) || !gpucl.zeroBuf(hl.gradB, hl.outSz)) return false;
+        uploadLinear(*hl, head);
+        if (!ok) return false;
+        if (!gpucl.linearForward(hl.w, hl.b, curIn, hl.pre, hl.inSz, hl.outSz, B)) return false;
+
+        // ── 손실 기울기 (cos: (예측-정답)/B) — 호스트에서 계산 (B개 스칼라라 저렴) ──
+        auto headOut = new float[B*hl.outSz];
+        if (!gpucl.download(hl.pre, headOut)) return false;
+        immutable float inv = 1.0f / cast(float) B;
+        auto dHead = new float[B*hl.outSz];
+        foreach (b; 0..B)
+            dHead[b] = use[b][0] ? (headOut[b] - ansVal[b][0]) * inv : 0f;
+        if (!gpucl.upload(hl.dZ, dHead)) return false;
+
+        // ── 헤드 역전파 ──
+        if (!gpucl.linearBackwardGradW(curIn, hl.dZ, hl.gradW, hl.gradB, hl.inSz, hl.outSz, B))
+            return false;
+        if (!gpucl.linearBackwardDInput(hl.w, hl.dZ, hl.dIn, hl.inSz, hl.outSz, B))
+            return false;
+        auto dOut = hl.dIn; int dOutSz = hl.inSz;
+
+        // ── 은닉층 역전파 (역순) ──
+        for (int i = n-1; i >= 0; i--) {
+            auto gl = &layers[i];
+            if (!gpucl.reluBackward(gl.pre, dOut, gl.dZ, B*gl.outSz)) return false;
+            auto inp = (i == 0) ? xBuf : layers[i-1].act;
+            if (!gpucl.linearBackwardGradW(inp, gl.dZ, gl.gradW, gl.gradB, gl.inSz, gl.outSz, B))
+                return false;
+            if (!gpucl.linearBackwardDInput(gl.w, gl.dZ, gl.dIn, gl.inSz, gl.outSz, B))
+                return false;
+            dOut = gl.dIn; dOutSz = gl.inSz;
+        }
+
+        // ── Adam step (GPU 위에서) + 갱신된 가중치/옵티마이저 상태 다운로드 ──
+        float bc1 = 1f, bc2 = 1f;
+        foreach (ref gl; layers) {
+            auto L = gl.host;
+            L.t++;
+            if (opt == Opt.adam) { bc1 = 1f - 0.9f^^L.t; bc2 = 1f - 0.999f^^L.t; }
+            size_t wn = cast(size_t) gl.outSz * gl.inSz;
+            if (!gpucl.adamStep(gl.w, gl.gradW, gl.mW, gl.vW, lr, bc1, bc2, cast(int) opt, cast(int) wn))
+                return false;
+            if (!gpucl.adamStep(gl.b, gl.gradB, gl.mB, gl.vB, lr, bc1, bc2, cast(int) opt, gl.outSz))
+                return false;
+
+            auto wFlat = new float[wn];
+            if (!gpucl.download(gl.w, wFlat) || !gpucl.download(gl.b, L.b)) return false;
+            foreach (j; 0..gl.outSz) foreach (k; 0..gl.inSz) L.w[j][k] = wFlat[j*gl.inSz+k];
+            auto mWFlat = new float[wn]; auto vWFlat = new float[wn];
+            if (!gpucl.download(gl.mW, mWFlat) || !gpucl.download(gl.vW, vWFlat) ||
+                !gpucl.download(gl.mB, L.mB) || !gpucl.download(gl.vB, L.vB)) return false;
+            foreach (j; 0..gl.outSz) foreach (k; 0..gl.inSz) {
+                L.mW[j][k] = mWFlat[j*gl.inSz+k]; L.vW[j][k] = vWFlat[j*gl.inSz+k];
+            }
+        }
+        return true;
+    }
+
     // 여러 문제를 한 번에. 기울기를 모았다가 갱신은 한 번만 한다.
     // (문제마다 갱신하면 가중치 전체를 훑는 비용이 순전파보다 커진다)
     // 묶음 크기는 부르는 쪽이 정한다.
@@ -1097,10 +1563,11 @@ class BlackBoxAI {
         net.zeroGrad();
         immutable float inv = 1.0f / cast(float) inputs.length;
 
-        // ── 묶음 경로: 순수 Linear 망이면 가중치 행을 배치 전체에 재사용 (≈5배) ──
+        // ── 묶음 경로: 가중치 행을 배치 전체에 재사용 — Linear/Attn/Each 전부 지원 ──
         // MYML_NOBATCH 환경변수로 끌 수 있다 (per-sample 와 동치 검증용).
-        if (net.pureLinear() && !_noBatch) {
+        if (!_noBatch) {
             int B = cast(int) inputs.length;
+            if (_gpuSlMany(inputs, ansVal, use, B)) return;
             net._allocBatch(B);
             net.forwardBatch(inputs, B);
             foreach (h; 0..nHeads) {

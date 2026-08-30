@@ -8,18 +8,34 @@ D언어로 구현한 RL/SL 라이브러리. `my_ml.d` → `my_ml.pyd` (.pyd = Py
 ```powershell
 $ldc   = "ldc2\ldc2-1.42.0-windows-x64\bin\ldc2.exe"
 $pylib = "$env:LOCALAPPDATA\Programs\Python\Python313\libs\python313.lib"
-& $ldc my_ml.d $pylib --O3 --release --shared --link-defaultlib-shared=false "-of=my_ml.pyd"
-Remove-Item my_ml.obj, my_ml.lib, my_ml.exp -ErrorAction SilentlyContinue
+& $ldc rnjswldbf_2014\ml.d rnjswldbf_2014\gpu_cl.d $pylib --O3 --release --shared --link-defaultlib-shared=false "-of=rnjswldbf_2014\ml.pyd"
+Remove-Item rnjswldbf_2014\ml.obj, rnjswldbf_2014\ml.lib, rnjswldbf_2014\ml.exp, rnjswldbf_2014\gpu_cl.obj -ErrorAction SilentlyContinue
 ```
 
-`"-of=my_ml.pyd"` 의 따옴표 필수. 빼면 PowerShell 이 인자를 쪼개서
+(`tests\build.ps1 -OutDir <dir>` 가 이 커맨드를 감싸놓은 스크립트 — 테스트 빌드는 그걸 쓰면 됨.)
+
+`"-of=..."` 의 따옴표 필수. 빼면 PowerShell 이 인자를 쪼개서
 `Error: unrecognized file extension pyd` 로 빌드가 실패한다.
 
 ## 파일
 
-- `my_ml.d` — D 소스 (신경망 + Python C API + Python 클래스 코드 인라인)
-- `my_ml.pyd` — 빌드 결과물 (gitignore)
+- `rnjswldbf_2014/ml.d` — D 소스 (신경망 + Python C API + Python 클래스 코드 인라인)
+- `rnjswldbf_2014/gpu_cl.d` — OpenCL GPU 백엔드 (런타임에 OpenCL.dll 동적 로드, 없으면 자동으로 CPU 로 폴백)
+- `rnjswldbf_2014/ml.pyd` — 빌드 결과물 (gitignore)
 - `main.py` — 빈 파일. 사용자가 여기에 작성한다.
+- `tests/` — 결정성 회귀 하네스 (`python tests/regression.py`)
+
+## 환경변수
+
+- `MYML_THREADS` — CPU 스레드 수 (기본: 전체 코어)
+- `MYML_NOBATCH=1` — 배치 경로 끄고 per-sample 직렬 경로로 (동치 검증용)
+- `MYML_GPU` — `0`=완전 비활성, `1`=강제, 미설정="auto"(문턱값 넘는 큰 배치만)
+- `MYML_GPU_MIN_FLOPS`, `MYML_GPU_MIN_B` — auto 모드 문턱값 (기본 5e7, 64)
+
+GPU 경로는 현재 순수 Linear 망 + 헤드 1개 + `cos` 출력만 지원한다 (attn/each,
+다중 헤드, pick 헤드는 CPU 배치 경로로 자동 폴백). NVIDIA/AMD 둘 다 OpenCL 하나로
+커버— CUDA 전용 경로는 없음 (배치=1 온라인 학습이 핵심 사용처라 GPU 는 큰 sl()
+묶음에만 조건부로 개입한다).
 
 ## API
 
