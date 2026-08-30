@@ -2,7 +2,7 @@ import setuptools
 
 setuptools.setup(
     name="rnjswldbf_2014",
-    version="0.1.0",
+    version="0.1.1",
     description="A reinforcement learning library in D",
     author="Jeeyul Kwon",
     license="GPL-2.0",

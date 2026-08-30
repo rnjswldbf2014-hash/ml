@@ -1,0 +1,17 @@
+Metadata-Version: 2.4
+Name: rnjswldbf_2014
+Version: 0.1.1
+Summary: A reinforcement learning library in D
+Author: Jeeyul Kwon
+License: GPL-2.0
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: GNU General Public License v2 (GPLv2)
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.8
+License-File: LICENSE
+Dynamic: author
+Dynamic: classifier
+Dynamic: license
+Dynamic: license-file
+Dynamic: requires-python
+Dynamic: summary
