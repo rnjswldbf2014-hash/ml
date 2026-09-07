@@ -24,7 +24,7 @@ D 언어로 구현한 RL/SL 라이브러리(`ml`) 프로젝트입니다.
 출력이 하나든 여럿이든 **모양이 같습니다.** 출력 개수를 바꿔도 코드가 안 깨집니다.
 
 ```python
-from ml import ml
+import ml
 
 ai = ml.make("M", [12, 128], [["왼쪽", "오른쪽"]])       # 하나여도 감쌈
 
@@ -51,9 +51,7 @@ ai.sl(입력, ["왼쪽", 2.5])
 ## 모델 만들기
 
 ```python
-from my_ml import make
-
-from my_ml import make, cos
+from ml import make, cos
 
 ai = make("MyModel", [12, 128, 128], [["왼쪽", "오른쪽", "정지"]])
 ```
@@ -183,7 +181,7 @@ ai.rl(상태, legal=[["왼쪽", "정지"], None])
 은닉층 자리에 `attn(항목수)` 를 넣으면, 그 층에서 **항목끼리 서로 참조**합니다.
 
 ```python
-from my_ml import make, attn, each
+from ml import make, attn, each
 
 ai = make("M", [12, attn(6), each(24), attn(6), each(24), 128], [["A", "B"]])
 ```
@@ -337,7 +335,7 @@ ai.predict([0.1, 0.2, 0.3])
 요약에는 나뭇잎이 안 들어가니, 그걸 버리는 게 이득이 됩니다.
 
 ```python
-from my_ml import make, vec, jepa
+from ml import make, vec, jepa
 
 요약기 = make("enc",  [입력수, 128], [vec(32)])          # 관측 -> 요약 32개
 예측기 = make("pred", [32 + 행동수, 128], [vec(32)])     # 요약 + 행동 -> 다음 요약
@@ -432,7 +430,7 @@ vec 자리는 정답과 점수에서 `None` 으로 비웁니다 (숫자 하나�
 ## 그 밖에
 
 ```python
-from my_ml import gc_disable, gc_collect
+from ml import gc_disable, gc_collect
 
 gc_disable()    # 학습 루프 전. D GC 를 멈춰 중간 끊김을 없앱니다.
 ...
@@ -451,7 +449,7 @@ v0.1 과 v0.2 는 API 가 호환되지 않습니다. 예전 코드는 그대로 
 ### 가중치 파일 변환
 
 ```python
-from my_ml import change
+from ml import change
 
 change("MyModel")     # MyModel_ml_memory.pth 를 새 포맷으로
 ```
@@ -481,12 +479,17 @@ change("MyModel")     # MyModel_ml_memory.pth 를 새 포맷으로
 ```powershell
 $ldc   = "ldc2\ldc2-1.42.0-windows-x64\bin\ldc2.exe"
 $pylib = "$env:LOCALAPPDATA\Programs\Python\Python313\libs\python313.lib"
-& $ldc my_ml.d $pylib --O3 --release --shared --link-defaultlib-shared=false "-of=my_ml.pyd"
-Remove-Item my_ml.obj, my_ml.lib, my_ml.exp -ErrorAction SilentlyContinue
+& $ldc rnjswldbf_2014\ml.d rnjswldbf_2014\gpu_cl.d $pylib --O3 --release --shared --link-defaultlib-shared=false "-of=rnjswldbf_2014\ml.pyd"
+Remove-Item rnjswldbf_2014\ml.obj, rnjswldbf_2014\ml.lib, rnjswldbf_2014\ml.exp, rnjswldbf_2014\gpu_cl.obj -ErrorAction SilentlyContinue
 ```
 
-`"-of=my_ml.pyd"` 의 따옴표는 필수입니다. 빼면 PowerShell 이 인자를 쪼개
+`"-of=...pyd"` 의 따옴표는 필수입니다. 빼면 PowerShell 이 인자를 쪼개
 `Error: unrecognized file extension pyd` 로 실패합니다.
+
+`gpu_cl.d` 는 OpenCL GPU 백엔드입니다. 실행할 때 `OpenCL.dll` 을 찾아보고
+없으면 알아서 CPU 로 갑니다. 빌드에 OpenCL SDK 는 필요 없습니다.
+
+만들어진 `ml.pyd` 가 있는 폴더에서 `import ml` 로 씁니다.
 
 ---
 

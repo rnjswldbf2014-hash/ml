@@ -1,6 +1,8 @@
 # dplayg
 
-D언어로 구현한 RL/SL 라이브러리. `my_ml.d` → `my_ml.pyd` (.pyd = Python extension, `import my_ml`로 사용).
+D언어로 구현한 RL/SL 라이브러리. `ml.d` → `ml.pyd` (.pyd = Python extension, `import ml`로 사용).
+(모듈 진입점이 `PyInit_ml` 이라 파일명·import 이름 모두 `ml` 이다. `import my_ml` 은 안 된다 —
+`__name__` 만 "my_ml" 로 나오는데 PyModuleDef 의 m_name 이 그렇게 남아있어서다.)
 가중치는 `이름_ml_memory.pth` 로 저장한다 (자체 포맷, 현재 ver 6).
 
 ## 빌드
@@ -41,7 +43,7 @@ GPU 경로는 현재 순수 Linear 망 + 헤드 1개 + `cos` 출력만 지원한
 ## API
 
 ```python
-from my_ml import make, cos, attn, each
+from ml import make, cos, attn, each
 
 # layers 는 [입력수, 은닉...] 만. 출력 개수는 outputs 에서 정해진다.
 # outputs 는 항상 리스트. 하나여도 감싼다. 반환·보상·정답·legal 도 전부 리스트.
@@ -74,7 +76,7 @@ ai.sl([입력1, 입력2, ...], [정답1, 정답2, ...])
 요약 단계에서 버려지므로 거기에 힘을 안 뺀다 (LeCun 이 제안한 JEPA).
 
 ```python
-from my_ml import make, vec, jepa
+from ml import make, vec, jepa
 
 enc  = make("enc",  [입력수, 128], [vec(32)])        # 요약기
 pred = make("pred", [32 + 행동수, 128], [vec(32)])   # 예측기
