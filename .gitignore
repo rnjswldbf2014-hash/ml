@@ -32,3 +32,6 @@ ans/
 
 # 테스트 하네스 스크래치 (빌드된 .pyd, 임시 가중치 스냅샷)
 tests/_scratch/
+
+# Claude Code 작업 파일 (프로젝트 내용 아님)
+.claude/

@@ -819,6 +819,92 @@ private struct AttnLayer {
     }
 }
 
+// ─────────────────────────────────────────────
+// VICReg — "다 같은 값으로 뭉개지는 것"(collapse) 막기
+// ─────────────────────────────────────────────
+// jepa 처럼 "요약끼리 비교" 하는 학습은 요약기가 잔머리를 굴릴 수 있다: 입력이 뭐든
+// 늘 같은 값을 뱉으면 예측이 항상 맞아서 손실이 0 이 된다. 아무것도 안 배우고 만점.
+// 그래서 요약값들이 (1) 차원마다 실제로 값이 변하고 (2) 차원끼리 같은 정보를 중복해서
+// 담지 않도록 벌점을 준다.
+//
+// 이 계산은 이 라이브러리의 다른 모든 계산과 성격이 다르다 — 한 샘플만 보고는 못 구하고
+// 배치 전체를 한꺼번에 봐야 한다 ("이 묶음 안에서 서로 다른가" 가 질문이라서).
+// 그래서 배치가 1이면 아예 건너뛴다.
+private struct VicReg {
+    float varW  = 25.0f;   // 분산 항 가중치
+    float covW  = 1.0f;    // 공분산 항 가중치
+    float gamma = 1.0f;    // 목표 표준편차 (이보다 크면 벌점 없음)
+
+    private float[] z;     // [B*D] 중심화한 값
+    private float[] mu, sd;// [D]
+    private float[] C;     // [D*D] 공분산
+
+    private void _alloc(int B, int D) {
+        if (z.length  < cast(size_t)(B*D)) { z  = new float[B*D]; z[]  = 0f; }
+        if (mu.length < cast(size_t)D)     { mu = new float[D];   mu[] = 0f;
+                                             sd = new float[D];   sd[] = 0f; }
+        if (C.length  < cast(size_t)(D*D)) { C  = new float[D*D]; C[]  = 0f; }
+    }
+
+    // S: [B*D] 요약값,  dS: [B*D] 여기에 기울기를 더한다. 손실값을 돌려준다.
+    float grad(const(float)[] S, float[] dS, int B, int D) {
+        if (B < 2 || D < 1) return 0f;   // 배치가 1이면 "서로 다른가" 를 잴 수 없다
+        _alloc(B, D);
+        immutable float invB = 1f / cast(float)B;
+        immutable float n1   = cast(float)(B - 1);
+
+        // 1) 차원마다 평균 -> 중심화 -> 표준편차
+        _parChunk(D, (int jlo, int jhi) {
+            foreach (j; jlo .. jhi) {
+                float s = 0f;
+                foreach (b; 0..B) s += S[b*D + j];
+                float m = s * invB;
+                mu[j] = m;
+                float ss = 0f;
+                foreach (b; 0..B) { float d = S[b*D + j] - m; z[b*D + j] = d; ss += d*d; }
+                sd[j] = sqrt(ss / n1 + 1e-4f);
+            }
+        });
+
+        // 2) 공분산 C = Zᵀ Z / (B-1)
+        _parChunk(D, (int jlo, int jhi) {
+            foreach (j; jlo .. jhi) foreach (k; 0..D) {
+                float s = 0f;
+                foreach (b; 0..B) s += z[b*D + j] * z[b*D + k];
+                C[j*D + k] = s / n1;
+            }
+        });
+
+        // 3) 손실 — 분산은 목표에 못 미친 만큼, 공분산은 대각선 밖(= 차원끼리 닮은 정도)
+        float lv = 0f, lc = 0f;
+        foreach (j; 0..D) {
+            if (sd[j] < gamma) lv += gamma - sd[j];
+            foreach (k; 0..D) if (k != j) { float c = C[j*D + k]; lc += c*c; }
+        }
+        lv /= D; lc /= D;
+
+        // 4) 기울기.  평균(mu)이 S 에 의존하는 항은 Σ_b z[b][k] == 0 이라 정확히 0 이 되므로
+        //    중심화한 값 z 로만 계산하면 된다.
+        //      분산  : d/dS[b][j] = -varW/(D(B-1)) * z[b][j]/sd[j]   (sd[j] < gamma 일 때만)
+        //      공분산: d/dS[b][j] = 4covW/(D(B-1)) * Σ_{k≠j} C[j][k] z[b][k]
+        //    j 마다 스레드를 나눈다 — dS[b*D+j] 는 j 별로 겹치지 않고, 합산 순서도
+        //    고정이라 직렬 실행과 비트 단위로 같다.
+        immutable float gv = -varW / (cast(float)D * n1);
+        immutable float gc = 4f * covW / (cast(float)D * n1);
+        _parChunk(D, (int jlo, int jhi) {
+            foreach (j; jlo .. jhi) {
+                float vs = (sd[j] < gamma) ? gv / sd[j] : 0f;
+                foreach (b; 0..B) {
+                    float s = 0f;
+                    foreach (k; 0..D) if (k != j) s += C[j*D + k] * z[b*D + k];
+                    dS[b*D + j] += vs * z[b*D + j] + gc * s;
+                }
+            }
+        });
+        return varW * lv + covW * lc;
+    }
+}
+
 private class Network {
     // 은닉층은 Linear(+ReLU) 와 Attn 이 섞일 수 있다.
     // kinds[i] == 0 이면 lins[slot[i]], 1 이면 attns[slot[i]]
@@ -988,7 +1074,9 @@ private class Network {
             _bHd[i]    = new float[B*h.outSz];
             _bDHead[i] = new float[B*h.outSz];
         }
-        if (n > 0) _bScratch0 = new float[B * _outSz[0]];
+        // 첫 층의 dIn 을 버릴 곳. 크기는 그 층의 "입력" 폭 기준이다 (_inSz[0]) — Attn 은
+        // 입력폭==출력폭이라 티가 안 나지만 Each 가 첫 층이면 둘이 다르다. max 로 잡아 둔다.
+        if (n > 0) _bScratch0 = new float[B * (_inSz[0] > _outSz[0] ? _inSz[0] : _outSz[0])];
         _bcap = B;
     }
 
@@ -1036,7 +1124,9 @@ private class Network {
     }
 
     // _bDHead (헤드별 [B*outSz], 호출자가 채움) -> 가중치 기울기 누적. step 은 밖에서.
-    void backwardBatch(int B) {
+    // dInput != null 이면 입력에 대한 기울기도 거기에 낸다 ([B*inputSz]) — jepa 처럼
+    // 앞 신경망으로 기울기를 계속 흘려보내야 할 때 쓴다. 평소(null)엔 버린다.
+    void backwardBatch(int B, float[] dInput = null) {
         int n = layerCount;
         int houtSz = n > 0 ? _outSz[n-1] : inputSz;
         _bDHout[0 .. B*houtSz] = 0f;
@@ -1044,18 +1134,23 @@ private class Network {
         foreach (hi, ref head; heads)
             head.batchAccum(_bHout[0..B*houtSz], _bDHead[hi][0..B*head.outSz],
                              _bDHout[0..B*houtSz], B, true, false);
-        if (n == 0) return;
+        if (n == 0) {
+            if (dInput !is null) dInput[0 .. B*inputSz] = _bDHout[0 .. B*inputSz];
+            return;
+        }
         for (int i = n-1; i >= 0; i--) {
-            int oS = _outSz[i];
+            int oS = _outSz[i], iS = _inSz[i];
             bool 첫층 = (i == 0);
             bool 마지막 = (i + 1 == n);
             auto inp = _bInp[i];
             // 이 층 "출력" 으로 들어오는 기울기 — 마지막이면 헤드에서 온 _bDHout, 아니면
             // 다음 층이 앞서(i+1 을 먼저 처리했으므로) _bDZ[i] 에 이미 써둔 dIn.
             auto dOut = 마지막 ? _bDHout[0..B*houtSz] : _bDZ[i][0..B*oS];
-            // Linear 는 !첫층 으로 dIn 계산 자체를 건너뛸 수 있지만 Attn/Each 는 항상
-            // 계산하므로, 첫층이면 버릴 스크래치(_bScratch0)를 준다.
-            auto dIn = 첫층 ? _bScratch0[0..B*oS] : _bDZ[i-1];
+            // Linear 는 (dInput 을 안 받는) 첫층이면 dIn 계산 자체를 건너뛸 수 있지만
+            // Attn/Each 는 항상 계산하므로, 그때는 버릴 스크래치(_bScratch0)를 준다.
+            // dInput 이 있으면 첫층의 dIn 은 버리지 않고 거기로 내보낸다.
+            auto dIn = !첫층      ? _bDZ[i-1]
+                     : (dInput !is null ? dInput[0..B*iS] : _bScratch0[0..B*iS]);
             final switch (kinds[i]) {
                 case 0:
                     auto L = &lins[slot[i]];
@@ -1066,7 +1161,8 @@ private class Network {
                             dZ[b*oS + k] = (pre[b*oS + k] > 0f) ? dOut[b*oS + k] : 0f;
                         }
                     });
-                    L.batchAccum(inp, dZ, 첫층 ? null : _bDZ[i-1], B, !첫층);
+                    bool 필요 = !첫층 || dInput !is null;
+                    L.batchAccum(inp, dZ, 필요 ? dIn : null, B, 필요);
                     break;
                 case 1:
                     // AttnLayer.bwdBatch 는 (per-sample bwd() 와 마찬가지로) dX 에 누적만
@@ -1627,6 +1723,34 @@ class BlackBoxAI {
         net.step(opt, lr);
     }
 
+    // ── jepa 용 진입점 ────────────────────────────────────────────────
+    // 보통 학습(sl/save)은 "입력 -> 정답" 한 번으로 끝나지만, jepa 는 같은 신경망을
+    // 두 번(x 한 번, y 한 번) 돌린 뒤 두 결과를 비교해야 한다. 그래서 순전파와
+    // 역전파를 따로 부를 수 있게 열어둔다. 학습 자체는 Jepa 가 조립한다.
+
+    // 헤드 h 의 출력 전체를 벡터로 (샘플 하나). net.forward 경로.
+    void embedOne(const(float)[] x, float[] outv, int h = 0) {
+        foreach (k; 0..net.inputSz) _envBuf[k] = k < x.length ? x[k] : 0f;
+        net.forward(_envBuf);
+        int D = outSizes[h];
+        outv[0..D] = net._hd[h][0..D];
+    }
+
+    // 배치 순전파. 결과는 net._bHd[0] 에 [B*outSizes[0]] 로 남는다.
+    void embedForward(float[][] X, int B) {
+        net._allocBatch(B);
+        net.forwardBatch(X, B);
+    }
+
+    // dOut([B*outSizes[0]]) -> 가중치 기울기 누적. step 은 밖에서 한 번만.
+    // dInput != null 이면 입력에 대한 기울기도 낸다 ([B*net.inputSz]).
+    void embedBackward(const(float)[] dOut, int B, float[] dInput) {
+        int D = outSizes[0];
+        foreach (h; 0..nHeads) net._bDHead[h][0 .. B*outSizes[h]] = 0f;
+        net._bDHead[0][0 .. B*D] = dOut[0 .. B*D];
+        net.backwardBatch(B, dInput);
+    }
+
     void save() {
         if (!ready) return;
         auto f = File(file, "wb");
@@ -1723,6 +1847,133 @@ class BlackBoxAI {
         }
         foreach (ref h; net.heads) rl_(h);
     }
+}
+
+// ─────────────────────────────────────────────
+// Jepa — 요약기(encoder) + 예측기(predictor)
+// ─────────────────────────────────────────────
+// 원본을 그대로 맞추는 대신 "요약"만 맞춘다 (LeCun 의 JEPA).
+//   sx = 요약기(x),  sy = 요약기(y),  p = 예측기(sx (+행동))
+//   손실 = 평균제곱오차(p, sy) + collapse 벌점(sx) + collapse 벌점(sy)
+// x 는 지금, y 는 다음 — 이렇게 쓰면 월드모델. x/y 를 같은 것의 두 조각으로 주면
+// 그냥 자기지도학습. 라이브러리 입장에선 둘이 똑같고, 뭘 넣을지는 쓰는 쪽 마음이다.
+//
+// 요약기는 x 와 y 에 같은 가중치를 쓴다 (한 덩어리를 두 번 돌린다). 그래서 기울기도
+// 양쪽에서 와서 합쳐진다.
+class Jepa {
+    BlackBoxAI enc, pred;
+    VicReg vic;
+    int D;        // 요약 크기 (= 요약기 헤드 0 의 출력 개수)
+    int A;        // 행동 입력 개수 (= 예측기 입력폭 - D).  0 이면 행동 없는 형태
+
+    private int       _cap;
+    private float[]   _sx, _sy, _dP, _dSx, _dSy, _dPin;
+    private float[][] _pin;      // 예측기 입력 [B][D+A]
+    private float[]   _pinFlat;  // 위의 실제 저장소
+    private float[]   _one;      // 샘플 하나짜리 스크래치 [D+A]
+
+    this(BlackBoxAI e, BlackBoxAI p) {
+        enc = e; pred = p;
+        if (e.nHeads < 1 || p.nHeads < 1)
+            throw new Exception("jepa: 요약기와 예측기 둘 다 출력이 있어야 합니다");
+        if (!e.cosModes[0] || !p.cosModes[0])
+            throw new Exception("jepa: 요약기와 예측기의 출력은 숫자(vec)여야 합니다");
+        D = e.outSizes[0];
+        if (p.outSizes[0] != D)
+            throw new Exception("jepa: 예측기 출력 " ~ to!string(p.outSizes[0])
+                              ~ " 가 요약 크기 " ~ to!string(D) ~ " 와 다릅니다");
+        A = p.net.inputSz - D;
+        if (A < 0)
+            throw new Exception("jepa: 예측기 입력 " ~ to!string(p.net.inputSz)
+                              ~ " 이 요약 크기 " ~ to!string(D) ~ " 보다 작습니다");
+        _one = new float[D + A]; _one[] = 0f;
+    }
+
+    private void _alloc(int B) {
+        if (B <= _cap) return;
+        _sx  = new float[B*D];        _sx[]  = 0f;
+        _sy  = new float[B*D];        _sy[]  = 0f;
+        _dP  = new float[B*D];        _dP[]  = 0f;
+        _dSx = new float[B*D];        _dSx[] = 0f;
+        _dSy = new float[B*D];        _dSy[] = 0f;
+        _dPin    = new float[B*(D+A)]; _dPin[]    = 0f;
+        _pinFlat = new float[B*(D+A)]; _pinFlat[] = 0f;
+        _pin = new float[][B];
+        foreach (b; 0..B) _pin[b] = _pinFlat[b*(D+A) .. (b+1)*(D+A)];
+        _cap = B;
+    }
+
+    // xs/ys: 각 [B][입력수].  acts: 행동이 있으면 [B][A], 없으면 null.
+    // 돌려주는 값은 손실 (예측 오차 + collapse 벌점).
+    float train(float[][] xs, float[][] ys, float[][] acts) {
+        int B = cast(int) xs.length;
+        if (B == 0) return 0f;
+        if (ys.length != xs.length)
+            throw new Exception("jepa: x 와 y 의 개수가 다릅니다");
+        if (A > 0 && (acts is null || acts.length != xs.length))
+            throw new Exception("jepa: 행동을 " ~ to!string(A) ~ "개씩 x 개수만큼 주세요");
+        _alloc(B);
+        enc.net.zeroGrad();
+        pred.net.zeroGrad();
+
+        // 1) 같은 요약기에 x, y 를 각각 통과시킨다.
+        //    두 번째 호출이 첫 번째의 중간값 버퍼를 덮어쓰므로 결과를 따로 빼둔다.
+        enc.embedForward(xs, B);
+        _sx[0..B*D] = enc.net._bHd[0][0..B*D];
+        enc.embedForward(ys, B);      // 이제 요약기 버퍼는 y 패스를 담고 있다
+        _sy[0..B*D] = enc.net._bHd[0][0..B*D];
+
+        // 2) 예측기: sx (+행동) -> sy 예측
+        foreach (b; 0..B) {
+            _pin[b][0..D] = _sx[b*D .. b*D + D];
+            if (A > 0) foreach (k; 0..A) _pin[b][D+k] = acts[b][k];
+        }
+        pred.embedForward(_pin, B);
+
+        // 3) 예측 손실 — 원본이 아니라 "요약" 공간에서 잰다. 이게 JEPA 의 핵심.
+        float loss = 0f;
+        immutable float g = 2f / cast(float)(B * D);
+        foreach (i; 0..B*D) {
+            float d = pred.net._bHd[0][i] - _sy[i];
+            loss += d * d;
+            _dP[i] = d * g;
+        }
+        loss /= cast(float)(B * D);
+
+        // 4) 예측기 역전파. 입력 기울기를 받아서 앞의 요약기(x 쪽)로 넘긴다.
+        pred.embedBackward(_dP[0..B*D], B, _dPin[0..B*(D+A)]);
+        foreach (b; 0..B) _dSx[b*D .. b*D + D] = _dPin[b*(D+A) .. b*(D+A) + D];
+
+        // 5) y 쪽 요약기 기울기 — 예측의 목표라서 부호가 반대다.
+        foreach (i; 0..B*D) _dSy[i] = -_dP[i];
+
+        // 6) collapse 벌점을 양쪽 요약에 더한다. 이것만 배치 전체를 봐야 계산된다.
+        loss += vic.grad(_sy[0..B*D], _dSy[0..B*D], B, D);
+        loss += vic.grad(_sx[0..B*D], _dSx[0..B*D], B, D);
+
+        // 7) 요약기 역전파 2번 — 지금 버퍼가 y 패스라 y 를 먼저 하고,
+        //    x 는 중간값을 다시 만들어야 하므로 순전파를 한 번 더 돌린다.
+        enc.embedBackward(_dSy[0..B*D], B, null);
+        enc.embedForward(xs, B);
+        enc.embedBackward(_dSx[0..B*D], B, null);
+
+        // 8) 모아둔 기울기로 한 번씩만 갱신
+        enc.net.step(enc.opt, enc.lr);
+        pred.net.step(pred.opt, pred.lr);
+        return loss;
+    }
+
+    // x -> 요약
+    void encode(const(float)[] x, float[] outv) { enc.embedOne(x, outv); }
+
+    // x (+행동) -> 다음 요약 예측. "미리 상상해보기".
+    void imagine(const(float)[] x, const(float)[] act, float[] outv) {
+        enc.embedOne(x, _one[0..D]);
+        if (A > 0) foreach (k; 0..A) _one[D+k] = k < act.length ? act[k] : 0f;
+        pred.embedOne(_one, outv);
+    }
+
+    void save() { enc.save(); pred.save(); }
 }
 
 void resset(string modelName) {
@@ -1919,6 +2170,25 @@ extern(C) void bbai_dtor(PyObject* cap) nothrow @trusted {
     if (ai) try { GC.removeRoot(cast(void*) ai); } catch (Throwable) {}
 }
 
+extern(C) void jepa_dtor(PyObject* cap) nothrow @trusted {
+    auto j = cast(Jepa) PyCapsule_GetPointer(cap, "Jepa");
+    if (j) try { GC.removeRoot(cast(void*) j); } catch (Throwable) {}
+}
+
+// [[a,b],[c,d]] -> float[][]
+float[][] pyFloatMat(PyObject* lst) {
+    Py_ssize_t n = PyList_Size(lst);
+    auto r = new float[][n];
+    foreach (i; 0..n) r[i] = pyFloatList(PyList_GetItem(lst, i));
+    return r;
+}
+
+PyObject* toPyFloats(const(float)[] v) {
+    auto lst = PyList_New(v.length);
+    foreach (i, x; v) PyList_SetItem(lst, i, PyFloat_FromDouble(x));
+    return lst;
+}
+
 // ─────────────────────────────────────────────
 // Python extension functions
 // ─────────────────────────────────────────────
@@ -1985,6 +2255,94 @@ PyObject* py_ml_predict(PyObject* self, PyObject* args) {
         ai.predictAll(pyLals(legal), pyFloatList(inp), chosen, value);
         return packPick(ai, chosen, value);
     } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _ml_predict"); return null; }
+}
+
+// 헤드 h 의 출력 전체를 벡터로 (vec 출력용). predict 는 한 칸짜리라 이걸 쓴다.
+PyObject* py_ml_embed(PyObject* self, PyObject* args) {
+    try {
+        PyObject* cap; PyObject* inp; int h;
+        if (!PyArg_ParseTuple(args, "OOi", &cap, &inp, &h)) return null;
+        auto ai = cast(BlackBoxAI) PyCapsule_GetPointer(cap, "BlackBoxAI");
+        if (h < 0 || h >= ai.nHeads) {
+            PyErr_SetString(_pyRuntimeError, "my_ml: embed() 의 출력 번호가 범위를 벗어났습니다");
+            return null;
+        }
+        auto v = new float[ai.outSizes[h]];
+        ai.embedOne(pyFloatList(inp), v, h);
+        return toPyFloats(v);
+    } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _ml_embed"); return null; }
+}
+
+PyObject* py_jepa_make(PyObject* self, PyObject* args) {
+    try {
+        PyObject* ec; PyObject* pc; double vw, cw, gm;
+        if (!PyArg_ParseTuple(args, "OOddd", &ec, &pc, &vw, &cw, &gm)) return null;
+        auto e = cast(BlackBoxAI) PyCapsule_GetPointer(ec, "BlackBoxAI");
+        auto p = cast(BlackBoxAI) PyCapsule_GetPointer(pc, "BlackBoxAI");
+        auto j = new Jepa(e, p);
+        j.vic.varW = cast(float)vw; j.vic.covW = cast(float)cw; j.vic.gamma = cast(float)gm;
+        GC.addRoot(cast(void*) j);
+        return PyCapsule_New(cast(void*) j, "Jepa", &jepa_dtor);
+    } catch (Exception e) {
+        PyErr_SetString(_pyRuntimeError, toStringz("my_ml: " ~ e.msg)); return null;
+    } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _jepa_make"); return null; }
+}
+
+PyObject* py_jepa_train(PyObject* self, PyObject* args) {
+    try {
+        PyObject* cap; PyObject* xs; PyObject* ys; PyObject* acts;
+        if (!PyArg_ParseTuple(args, "OOOO", &cap, &xs, &ys, &acts)) return null;
+        auto j = cast(Jepa) PyCapsule_GetPointer(cap, "Jepa");
+        float[][] am = (acts is _pyNone) ? null : pyFloatMat(acts);
+        float loss = j.train(pyFloatMat(xs), pyFloatMat(ys), am);
+        return PyFloat_FromDouble(loss);
+    } catch (Exception e) {
+        PyErr_SetString(_pyRuntimeError, toStringz("my_ml: " ~ e.msg)); return null;
+    } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _jepa_train"); return null; }
+}
+
+PyObject* py_jepa_encode(PyObject* self, PyObject* args) {
+    try {
+        PyObject* cap; PyObject* inp;
+        if (!PyArg_ParseTuple(args, "OO", &cap, &inp)) return null;
+        auto j = cast(Jepa) PyCapsule_GetPointer(cap, "Jepa");
+        auto v = new float[j.D];
+        j.encode(pyFloatList(inp), v);
+        return toPyFloats(v);
+    } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _jepa_encode"); return null; }
+}
+
+PyObject* py_jepa_imagine(PyObject* self, PyObject* args) {
+    try {
+        PyObject* cap; PyObject* inp; PyObject* act;
+        if (!PyArg_ParseTuple(args, "OOO", &cap, &inp, &act)) return null;
+        auto j = cast(Jepa) PyCapsule_GetPointer(cap, "Jepa");
+        auto v = new float[j.D];
+        float[] a = (act is _pyNone) ? null : pyFloatList(act);
+        j.imagine(pyFloatList(inp), a, v);
+        return toPyFloats(v);
+    } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _jepa_imagine"); return null; }
+}
+
+PyObject* py_jepa_save(PyObject* self, PyObject* args) {
+    try {
+        PyObject* cap;
+        if (!PyArg_ParseTuple(args, "O", &cap)) return null;
+        (cast(Jepa) PyCapsule_GetPointer(cap, "Jepa")).save();
+        Py_IncRef(_pyNone); return _pyNone;
+    } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _jepa_save"); return null; }
+}
+
+PyObject* py_jepa_meta(PyObject* self, PyObject* args) {
+    try {
+        PyObject* cap;
+        if (!PyArg_ParseTuple(args, "O", &cap)) return null;
+        auto j = cast(Jepa) PyCapsule_GetPointer(cap, "Jepa");
+        auto lst = PyList_New(2);
+        PyList_SetItem(lst, 0, PyLong_FromLong(j.D));
+        PyList_SetItem(lst, 1, PyLong_FromLong(j.A));
+        return lst;
+    } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _jepa_meta"); return null; }
 }
 
 // inputs[i], chosen[i][h], values[i][h], scores[i][h]  (score 가 NaN 이면 그 헤드는 제외)
@@ -2211,6 +2569,30 @@ class _Each:
 each = _Each()
 
 
+class _Vec:
+    """숫자 여러 개를 한 덩어리로 내는 출력.
+
+        vec(64)   -> 숫자 64개짜리 출력 하나
+
+    cos 를 64개 나열하는 것과 값은 같지만, 이건 "한 덩어리"라서 jepa 의
+    요약(summary)처럼 전체를 통째로 다뤄야 할 때 쓴다. 값을 꺼낼 땐
+    predict() 대신 embed() 를 쓴다 (predict 는 첫 칸만 준다).
+    """
+    __slots__ = ("size",)
+
+    def __init__(self, size=0):
+        self.size = int(size)
+
+    def __call__(self, size):
+        if size < 1: raise ValueError("vec(개수) 는 1 이상이어야 합니다")
+        return _Vec(size)
+
+    def __repr__(self):
+        return f"vec({self.size})"
+
+vec = _Vec()
+
+
 class Step:
     """rl() 이 돌려주는 (입력, 출력) 쌍. 그냥 데이터."""
     __slots__ = ("input", "output", "_units", "_raw")
@@ -2245,20 +2627,29 @@ _NAN = float("nan")
 
 
 class BlackBoxAI:
-    def __init__(self, h, name, heads):
+    def __init__(self, h, name, heads, vecs=None):
         self._h     = h
         self._name  = name
         self._heads = heads          # [(actions or None, cos:bool), ...]
         self._n     = len(heads)
+        self._vecs  = list(vecs) if vecs else [False]*len(heads)
 
-    # 헤드별 원시값 → 사람이 쓰는 출력
+    def embed(self, input_list, head=0):
+        """그 출력의 값 전체를 리스트로. vec 출력을 꺼낼 때 쓴다.
+        출력이 여러 개면 head 로 몇 번째인지 고른다 (기본 0번)."""
+        return _ml_embed(self._h, [float(x) for x in input_list], int(head))
+
+    # 헤드별 원시값 → 사람이 쓰는 출력.
+    # vec 출력 자리는 None 으로 비운다 — 숫자가 여러 개라 한 칸에 안 들어간다.
+    # 그 값은 embed(입력, 번호) 로 따로 꺼낸다.
     def _decode(self, flat):
         out, units, raw = [], [], []
         for i, (acts, cos) in enumerate(self._heads):
             idx, val = int(flat[i*2]), float(flat[i*2+1])
             units.append(idx)
             raw.append(val)
-            out.append(val if cos else acts[idx])
+            if self._vecs[i]:   out.append(None)
+            else:               out.append(val if cos else acts[idx])
         return out, units, raw
 
     def _legal_arg(self, legal):
@@ -2283,6 +2674,11 @@ class BlackBoxAI:
             raise ValueError(f"점수는 리스트로 주세요 (출력 {self._n}개)")
         if len(point) != self._n:
             raise ValueError(f"점수 개수({len(point)})가 출력 개수({self._n})와 다릅니다")
+        for i, pt in enumerate(point):
+            if self._vecs[i] and pt is not None:
+                raise ValueError(
+                    f"{i}번째 출력은 vec 이라 점수를 줄 수 없습니다. "
+                    "None 으로 비우고 jepa() 로 학습하세요")
         return Scored(data.input, data.output, list(point), data._units, data._raw)
 
     # ── 여기서만 학습 + 저장 ──
@@ -2314,6 +2710,10 @@ class BlackBoxAI:
                 raise ValueError(f"정답 개수({len(answer)})가 출력 개수({self._n})와 다릅니다")
             for i, a in enumerate(answer):
                 if a is None: continue
+                if self._vecs[i]:
+                    raise ValueError(
+                        f"{i}번째 출력은 vec 이라 sl() 로 정답을 줄 수 없습니다. "
+                        "None 으로 비우고 jepa() 로 학습하세요")
                 acts, cos = self._heads[i]
                 use[i] = 1
                 if cos: ansV[i] = float(a)
@@ -2366,6 +2766,9 @@ class BlackBoxAI:
 
 def _헤드해석(spec):
     """스펙 하나 → (액션목록 또는 None, cos여부, 출력개수)"""
+    if isinstance(spec, _Vec):
+        if spec.size < 1: raise ValueError("vec(개수) 는 1 이상이어야 합니다")
+        return None, True, spec.size
     if isinstance(spec, _Cos):
         return None, True, 1
     if isinstance(spec, str) and spec.lower() == "cos":
@@ -2381,7 +2784,7 @@ def _헤드해석(spec):
 
 
 def _헤드스펙인가(x):
-    return isinstance(x, (_Cos, list, tuple)) or (isinstance(x, str) and x.lower() == "cos")
+    return isinstance(x, (_Cos, _Vec, list, tuple)) or (isinstance(x, str) and x.lower() == "cos")
 
 
 def make(model_name, layers, outputs, optimizer='adam', sigma=1.0, entropy=0.01):
@@ -2436,17 +2839,110 @@ def make(model_name, layers, outputs, optimizer='adam', sigma=1.0, entropy=0.01)
         raise ValueError('outputs 는 리스트로 주세요. 하나여도 [["A","B"]] 처럼 감쌉니다')
     specs = list(outputs)
 
-    heads, al_arg, cos_arg, sizes = [], [], [], []
+    heads, al_arg, cos_arg, sizes, vecs = [], [], [], [], []
     for spec in specs:
         names, is_cos, n = _헤드해석(spec)
         heads.append((names, is_cos))
         al_arg.append(names or [])
         cos_arg.append(1 if is_cos else 0)
         sizes.append(n)
+        vecs.append(isinstance(spec, _Vec))
 
     h = _ml_make(model_name, inputSz, lay_kind, lay_a, lay_b, sizes, al_arg, cos_arg,
                  optimizer, float(sigma), float(entropy))
-    return BlackBoxAI(h, model_name, heads)
+    return BlackBoxAI(h, model_name, heads, vecs)
+
+
+class Jepa:
+    """요약기 + 예측기 한 쌍.
+
+    원본을 통째로 맞추는 대신 "요약"만 맞춘다.
+      train(x들, y들)  : x 의 요약으로 y 의 요약을 맞추도록 학습. 손실을 돌려준다.
+      encode(x)        : x -> 요약 (숫자 리스트)
+      imagine(x, 행동) : x (+행동) -> 다음 요약 예측
+      save()           : 요약기와 예측기 둘 다 저장
+    """
+    __slots__ = ("_h", "_enc", "_pred", "_d", "_a")
+
+    def __init__(self, h, enc, pred):
+        self._h, self._enc, self._pred = h, enc, pred
+        self._d, self._a = _jepa_meta(h)
+
+    @property
+    def summary(self):  return self._d      # 요약 크기
+    @property
+    def actions(self):  return self._a      # 행동 입력 개수 (0 이면 없음)
+    @property
+    def encoder(self):  return self._enc
+    @property
+    def predictor(self): return self._pred
+
+    def train(self, xs, ys, actions=None):
+        """묶음으로 준다. xs[i] 와 ys[i] 가 한 쌍.
+
+        묶음이 커야 배운다 — "요약들이 서로 다른가" 를 묶음 안에서 재기 때문에,
+        2개 미만이면 붕괴 방지가 아예 꺼진다. 32개 이상을 권한다.
+        """
+        if len(xs) != len(ys):
+            raise ValueError(f"x {len(xs)}개, y {len(ys)}개 — 개수가 같아야 합니다")
+        if self._a > 0:
+            if actions is None:
+                raise ValueError(f"이 예측기는 행동 {self._a}개를 같이 받습니다")
+            if len(actions) != len(xs):
+                raise ValueError("행동도 x 와 같은 개수만큼 주세요")
+        X = [[float(v) for v in r] for r in xs]
+        Y = [[float(v) for v in r] for r in ys]
+        A = None if actions is None else [[float(v) for v in r] for r in actions]
+        return _jepa_train(self._h, X, Y, A)
+
+    def encode(self, x):
+        return _jepa_encode(self._h, [float(v) for v in x])
+
+    def imagine(self, x, action=None):
+        a = None if action is None else [float(v) for v in action]
+        return _jepa_imagine(self._h, [float(v) for v in x], a)
+
+    def save(self):
+        _jepa_save(self._h)
+
+    def __repr__(self):
+        return f"Jepa(summary={self._d}, actions={self._a})"
+
+
+def jepa(encoder, predictor, var=25.0, cov=1.0, target=1.0):
+    """요약기와 예측기를 묶어서 jepa 학습기를 만든다.
+
+        enc  = make("enc",  [입력수, 128], [vec(32)])          # 요약기
+        pred = make("pred", [32 + 행동수, 128], [vec(32)])      # 예측기
+        w = jepa(enc, pred)
+        w.train(지금들, 다음들, 행동들)
+
+    예측기의 입력수 - 요약 크기 = 행동 입력 개수로 자동 계산된다.
+    같으면 행동 없는 형태(그냥 자기지도학습)가 된다.
+
+    요약기에 출력을 더 붙여서 섞어 쓸 수 있다. 첫 출력만 vec 이면 된다.
+
+        enc = make("enc", [입력수, 128], [vec(32), ["왼쪽","오른쪽"]])
+        w = jepa(enc, pred)
+        w.train(...)          # 요약을 다듬는다 (첫 출력)
+        enc.sl(관측들, [[None, "왼쪽"], ...])   # 행동을 가르친다 (둘째 출력)
+
+    같은 신경망 몸통을 공유하므로, jepa 로 배운 요약이 행동 쪽에도 그대로 도움이
+    된다. vec 자리는 sl()/reward() 에서 None 으로 비우고 predict() 에서도 None 이
+    나온다 — 그 값은 embed(입력, 번호) 로 꺼낸다.
+
+    var / cov : 요약이 "다 같은 값으로 뭉개지는 것"을 막는 힘.
+                var 는 값이 실제로 변하게, cov 는 칸끼리 딴 정보를 담게 민다.
+                0 으로 두면 꺼지는데, 그러면 거의 확실히 뭉개진다.
+    target    : 각 칸이 목표로 하는 값의 퍼짐 정도 (표준편차).
+    """
+    if not isinstance(encoder, BlackBoxAI) or not isinstance(predictor, BlackBoxAI):
+        raise ValueError("jepa(요약기, 예측기) 는 make() 로 만든 모델 두 개를 받습니다")
+    for 이름, m in (("요약기", encoder), ("예측기", predictor)):
+        if not m._vecs[0]:
+            raise ValueError(f"{이름} 의 첫 출력이 vec 이어야 합니다 (지금: {m._heads[0][0] or 'cos'})")
+    h = _jepa_make(encoder._h, predictor._h, float(var), float(cov), float(target))
+    return Jepa(h, encoder, predictor)
 
 
 def change(model_name):
@@ -2478,7 +2974,7 @@ builtins.gc_collect = gc_collect
 // ─────────────────────────────────────────────
 // Module init
 // ─────────────────────────────────────────────
-private __gshared PyMethodDef[14] _methods;
+private __gshared PyMethodDef[21] _methods;
 private __gshared PyModuleDef     _moddef;
 
 extern(C) export PyObject* PyInit_ml() nothrow @trusted {
@@ -2496,7 +2992,14 @@ extern(C) export PyObject* PyInit_ml() nothrow @trusted {
         _methods[10] = PyMethodDef("_ml_get_meta",        &py_ml_get_meta,        METH_VARARGS, null);
         _methods[11] = PyMethodDef("_ml_change",          &py_ml_change,          METH_VARARGS, null);
         _methods[12] = PyMethodDef("_ml_sl_many",        &py_ml_sl_many,         METH_VARARGS, null);
-        _methods[13] = PyMethodDef(null, null, 0, null);
+        _methods[13] = PyMethodDef("_ml_embed",          &py_ml_embed,           METH_VARARGS, null);
+        _methods[14] = PyMethodDef("_jepa_make",         &py_jepa_make,          METH_VARARGS, null);
+        _methods[15] = PyMethodDef("_jepa_train",        &py_jepa_train,         METH_VARARGS, null);
+        _methods[16] = PyMethodDef("_jepa_encode",       &py_jepa_encode,        METH_VARARGS, null);
+        _methods[17] = PyMethodDef("_jepa_imagine",      &py_jepa_imagine,       METH_VARARGS, null);
+        _methods[18] = PyMethodDef("_jepa_save",         &py_jepa_save,          METH_VARARGS, null);
+        _methods[19] = PyMethodDef("_jepa_meta",         &py_jepa_meta,          METH_VARARGS, null);
+        _methods[20] = PyMethodDef(null, null, 0, null);
 
         _moddef.m_base.ob_base.ob_refcnt = 1;
         _moddef.m_name    = "my_ml";
