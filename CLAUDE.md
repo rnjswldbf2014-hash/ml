@@ -24,7 +24,9 @@ Remove-Item rnjswldbf_2014\ml.obj, rnjswldbf_2014\ml.lib, rnjswldbf_2014\ml.exp,
 - `rnjswldbf_2014/ml.d` — D 소스 (신경망 + Python C API + Python 클래스 코드 인라인)
 - `rnjswldbf_2014/gpu_cl.d` — OpenCL GPU 백엔드 (런타임에 OpenCL.dll 동적 로드, 없으면 자동으로 CPU 로 폴백)
 - `rnjswldbf_2014/ml.pyd` — 빌드 결과물 (gitignore)
-- `main.py` — 빈 파일. 사용자가 여기에 작성한다.
+- `main.py` — jepa 월드모델 예제 (`python main.py` 로 바로 돌아간다).
+  잡음 섞인 관측만 보고 위치를 배우고, 예측기를 여러 번 이어 붙여 머릿속으로
+  굴려보며 계획을 세운다.
 - `tests/` — 결정성 회귀 하네스 (`python tests/regression.py`)
   와 jepa 검증 (`python tests/jepa.py` — 학습 여부·붕괴 방지·스레드 결정성)
 
