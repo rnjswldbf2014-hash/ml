@@ -1409,6 +1409,58 @@ class BlackBoxAI {
         // 배치 크기로 나눠 평균 기울기를 쓴다.
         // (합산만 하면 배치가 커질수록 갱신 폭이 커져 발산한다)
         immutable float inv = 1.0f / cast(float) inputs.length;
+
+        // ── 묶음 경로 — sl() 이 쓰는 것과 같은 코어(forwardBatch/backwardBatch).
+        // 기울기 계산 자체는 아래 per-sample 경로와 한 글자도 다르지 않다.
+        // 읽는 곳이 _hd -> _bHd, 쓰는 곳이 _dHead -> _bDHead 로 바뀔 뿐이다.
+        //
+        // 1개짜리는 아래 직렬 경로로 보낸다. 배치 버퍼 준비·층별 디스패치 값이
+        // 재사용할 게 없는 상태에선 그냥 손해다 (측정: [64,256,256] 에서
+        // 0.94ms -> 0.85ms). 배치=1 온라인 학습이 이 라이브러리의 핵심 용도라
+        // 그 경로를 제일 짧게 둔다.
+        if (!_noBatch && inputs.length > 1) {
+            int B = cast(int) inputs.length;
+            net._allocBatch(B);
+            net.forwardBatch(inputs, B);
+            foreach (h; 0..nHeads) {
+                int oS = outSizes[h];
+                net._bDHead[h][0 .. B*oS] = 0f;
+                foreach (i; 0..B) {
+                    float sc = scores[i][h];
+                    if (sc != sc) continue;   // NaN -> 이 헤드는 학습 안 함
+                    sc *= inv;
+                    auto hd  = net._bHd[h][i*oS .. i*oS + oS];
+                    auto dst = net._bDHead[h][i*oS .. i*oS + oS];
+                    if (cosModes[h]) {
+                        int u = chosen[i][h] < oS ? chosen[i][h] : 0;
+                        float mu = hd[u];
+                        float gr = -sc * (values[i][h] - mu) / (cosSigma * cosSigma);
+                        if (gr >  GCLIP) gr =  GCLIP;      // 발산 방지
+                        if (gr < -GCLIP) gr = -GCLIP;
+                        dst[u] = gr;
+                    } else {
+                        foreach (k; 0..oS) _probBufs[h][k] = hd[k];
+                        softmaxInPlace(_probBufs[h][0..oS]);
+                        float Hh = 0f;
+                        foreach (k; 0..oS) {
+                            float pk = _probBufs[h][k];
+                            if (pk > 1e-8f) Hh -= pk * log(pk);
+                        }
+                        foreach (k; 0..oS) {
+                            float pk = _probBufs[h][k];
+                            float g  = sc * (pk - (k == chosen[i][h] ? 1f : 0f));
+                            if (entropy != 0f && pk > 1e-8f)
+                                g += entropy * inv * pk * (log(pk) + Hh);
+                            dst[k] = g;
+                        }
+                    }
+                }
+            }
+            net.backwardBatch(B);
+            net.step(opt, lr);
+            return;
+        }
+
         foreach (i; 0..inputs.length) {
             foreach (k; 0..inputs[i].length) _envBuf[k] = inputs[i][k];
             net.forward(_envBuf);
@@ -2362,8 +2414,10 @@ PyObject* py_ml_learn(PyObject* self, PyObject* args) {
             values[i] = pyFloatList(PyList_GetItem(vals, i));
             score[i]  = pyFloatList(PyList_GetItem(scrs, i));
         }
+        // 파일로 쓸지는 파이썬 쪽이 정한다 (autosave). 온라인 RL 은 매 스텝
+        // 여기를 지나가는데, 그때마다 가중치 파일을 쓰면 학습 시간의 3분의 2가
+        // 디스크에 나간다 (측정: [64,256,256] 에서 14.4ms 중 9.7ms).
         ai.learnBatch(inputs, chosen, values, score);
-        ai.save();
         Py_IncRef(_pyNone); return _pyNone;
     } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _ml_learn"); return null; }
 }
@@ -2627,12 +2681,28 @@ _NAN = float("nan")
 
 
 class BlackBoxAI:
-    def __init__(self, h, name, heads, vecs=None):
+    def __init__(self, h, name, heads, vecs=None, autosave=1):
         self._h     = h
         self._name  = name
         self._heads = heads          # [(actions or None, cos:bool), ...]
         self._n     = len(heads)
         self._vecs  = list(vecs) if vecs else [False]*len(heads)
+        self._autosave = int(autosave)
+        self._since    = 0           # 마지막으로 파일에 쓴 뒤 학습한 횟수
+
+    @property
+    def autosave(self):     return self._autosave
+
+    @autosave.setter
+    def autosave(self, n):  self._autosave = int(n)
+
+    def _파일에쓸까(self):
+        """save(scored) 가 학습한 뒤 파일까지 쓸지."""
+        self._since += 1
+        if self._autosave > 0 and self._since >= self._autosave:
+            self._since = 0
+            return True
+        return False
 
     def embed(self, input_list, head=0):
         """그 출력의 값 전체를 리스트로. vec 출력을 꺼낼 때 쓴다.
@@ -2683,8 +2753,14 @@ class BlackBoxAI:
 
     # ── 여기서만 학습 + 저장 ──
     def save(self, scored=None):
+        """scored 를 주면 학습한다. 인자 없이 부르면 파일에만 쓴다.
+
+        파일 쓰기는 망이 커지면 학습 자체보다 비싸다 ([64,512,512] 에서 학습
+        19ms / 쓰기 34ms). 매 스텝 학습하는 온라인 RL 이면 make(..., autosave=N)
+        으로 N 번에 한 번만 쓰게 하고, 끝날 때 ai.save() 로 마무리하면 된다.
+        """
         if scored is None:
-            _ml_save(self._h); return 0
+            _ml_save(self._h); self._since = 0; return 0
         batch = [scored] if isinstance(scored, Scored) else list(scored)
         if not batch:
             return 0
@@ -2696,6 +2772,8 @@ class BlackBoxAI:
                            for v, (_, c) in zip(s._raw, self._heads)])
             points.append([_NAN if x is None else float(x) for x in s.point])
         _ml_learn(self._h, inputs, chosen, values, points)
+        if self._파일에쓸까():
+            _ml_save(self._h)
         return len(batch)
 
     # ── 지도학습 ──
@@ -2787,7 +2865,8 @@ def _헤드스펙인가(x):
     return isinstance(x, (_Cos, _Vec, list, tuple)) or (isinstance(x, str) and x.lower() == "cos")
 
 
-def make(model_name, layers, outputs, optimizer='adam', sigma=1.0, entropy=0.01):
+def make(model_name, layers, outputs, optimizer='adam', sigma=1.0, entropy=0.01,
+         autosave=1):
     """
     model_name : 모델 이름 (가중치 파일명)
     layers     : [입력수, 은닉...]   출력은 outputs 에서 정해진다
@@ -2801,6 +2880,10 @@ def make(model_name, layers, outputs, optimizer='adam', sigma=1.0, entropy=0.01)
                  반환·보상·정답·legal 도 전부 출력 개수만큼의 리스트다.
     sigma      : cos 가 값을 얼마나 넓게 탐험할지 (기본 1.0)
     entropy    : 고르는 쪽이 한 답으로 굳는 것을 막는 힘 (기본 0.01)
+    autosave   : save(scored) 가 몇 번에 한 번 파일까지 쓸지 (기본 1 = 매번)
+                 파일 쓰기는 망이 커지면 학습보다 비싸다. 매 스텝 학습하는
+                 온라인 RL 이면 100 정도로 두고, 끝낼 때 ai.save() 로 마무리한다.
+                 0 이면 자동으로 안 쓴다 (ai.save() 를 직접 불러야 한다).
     """
     if len(layers) < 1:
         raise ValueError("layers 는 [입력수, 은닉...] 형태입니다")
@@ -2850,7 +2933,7 @@ def make(model_name, layers, outputs, optimizer='adam', sigma=1.0, entropy=0.01)
 
     h = _ml_make(model_name, inputSz, lay_kind, lay_a, lay_b, sizes, al_arg, cos_arg,
                  optimizer, float(sigma), float(entropy))
-    return BlackBoxAI(h, model_name, heads, vecs)
+    return BlackBoxAI(h, model_name, heads, vecs, autosave)
 
 
 class Jepa:

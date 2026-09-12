@@ -27,8 +27,8 @@ Remove-Item rnjswldbf_2014\ml.obj, rnjswldbf_2014\ml.lib, rnjswldbf_2014\ml.exp,
 - `main.py` — jepa 월드모델 예제 (`python main.py` 로 바로 돌아간다).
   잡음 섞인 관측만 보고 위치를 배우고, 예측기를 여러 번 이어 붙여 머릿속으로
   굴려보며 계획을 세운다.
-- `tests/` — 결정성 회귀 하네스 (`python tests/regression.py`)
-  와 jepa 검증 (`python tests/jepa.py` — 학습 여부·붕괴 방지·스레드 결정성)
+- `tests/` — `regression.py` (sl 경로 결정성), `rl.py` (RL 묶음 경로 동치 +
+  autosave 정책), `jepa.py` (학습 여부·붕괴 방지·스레드 결정성)
 
 ## 환경변수
 
@@ -139,6 +139,9 @@ vec 자리는 `sl()` 정답과 `reward()` 점수에서 `None` 으로 비워야 �
   그대로 넣으면 신경망이 크기로 해석한다 (55% vs 100% 사례).
 - attn 만 넣으면 효과가 거의 없다. each 와 같이 써야 한다 (87% -> 99% 사례).
 - `sl()` 을 하나씩 부르면 문제마다 가중치 전체를 갱신해서 매우 느리다. 묶음으로 준다.
+- `save(scored)` 는 기본(autosave=1)으로 부를 때마다 가중치 파일을 쓴다. 망이 크면
+  학습보다 비싸다. 온라인 RL 은 `make(..., autosave=100)` 같이 두고 끝에 `ai.save()`.
+  (실측 [64,256,256] 배치 1: 12.4ms → 0.31ms)
 - 드문 행동을 지도학습시킬 때는 여러 번 반복해야 한다.
   안 그러면 흔한 행동만 답하는 쪽으로 굳는다.
   (전체의 4% 인 행동은 "안 한다" 고만 답해도 96점이라 그쪽으로 수렴한다)
