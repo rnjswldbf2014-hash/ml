@@ -100,6 +100,16 @@ void _parChunkNT(int n, scope void delegate(int lo, int hi) nothrow body) nothro
 private Random rng;
 static this() { rng = Random(unpredictableSeed); }
 
+// 안내 메시지. 출력 실패를 삼킨다.
+//
+// stdout 이 막혀 있을 수 있다 — 파이프가 닫혔다거나, 부모 프로세스가 출력을
+// 안 읽어서 버퍼가 찼다거나. 그때 writefln 은 예외를 던지는데, 예전엔 그게
+// 생성자 밖으로 그대로 나가서 "모델 생성 실패" 가 됐다. 안내 한 줄 때문에
+// 모델을 못 만드는 건 말이 안 된다.
+private void 알림(Args...)(string fmt, Args args) nothrow {
+    try { writefln(fmt, args); } catch (Throwable) {}
+}
+
 // ── CPU Dispatch ─────────────────────────────────────────────────────────
 private import ldc.attributes : target;
 
@@ -1314,6 +1324,18 @@ class BlackBoxAI {
     // 신경망을 거치지 않고 가중치를 직접 훑는 쪽(export_weights)이 부른다.
     void syncFromGpu() { _gpuSyncBack(); }
 
+    // GPU 버퍼를 놓아준다. 모델을 버릴 때(파이썬 캡슐 소멸) 부른다.
+    // 내장 GPU 는 이 메모리가 곧 시스템 RAM 이고, 큰 망이면 100MB 를 넘는다.
+    // 예전엔 아무도 안 불러서 프로세스가 끝날 때까지 붙잡고 있었다.
+    void releaseGpu() nothrow {
+        try { _gpuSyncBack(); } catch (Throwable) {}   // 남은 학습 결과는 회수하고
+        foreach (ref gl; _gpuLayers) gl.free();
+        gpucl.freeBuf(_gpuX);
+        _gpuLayers = null;
+        _gpuCapB = 0;
+        _gpuResident = false;
+    }
+
     // GPU 에 남아있는 w, b, m, v 를 호스트로 회수한다. Network._sync 가 부른다.
     private void _gpuSyncBack() {
         if (!_gpuResident || _gpuSyncing) return;
@@ -1376,23 +1398,23 @@ class BlackBoxAI {
                     layKind = lk.dup; layA = la.dup; layB = lb.dup;
                     hiddenSizes = [];
                     foreach (i; 0..lk.length) if (lk[i] == 0) hiddenSizes ~= la[i];
-                    writefln(" [%s] 저장된 구조 %s 가 요청한 %s 와 다릅니다. 새로 만듭니다.",
+                    알림(" [%s] 저장된 구조 %s 가 요청한 %s 와 다릅니다. 새로 만듭니다.",
                              name, 저장된, 층설명());
                     outSizes = heads.dup;
                     actionLists = actions.dup; cosModes = cos.dup;
                     net = null; ready = false;
                 } else {
                     ready = true;
-                    writefln(" [%s] 이전 학습 데이터를 불러왔습니다.", name);
+                    알림(" [%s] 이전 학습 데이터를 불러왔습니다.", name);
                 }
             } catch (Exception e) {
-                writefln(" [%s] 불러오기 실패 (%s). 새로 시작합니다.", name, e.msg);
+                알림(" [%s] 불러오기 실패 (%s). 새로 시작합니다.", name, e.msg);
                 ready = false;
             }
         }
         if (!ready) {
             net = new Network(inputSz, layKind, layA, layB, outSizes);
-            writefln(" [%s] 새로 생성되었습니다. %s->%s", name, 층설명(), outSizes);
+            알림(" [%s] 새로 생성되었습니다. %s->%s", name, 층설명(), outSizes);
             ready = true;
         }
         // GPU 가 가중치를 장치에 남겨두고 갈 수 있으므로, 신경망을 읽는 입구마다
@@ -2139,11 +2161,11 @@ void resset(string modelName) {
     foreach (suffix; ["_ml_memory.pth", "_sl_memory.pth", "_auto_memory.pth"]) {
         string path = modelName ~ suffix;
         if (exists(path)) {
-            try { remove(path); writefln(" [%s] 초기화: %s", modelName, path); deleted = true; }
-            catch (Exception e) { writefln("오류: %s 삭제 실패 (%s)", path, e.msg); }
+            try { remove(path); 알림(" [%s] 초기화: %s", modelName, path); deleted = true; }
+            catch (Exception e) { 알림("오류: %s 삭제 실패 (%s)", path, e.msg); }
         }
     }
-    if (!deleted) writefln(" [%s] 모델 파일이 존재하지 않습니다.", modelName);
+    if (!deleted) 알림(" [%s] 모델 파일이 존재하지 않습니다.", modelName);
 }
 
 private bool isTorchFile(string path) nothrow {
@@ -2325,7 +2347,28 @@ PyObject* toPyList(string[] strs) {
 
 extern(C) void bbai_dtor(PyObject* cap) nothrow @trusted {
     auto ai = cast(BlackBoxAI) PyCapsule_GetPointer(cap, "BlackBoxAI");
-    if (ai) try { GC.removeRoot(cast(void*) ai); } catch (Throwable) {}
+    if (ai) try {
+        ai.releaseGpu();               // 루트를 떼기 전에 — 아직 살아있을 때 놓아준다
+        GC.removeRoot(cast(void*) ai);
+    } catch (Throwable) {}
+}
+
+// 예외를 파이썬 쪽으로 넘길 때 실제 내용을 담는다.
+//
+// 예전엔 전부 "my_ml: exception in _ml_xxx" 한 줄로만 보고해서, 무슨 일이
+// 일어났는지 알 방법이 아예 없었다 (재현 안 되는 실패를 만났을 때 정확히 이것
+// 때문에 아무것도 알아내지 못했다). 클래스 이름은 항상 붙인다 —
+// OutOfMemoryError 처럼 msg 가 비어있는 Error 도 이름만으로 구분이 된다.
+private void setPyError(string where, Throwable t) nothrow {
+    try {
+        string m = where ~ ": " ~ typeid(t).name;
+        if (t.msg.length) m ~= " — " ~ t.msg;
+        PyErr_SetString(_pyRuntimeError, toStringz(m));
+    } catch (Throwable) {
+        // 메모리 부족을 처리하는 중이면 위 할당도 실패할 수 있다. 리터럴은
+        // 널 종료라 할당 없이 그대로 넘길 수 있다.
+        PyErr_SetString(_pyRuntimeError, "my_ml: 예외 (내용을 담지 못했습니다)");
+    }
 }
 
 extern(C) void jepa_dtor(PyObject* cap) nothrow @trusted {
@@ -2377,7 +2420,7 @@ PyObject* py_ml_make(PyObject* self, PyObject* args) {
                                  cast(float)sigma, cast(float)ent);
         GC.addRoot(cast(void*) ai);
         return PyCapsule_New(cast(void*) ai, "BlackBoxAI", &bbai_dtor);
-    } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _ml_make"); return null; }
+    } catch (Throwable t) { setPyError("my_ml: _ml_make", t); return null; }
 }
 
 // 헤드별 [선택인덱스, 실수값] 을 평탄한 리스트로 돌려준다: [i0,v0, i1,v1, ...]
@@ -2400,7 +2443,7 @@ PyObject* py_ml_pick(PyObject* self, PyObject* args) {
         auto value  = new float[ai.nHeads];
         ai.pickAll(pyLals(legal), pyFloatList(inp), chosen, value);
         return packPick(ai, chosen, value);
-    } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _ml_pick"); return null; }
+    } catch (Throwable t) { setPyError("my_ml: _ml_pick", t); return null; }
 }
 
 PyObject* py_ml_predict(PyObject* self, PyObject* args) {
@@ -2412,7 +2455,7 @@ PyObject* py_ml_predict(PyObject* self, PyObject* args) {
         auto value  = new float[ai.nHeads];
         ai.predictAll(pyLals(legal), pyFloatList(inp), chosen, value);
         return packPick(ai, chosen, value);
-    } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _ml_predict"); return null; }
+    } catch (Throwable t) { setPyError("my_ml: _ml_predict", t); return null; }
 }
 
 // 헤드 h 의 출력 전체를 벡터로 (vec 출력용). predict 는 한 칸짜리라 이걸 쓴다.
@@ -2428,7 +2471,7 @@ PyObject* py_ml_embed(PyObject* self, PyObject* args) {
         auto v = new float[ai.outSizes[h]];
         ai.embedOne(pyFloatList(inp), v, h);
         return toPyFloats(v);
-    } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _ml_embed"); return null; }
+    } catch (Throwable t) { setPyError("my_ml: _ml_embed", t); return null; }
 }
 
 // GPU 를 실제로 쓰고 있는지 확인용. "켜 뒀는데 사실 CPU 로 돌고 있었다" 를
@@ -2446,7 +2489,7 @@ PyObject* py_ml_gpu_info(PyObject* self, PyObject* args) {
         put("min_flops", PyLong_FromLong(_gpuMinFlops));
         put("min_batch", PyLong_FromLong(_gpuMinB));
         return d;
-    } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _ml_gpu_info"); return null; }
+    } catch (Throwable t) { setPyError("my_ml: _ml_gpu_info", t); return null; }
 }
 
 PyObject* py_jepa_make(PyObject* self, PyObject* args) {
@@ -2461,7 +2504,7 @@ PyObject* py_jepa_make(PyObject* self, PyObject* args) {
         return PyCapsule_New(cast(void*) j, "Jepa", &jepa_dtor);
     } catch (Exception e) {
         PyErr_SetString(_pyRuntimeError, toStringz("my_ml: " ~ e.msg)); return null;
-    } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _jepa_make"); return null; }
+    } catch (Throwable t) { setPyError("my_ml: _jepa_make", t); return null; }
 }
 
 PyObject* py_jepa_train(PyObject* self, PyObject* args) {
@@ -2474,7 +2517,7 @@ PyObject* py_jepa_train(PyObject* self, PyObject* args) {
         return PyFloat_FromDouble(loss);
     } catch (Exception e) {
         PyErr_SetString(_pyRuntimeError, toStringz("my_ml: " ~ e.msg)); return null;
-    } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _jepa_train"); return null; }
+    } catch (Throwable t) { setPyError("my_ml: _jepa_train", t); return null; }
 }
 
 PyObject* py_jepa_encode(PyObject* self, PyObject* args) {
@@ -2485,7 +2528,7 @@ PyObject* py_jepa_encode(PyObject* self, PyObject* args) {
         auto v = new float[j.D];
         j.encode(pyFloatList(inp), v);
         return toPyFloats(v);
-    } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _jepa_encode"); return null; }
+    } catch (Throwable t) { setPyError("my_ml: _jepa_encode", t); return null; }
 }
 
 PyObject* py_jepa_imagine(PyObject* self, PyObject* args) {
@@ -2497,7 +2540,7 @@ PyObject* py_jepa_imagine(PyObject* self, PyObject* args) {
         float[] a = (act is _pyNone) ? null : pyFloatList(act);
         j.imagine(pyFloatList(inp), a, v);
         return toPyFloats(v);
-    } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _jepa_imagine"); return null; }
+    } catch (Throwable t) { setPyError("my_ml: _jepa_imagine", t); return null; }
 }
 
 PyObject* py_jepa_save(PyObject* self, PyObject* args) {
@@ -2506,7 +2549,7 @@ PyObject* py_jepa_save(PyObject* self, PyObject* args) {
         if (!PyArg_ParseTuple(args, "O", &cap)) return null;
         (cast(Jepa) PyCapsule_GetPointer(cap, "Jepa")).save();
         Py_IncRef(_pyNone); return _pyNone;
-    } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _jepa_save"); return null; }
+    } catch (Throwable t) { setPyError("my_ml: _jepa_save", t); return null; }
 }
 
 PyObject* py_jepa_meta(PyObject* self, PyObject* args) {
@@ -2518,7 +2561,7 @@ PyObject* py_jepa_meta(PyObject* self, PyObject* args) {
         PyList_SetItem(lst, 0, PyLong_FromLong(j.D));
         PyList_SetItem(lst, 1, PyLong_FromLong(j.A));
         return lst;
-    } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _jepa_meta"); return null; }
+    } catch (Throwable t) { setPyError("my_ml: _jepa_meta", t); return null; }
 }
 
 // inputs[i], chosen[i][h], values[i][h], scores[i][h]  (score 가 NaN 이면 그 헤드는 제외)
@@ -2543,7 +2586,7 @@ PyObject* py_ml_learn(PyObject* self, PyObject* args) {
         // 디스크에 나간다 (측정: [64,256,256] 에서 14.4ms 중 9.7ms).
         ai.learnBatch(inputs, chosen, values, score);
         Py_IncRef(_pyNone); return _pyNone;
-    } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _ml_learn"); return null; }
+    } catch (Throwable t) { setPyError("my_ml: _ml_learn", t); return null; }
 }
 
 PyObject* py_ml_sl(PyObject* self, PyObject* args) {
@@ -2562,7 +2605,7 @@ PyObject* py_ml_sl(PyObject* self, PyObject* args) {
         ai.slBatch(input, lals, pyIntList(ansI), pyFloatList(ansV), use);
         ai.predictAll(lals, input, chosen, value);
         return packPick(ai, chosen, value);
-    } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _ml_sl"); return null; }
+    } catch (Throwable t) { setPyError("my_ml: _ml_sl", t); return null; }
 }
 
 // 여러 문제를 한 번에 넘긴다 (경계 넘나드는 비용을 줄이려는 것)
@@ -2588,7 +2631,7 @@ PyObject* py_ml_sl_many(PyObject* self, PyObject* args) {
         }
         ai.slMany(inputs, pyLals(legal), ai_, av_, us_);
         Py_IncRef(_pyNone); return _pyNone;
-    } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _ml_sl_many"); return null; }
+    } catch (Throwable t) { setPyError("my_ml: _ml_sl_many", t); return null; }
 }
 
 PyObject* py_ml_save(PyObject* self, PyObject* args) {
@@ -2597,7 +2640,7 @@ PyObject* py_ml_save(PyObject* self, PyObject* args) {
         if (!PyArg_ParseTuple(args, "O", &cap)) return null;
         (cast(BlackBoxAI) PyCapsule_GetPointer(cap, "BlackBoxAI")).save();
         Py_IncRef(_pyNone); return _pyNone;
-    } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _ml_save"); return null; }
+    } catch (Throwable t) { setPyError("my_ml: _ml_save", t); return null; }
 }
 
 PyObject* py_ml_change(PyObject* self, PyObject* args) {
@@ -2609,7 +2652,7 @@ PyObject* py_ml_change(PyObject* self, PyObject* args) {
         return PyUnicode_FromString(toStringz(r));
     } catch (Exception e) {
         PyErr_SetString(_pyRuntimeError, toStringz("my_ml: " ~ e.msg)); return null;
-    } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _ml_change"); return null; }
+    } catch (Throwable t) { setPyError("my_ml: _ml_change", t); return null; }
 }
 
 PyObject* py_ml_resset(PyObject* self, PyObject* args) {
@@ -2618,17 +2661,17 @@ PyObject* py_ml_resset(PyObject* self, PyObject* args) {
         if (!PyArg_ParseTuple(args, "O", &nm)) return null;
         resset(fromStringz(PyUnicode_AsUTF8(nm)).idup);
         Py_IncRef(_pyNone); return _pyNone;
-    } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _ml_resset"); return null; }
+    } catch (Throwable t) { setPyError("my_ml: _ml_resset", t); return null; }
 }
 
 PyObject* py_ml_gc_disable(PyObject* self, PyObject* args) {
     try { GC.disable(); Py_IncRef(_pyNone); return _pyNone; }
-    catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _ml_gc_disable"); return null; }
+    catch (Throwable t) { setPyError("my_ml: _ml_gc_disable", t); return null; }
 }
 
 PyObject* py_ml_gc_collect(PyObject* self, PyObject* args) {
     try { GC.enable(); GC.collect(); Py_IncRef(_pyNone); return _pyNone; }
-    catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _ml_gc_collect"); return null; }
+    catch (Throwable t) { setPyError("my_ml: _ml_gc_collect", t); return null; }
 }
 
 PyObject* py_ml_export_weights(PyObject* self, PyObject* args) {
@@ -2667,7 +2710,7 @@ PyObject* py_ml_export_weights(PyObject* self, PyObject* args) {
         auto isz = PyLong_FromLong(net.inputSz); PyDict_SetItemString(d, "input_size", isz); Py_DecRef(isz);
         auto opts = PyUnicode_FromString(toStringz(optToStr(ai.opt))); PyDict_SetItemString(d, "optimizer_name", opts); Py_DecRef(opts);
         return d;
-    } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _ml_export_weights"); return null; }
+    } catch (Throwable t) { setPyError("my_ml: _ml_export_weights", t); return null; }
 }
 
 PyObject* py_ml_get_meta(PyObject* self, PyObject* args) {
@@ -2685,7 +2728,7 @@ PyObject* py_ml_get_meta(PyObject* self, PyObject* args) {
         PyDict_SetItemString(d, "hidden_layers", hl); Py_DecRef(hl);
         auto opts = PyUnicode_FromString(toStringz(optToStr(ai.opt))); PyDict_SetItemString(d, "optimizer_name", opts); Py_DecRef(opts);
         return d;
-    } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _ml_get_meta"); return null; }
+    } catch (Throwable t) { setPyError("my_ml: _ml_get_meta", t); return null; }
 }
 
 // ─────────────────────────────────────────────
