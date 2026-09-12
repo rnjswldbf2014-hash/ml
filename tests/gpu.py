@@ -1,20 +1,20 @@
 """Guards on the OpenCL GPU path in gpu_cl.d / ml.d.
 
 The important one is the first: **the default configuration must not use the
-GPU.** The GPU kernels are a naive untiled matmul with uncoalesced global
-reads, and on the hardware this was measured on (AMD gfx1035 integrated) the
-GPU path runs 17-25x SLOWER than the CPU batched path. It also produces
-*correct* results, so a user who got silently routed onto it had no way to
-notice beyond wondering why training crawled. MYML_GPU used to default to
-"auto", which did exactly that once a batch crossed the FLOP threshold.
+GPU.** MYML_GPU used to default to "auto", and back when the kernels were an
+untiled matmul with uncoalesced reads that silently made training 17-25x
+slower once a batch crossed the FLOP threshold -- with correct results, so
+nobody could tell why it crawled.
 
-So: default off, opt in with MYML_GPU=1 (force) or MYML_GPU=auto (threshold).
-If the kernels are ever made competitive, flip the default back and delete
-this note -- but only with a benchmark to point at.
+The kernels are tiled now and land around parity with the 12-thread CPU path
+(slightly ahead only on the largest shapes measured). That is not enough of a
+win to justify switching users over by default on hardware nobody benchmarked,
+so it stays opt-in: MYML_GPU=1 (force) or MYML_GPU=auto (threshold). Flip the
+default only with a benchmark to point at.
 
-The second check is that when the GPU path *is* forced, it still computes the
-right thing (within float-reassociation tolerance), so the code does not rot
-while it is off by default.
+The rest checks that the GPU path still computes the right thing when it is
+asked for, so it does not rot while off by default -- including shapes that do
+not line up with the tile size, which is where tiled kernels usually break.
 
 Skips itself cleanly when no OpenCL GPU is present.
 
@@ -64,14 +64,15 @@ def build():
     print(r.stdout.strip())
 
 
-def run(mode, gpu, batch=BATCH):
+def run(mode, gpu, batch=BATCH, layers=None):
     env = {**os.environ}
     if gpu is None:
         env.pop("MYML_GPU", None)          # unset == whatever the library defaults to
     else:
         env["MYML_GPU"] = gpu
     proc = subprocess.run(
-        [sys.executable, CHILD, ",".join(map(str, LAYERS)), str(batch), mode, WORK],
+        [sys.executable, CHILD, ",".join(map(str, layers or LAYERS)), str(batch),
+         mode, WORK],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
         cwd=ROOT, env=env)
     out = {}
@@ -94,11 +95,11 @@ def floats(line):
     return [struct.unpack("<f", bytes.fromhex(h))[0] for h in line.split()[1:]]
 
 
-def snapshot():
+def snapshot(layers=None):
     for d in (SNAP, WORK):
         shutil.rmtree(d, ignore_errors=True)
         os.makedirs(d)
-    run("snapshot", "0")
+    run("snapshot", "0", layers=layers)
     files = [f for f in os.listdir(WORK) if f.endswith(".pth")]
     for f in files:
         shutil.copy(os.path.join(WORK, f), SNAP)
@@ -143,6 +144,30 @@ if ran:
     err = max(abs(x - y) / max(1.0, abs(x), abs(y)) for x, y in zip(a, b))
     check("GPU result matches the CPU result", err < TOLERANCE,
           f"max relative error {err:.2e} (tolerance {TOLERANCE})")
+
+# ── tile-boundary correctness ────────────────────────────────────────────
+# The matmul kernels tile the work 16x16 and round the launch up, relying on
+# in-kernel bounds checks plus zero-filled local tiles to stay correct when a
+# dimension is not a multiple of 16. Getting that wrong yields plausible-looking
+# but wrong numbers, and a suite that only ever uses round sizes never sees it.
+print("\n[tiles] sizes that do not divide evenly by the 16x16 tile")
+for layers, batch in [([17, 33, 19], 7),        # every dimension below one tile
+                      ([16, 16, 16], 16),       # exactly one tile
+                      ([100, 150, 70], 100),    # nothing aligned
+                      ([1, 32, 1], 65),         # single-element input and output
+                      ([255, 257, 33], 255),    # one off the tile boundary
+                      ([129, 16, 300], 17)]:
+    files = snapshot(layers)
+    restore(files)
+    c = run("probe", "0", batch, layers)
+    restore(files)
+    g = run("probe", "1", batch, layers)
+    if g.get("runs", 0) == 0:
+        check(f"{layers} x{batch}", False, "GPU path did not engage")
+        continue
+    a, b = floats(c["hex"]), floats(g["hex"])
+    err = max(abs(x - y) / max(1.0, abs(x), abs(y)) for x, y in zip(a, b))
+    check(f"{layers} x{batch}", err < TOLERANCE, f"relative error {err:.2e}")
 
 shutil.rmtree(SNAP, ignore_errors=True)
 shutil.rmtree(WORK, ignore_errors=True)

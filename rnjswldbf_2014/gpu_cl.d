@@ -94,21 +94,42 @@ private __gshared cl_context _ctx;
 private __gshared cl_command_queue _queue;
 private __gshared cl_device_id _device;
 private __gshared cl_program _prog;
-private __gshared cl_kernel _kLinearFwd, _kRelu, _kReluBwd, _kGradW, _kDInput, _kAdamStep;
+private __gshared cl_kernel _kLinearFwd, _kRelu, _kReluBwd, _kGradW, _kGradB, _kDInput, _kAdamStep;
 
 // ── 커널 소스 ────────────────────────────────────────────────────────────
 private enum string KERNEL_SRC = `
+// 세 개의 행렬곱 커널은 전부 같은 타일링 구조다. work-group 하나가 TS x TS 출력
+// 타일을 맡고, 줄어드는 축을 TS 씩 끊어 로컬 메모리로 올린 뒤 곱한다.
+//
+// 지켜야 하는 두 가지:
+//  ① 전역 메모리 읽기는 get_local_id(0) 이 "붙어있는" 축을 훑게 한다. 이게 어긋나면
+//     lane 마다 다른 캐시라인을 건드려서 대역폭이 수십분의 1로 떨어진다.
+//     (예전 커널이 정확히 이랬다 — 이론 성능의 0.2% 밖에 못 냈다.)
+//  ② 로컬 배열은 [TS][TS+1] 로 한 칸 패딩한다. TS 가 뱅크 수의 약수라 패딩 없이는
+//     열 방향 접근이 전부 같은 뱅크로 몰린다.
+#define TS 16
+
+// pre[c][j] = b[j] + sum_k w[j][k] * xs[c][k]
 __kernel void k_linear_forward(__global const float* w, __global const float* b,
                                 __global const float* xs, __global float* pre,
                                 int inSz, int outSz, int count) {
-    int j = get_global_id(0);
-    int c = get_global_id(1);
-    if (j >= outSz || c >= count) return;
-    __global const float* wj = w + (long)j * inSz;
-    __global const float* xc = xs + (long)c * inSz;
-    float acc = b[j];
-    for (int k = 0; k < inSz; k++) acc += wj[k] * xc[k];
-    pre[(long)c * outSz + j] = acc;
+    int lj = get_local_id(0), lc = get_local_id(1);
+    int j0 = get_group_id(0) * TS, c0 = get_group_id(1) * TS;
+    int j = j0 + lj, c = c0 + lc;
+
+    __local float Ax[TS][TS+1];   // Ax[a][b] = xs[c0+a][k0+b]
+    __local float Bw[TS][TS+1];   // Bw[a][b] =  w[j0+a][k0+b]
+
+    float acc = 0.0f;
+    for (int k0 = 0; k0 < inSz; k0 += TS) {
+        int k = k0 + lj;                                  // lj 가 k 를 훑는다 -> 병합
+        Ax[lc][lj] = (c < count   && k < inSz) ? xs[(long)c      * inSz + k] : 0.0f;
+        Bw[lc][lj] = (j0+lc < outSz && k < inSz) ? w[(long)(j0+lc) * inSz + k] : 0.0f;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int t = 0; t < TS; t++) acc += Ax[lc][t] * Bw[lj][t];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (c < count && j < outSz) pre[(long)c * outSz + j] = b[j] + acc;
 }
 
 // in-place 아님 — pre 는 backward 의 ReLU 도함수 마스킹에 그대로 남아있어야 한다.
@@ -127,35 +148,64 @@ __kernel void k_relu_backward(__global const float* pre, __global const float* d
     dZ[i] = pre[i] > 0.0f ? dOut[i] : 0.0f;
 }
 
+// gradW[j][k] += sum_c dZ[c][j] * xs[c][k]
+// 예전엔 work-item 을 outSz 개만 띄우고 그 안에서 c 와 k 를 전부 돌았다. 출력이
+// outSz*inSz 개인데 일꾼이 outSz 명이었던 셈이다.
 __kernel void k_linear_backward_gradW(__global const float* xs, __global const float* dZ,
-                                       __global float* gradW, __global float* gradB,
+                                       __global float* gradW,
                                        int inSz, int outSz, int count) {
+    int lk = get_local_id(0), lj = get_local_id(1);
+    int k0 = get_group_id(0) * TS, j0 = get_group_id(1) * TS;
+    int k = k0 + lk, j = j0 + lj;
+
+    __local float Ad[TS][TS+1];   // Ad[a][b] = dZ[c0+b][j0+a]   (j 가 앞)
+    __local float Bx[TS][TS+1];   // Bx[a][b] = xs[c0+a][k0+b]
+
+    float acc = 0.0f;
+    for (int c0 = 0; c0 < count; c0 += TS) {
+        int c = c0 + lj;
+        // dZ 는 [count][outSz] 라 j 가 붙어있다 -> lk 로 j 를 훑어야 병합된다
+        Ad[lk][lj] = (c < count && j0+lk < outSz) ? dZ[(long)c * outSz + j0+lk] : 0.0f;
+        Bx[lj][lk] = (c < count && k      < inSz) ? xs[(long)c * inSz  + k    ] : 0.0f;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int t = 0; t < TS; t++) acc += Ad[lj][t] * Bx[t][lk];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (j < outSz && k < inSz) gradW[(long)j * inSz + k] += acc;
+}
+
+// gradB[j] += sum_c dZ[c][j].  일이 outSz*count 뿐이라 타일링할 게 없다.
+__kernel void k_linear_backward_gradB(__global const float* dZ, __global float* gradB,
+                                       int outSz, int count) {
     int j = get_global_id(0);
     if (j >= outSz) return;
-    __global float* gj = gradW + (long)j * inSz;
     float gb = 0.0f;
-    for (int c = 0; c < count; c++) {
-        float d = dZ[(long)c * outSz + j];
-        if (d == 0.0f) continue;
-        __global const float* xc = xs + (long)c * inSz;
-        for (int k = 0; k < inSz; k++) gj[k] += d * xc[k];
-        gb += d;
-    }
+    for (int c = 0; c < count; c++) gb += dZ[(long)c * outSz + j];
     gradB[j] += gb;
 }
 
+// dIn[c][k] = sum_j dZ[c][j] * w[j][k]
+// dZ 도 w 도 줄어드는 축(j)이 각각 뒤/앞에 자연스럽게 놓여 있어 셋 중 제일 단순하다.
 __kernel void k_linear_backward_dInput(__global const float* w, __global const float* dZ,
                                         __global float* dIn, int inSz, int outSz, int count) {
-    int c = get_global_id(0);
-    if (c >= count) return;
-    __global float* o = dIn + (long)c * inSz;
-    for (int k = 0; k < inSz; k++) o[k] = 0.0f;
-    for (int j = 0; j < outSz; j++) {
-        float d = dZ[(long)c * outSz + j];
-        if (d == 0.0f) continue;
-        __global const float* wj = w + (long)j * inSz;
-        for (int k = 0; k < inSz; k++) o[k] += d * wj[k];
+    int lk = get_local_id(0), lc = get_local_id(1);
+    int k0 = get_group_id(0) * TS, c0 = get_group_id(1) * TS;
+    int k = k0 + lk, c = c0 + lc;
+
+    __local float Ad[TS][TS+1];   // Ad[a][b] = dZ[c0+a][j0+b]
+    __local float Bw[TS][TS+1];   // Bw[a][b] =  w[j0+a][k0+b]
+
+    float acc = 0.0f;
+    for (int j0 = 0; j0 < outSz; j0 += TS) {
+        int j = j0 + lk;
+        Ad[lc][lk] = (c < count   && j      < outSz) ? dZ[(long)c      * outSz + j] : 0.0f;
+        Bw[lc][lk] = (j0+lc < outSz && k    < inSz)  ?  w[(long)(j0+lc) * inSz  + k] : 0.0f;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int t = 0; t < TS; t++) acc += Ad[lc][t] * Bw[t][lk];
+        barrier(CLK_LOCAL_MEM_FENCE);
     }
+    // 예전 커널은 0으로 채운 뒤 누적했다 — 결국 대입과 같다.
+    if (c < count && k < inSz) dIn[(long)c * inSz + k] = acc;
 }
 
 // optKind: 0=adam 1=sgd 2=rmsprop 3=adagrad
@@ -259,6 +309,8 @@ bool ensureInit() nothrow {
         _kReluBwd = clCreateKernel(_prog, "k_relu_backward", &err);
         if (err != CL_SUCCESS) return false;
         _kGradW = clCreateKernel(_prog, "k_linear_backward_gradW", &err);
+        if (err != CL_SUCCESS) return false;
+        _kGradB = clCreateKernel(_prog, "k_linear_backward_gradB", &err);
         if (err != CL_SUCCESS) return false;
         _kDInput = clCreateKernel(_prog, "k_linear_backward_dInput", &err);
         if (err != CL_SUCCESS) return false;
@@ -366,6 +418,22 @@ private bool setArgs(cl_kernel k, void*[] args, size_t[] sizes) nothrow {
     return true;
 }
 
+// 타일링 커널 공통 실행. 커널 소스의 TS 와 반드시 같아야 한다 — work-group 이
+// TS x TS 라는 전제로 로컬 배열을 잡아놨기 때문에 어긋나면 조용히 틀린 값이 나온다.
+private enum int TS = 16;
+
+// 출력 (dim0 x dim1) 을 TS 배수로 올려서 띄운다. 남는 work-item 은 커널 안의
+// 범위 검사에서 걸러진다 (로컬 타일에는 0 이 들어가므로 합에 영향이 없다).
+private bool runTiled(cl_kernel k, int dim0, int dim1) nothrow {
+    try {
+        size_t[2] lws = [TS, TS];
+        size_t[2] gws = [cast(size_t)((dim0 + TS - 1) / TS) * TS,
+                          cast(size_t)((dim1 + TS - 1) / TS) * TS];
+        return clEnqueueNDRangeKernel(_queue, k, 2, null, gws.ptr, lws.ptr,
+                                      0, null, null) == CL_SUCCESS;
+    } catch (Throwable) { return false; }
+}
+
 bool linearForward(GpuBuf w, GpuBuf b, GpuBuf xs, GpuBuf pre, int inSz, int outSz, int count) nothrow {
     if (!available) return false;
     try {
@@ -375,10 +443,7 @@ bool linearForward(GpuBuf w, GpuBuf b, GpuBuf xs, GpuBuf pre, int inSz, int outS
         size_t[7] sizes = [(void*).sizeof,(void*).sizeof,(void*).sizeof,(void*).sizeof,
                             int.sizeof,int.sizeof,int.sizeof];
         if (!setArgs(_kLinearFwd, args[], sizes[])) return false;
-        size_t[2] gws = [cast(size_t) outSz, cast(size_t) count];
-        if (clEnqueueNDRangeKernel(_queue, _kLinearFwd, 2, null, gws.ptr, null, 0, null, null) != CL_SUCCESS)
-            return false;
-        return true;   // clFinish 안 한다 — 큐가 in-order 라 다음 작업이 알아서 뒤에 선다
+        return runTiled(_kLinearFwd, outSz, count);
     } catch (Throwable) { return false; }
 }
 
@@ -415,15 +480,21 @@ bool linearBackwardGradW(GpuBuf xs, GpuBuf dZ, GpuBuf gradW, GpuBuf gradB,
     if (!available) return false;
     try {
         auto xa=xs.handle; auto da=dZ.handle; auto gwa=gradW.handle; auto gba=gradB.handle;
-        void*[7] args = [cast(void*)&xa, cast(void*)&da, cast(void*)&gwa, cast(void*)&gba,
+        void*[6] args = [cast(void*)&xa, cast(void*)&da, cast(void*)&gwa,
                           cast(void*)&inSz, cast(void*)&outSz, cast(void*)&count];
-        size_t[7] sizes = [(void*).sizeof,(void*).sizeof,(void*).sizeof,(void*).sizeof,
+        size_t[6] sizes = [(void*).sizeof,(void*).sizeof,(void*).sizeof,
                             int.sizeof,int.sizeof,int.sizeof];
         if (!setArgs(_kGradW, args[], sizes[])) return false;
+        if (!runTiled(_kGradW, inSz, outSz)) return false;
+
+        // gradB 는 따로 — 일이 outSz*count 뿐이라 타일링할 게 없다
+        void*[4] bargs = [cast(void*)&da, cast(void*)&gba,
+                           cast(void*)&outSz, cast(void*)&count];
+        size_t[4] bsizes = [(void*).sizeof,(void*).sizeof,int.sizeof,int.sizeof];
+        if (!setArgs(_kGradB, bargs[], bsizes[])) return false;
         size_t gws = cast(size_t) outSz;
-        if (clEnqueueNDRangeKernel(_queue, _kGradW, 1, null, &gws, null, 0, null, null) != CL_SUCCESS)
-            return false;
-        return true;   // clFinish 안 한다 — 큐가 in-order 라 다음 작업이 알아서 뒤에 선다
+        return clEnqueueNDRangeKernel(_queue, _kGradB, 1, null, &gws, null,
+                                      0, null, null) == CL_SUCCESS;
     } catch (Throwable) { return false; }
 }
 
@@ -436,10 +507,7 @@ bool linearBackwardDInput(GpuBuf w, GpuBuf dZ, GpuBuf dIn, int inSz, int outSz, 
         size_t[6] sizes = [(void*).sizeof,(void*).sizeof,(void*).sizeof,
                             int.sizeof,int.sizeof,int.sizeof];
         if (!setArgs(_kDInput, args[], sizes[])) return false;
-        size_t gws = cast(size_t) count;
-        if (clEnqueueNDRangeKernel(_queue, _kDInput, 1, null, &gws, null, 0, null, null) != CL_SUCCESS)
-            return false;
-        return true;   // clFinish 안 한다 — 큐가 in-order 라 다음 작업이 알아서 뒤에 선다
+        return runTiled(_kDInput, inSz, count);
     } catch (Throwable) { return false; }
 }
 
