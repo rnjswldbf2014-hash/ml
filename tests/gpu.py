@@ -203,10 +203,12 @@ def sync_run(seq, gpu, start=None):
     if not os.path.exists(path):
         print(proc.stdout); print(proc.stderr)
         raise SystemExit("sync child produced no weight file")
-    runs = 0
+    runs, probe = 0, None
     for ln in (proc.stdout or "").splitlines():
         if ln.startswith("RUNS "):
             runs = int(ln[5:])
+        elif ln.startswith("PROBE "):
+            probe = floats(ln)
     with open(path, "rb") as f:
         blob = f.read()
     # header: magic, ver, opt, inputSz, nLay, nLay*(kind,a,b), nHeads,
@@ -214,7 +216,7 @@ def sync_run(seq, gpu, start=None):
     nlay = len(SYNC_LAYERS) - 1
     head = 4 * 5 + nlay * 12 + 4 + 12
     vals = struct.unpack(f"<{(len(blob) - head) // 4}f", blob[head:head + ((len(blob) - head) // 4) * 4])
-    return vals, runs
+    return vals, runs, probe
 
 
 # Start from a model that already has a few CPU steps on it, not a fresh one.
@@ -225,7 +227,7 @@ def sync_run(seq, gpu, start=None):
 # from-scratch comparison diverges for reasons that have nothing to do with
 # syncing. A few steps in, the second moment is non-zero and the two paths track
 # each other closely.
-_, _ = sync_run("ccc", "0")
+sync_run("ccc", "0")
 with open(os.path.join(WORK, SYNC_PTH), "rb") as f:
     SYNC_START = f.read()
 
@@ -244,14 +246,19 @@ def deviation(ref, got):
 
 
 for seq in ["gggg", "ggcc", "gcgcgc", "cggc"]:
-    ref, _ = sync_run(seq, "0", SYNC_START)
-    got, runs = sync_run(seq, "auto", SYNC_START)
+    ref, _, refp = sync_run(seq, "0", SYNC_START)
+    got, runs, gotp = sync_run(seq, "auto", SYNC_START)
     if runs == 0:
         check(f"sequence {seq}", False, "no GPU steps actually ran")
         continue
     dev = deviation(ref, got)
-    check(f"sequence {seq} ({runs} GPU steps)", dev < 0.05,
+    check(f"saved weights after {seq} ({runs} GPU steps)", dev < 0.05,
           f"largest disagreement vs CPU-only, over array RMS: {dev:.2e}")
+    # predict() is probed before save(). Weights now stay on the device between
+    # GPU calls, so a missing sync on the forward path answers from the stale
+    # host copy -- and save() would paper over it by syncing on its own.
+    perr = max(abs(a - b) / max(1e-2, abs(a), abs(b)) for a, b in zip(refp, gotp))
+    check(f"predict() after {seq}", perr < 0.02, f"relative difference {perr:.2e}")
 
 shutil.rmtree(SNAP, ignore_errors=True)
 shutil.rmtree(WORK, ignore_errors=True)

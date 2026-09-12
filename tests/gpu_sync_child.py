@@ -15,6 +15,7 @@ argv: <workdir> <sequence>
 """
 import os
 import random
+import struct
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -36,6 +37,14 @@ for step in SEQ:
     X = [[rnd.gauss(0, 1) for _ in range(LAYERS[0])] for _ in range(b)]
     Y = [[rnd.gauss(0, 1)] for _ in range(b)]
     ai.sl(X, Y)
+
+# Probe BEFORE save(). With weights left on the device, a missing sync hook on
+# the forward path shows up here -- predict() would answer from the stale host
+# copy while the real weights sit on the GPU. save() would mask it, since it
+# syncs on its own.
+probe = [ai.predict([0.02 * i - 0.5 for i in range(LAYERS[0])])[0],
+         ai.predict([0.6 - 0.03 * i for i in range(LAYERS[0])])[0]]
+print("PROBE " + " ".join(struct.pack("<f", float(v)).hex() for v in probe))
 
 ai.save()
 print("RUNS %d" % ml.gpu_info()["runs"])

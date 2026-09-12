@@ -929,6 +929,16 @@ private class Network {
     float[]   _dA, _dB, _dC;
     bool      fwdCached;
 
+    // GPU 학습 경로가 가중치를 장치에 남겨두고 갈 수 있다. 그 뒤로 호스트 쪽
+    // w/b/m/v 는 낡은 값이므로, 그것들을 만지기 전에 반드시 회수해야 한다.
+    //
+    // 호출처마다 "여기서 회수" 를 적어두는 방식은 하나만 빠뜨려도 조용히 틀린 답이
+    // 나온다. 그래서 여기(가중치를 읽는 입구 전부)에 훅을 두고 BlackBoxAI 가 꽂는다
+    // — 새 경로를 나중에 추가해도 forward/backward/step 중 하나는 반드시 지나가므로
+    // 저절로 덮인다. 직접 필드를 훑는 save()/export_weights 만 따로 불러준다.
+    void delegate() gpuSync;
+    private void _sync() { if (gpuSync !is null) gpuSync(); }
+
     int layerCount() const nothrow @nogc { return cast(int) kinds.length; }
 
     // specKind[i]: 0=Linear(specA=출력폭), 1=Attn(specA=조각수, specB=헤드수)
@@ -993,6 +1003,7 @@ private class Network {
     }
 
     void forward(const(float)[] x) {
+        _sync();
         int n = layerCount;
         if (n == 0) {
             foreach (k; 0..x.length) _hout[k] = x[k];
@@ -1027,6 +1038,7 @@ private class Network {
     }
 
     void backward() {
+        _sync();
         int houtSz = cast(int)_hout.length;
         _dA[0..houtSz] = 0f;
         foreach (i, ref head; heads) {
@@ -1088,6 +1100,7 @@ private class Network {
 
     // X: B 개 입력 (각 inputSz). 헤드 출력은 _bHd 에.
     void forwardBatch(float[][] X, int B) {
+        _sync();
         int n = layerCount;
         int houtSz = n > 0 ? _outSz[n-1] : inputSz;
         if (n == 0) {
@@ -1133,6 +1146,7 @@ private class Network {
     // dInput != null 이면 입력에 대한 기울기도 거기에 낸다 ([B*inputSz]) — jepa 처럼
     // 앞 신경망으로 기울기를 계속 흘려보내야 할 때 쓴다. 평소(null)엔 버린다.
     void backwardBatch(int B, float[] dInput = null) {
+        _sync();
         int n = layerCount;
         int houtSz = n > 0 ? _outSz[n-1] : inputSz;
         _bDHout[0 .. B*houtSz] = 0f;
@@ -1194,7 +1208,9 @@ private class Network {
         foreach (ref h; heads) h.zeroGrad();
     }
 
+    // nothrow 를 지키려고 여기서만 try 로 감싼다 (훅은 GPU 다운로드를 한다).
     void step(Opt opt, float lr) nothrow {
+        try { _sync(); } catch (Throwable) {}
         foreach (ref h; lins)  h.step(opt, lr);
         foreach (ref a; attns) a.step(opt, lr);
         foreach (ref e; eachs) e.step(opt, lr);
@@ -1289,36 +1305,35 @@ class BlackBoxAI {
     private float[]       _gpuFlat;      // 가중치 평탄화용 (층 중 제일 큰 것 기준)
     private float[]       _gpuHeadBuf;   // 헤드 출력/기울기용 [B]
 
-    // 옵티마이저 상태(m, v)의 최신본이 GPU 에 있는가. GPU 로 연속 학습할 때 이걸
-    // 매번 내렸다 올리는 게 제일 큰 낭비라 GPU 에 남겨둔다.
-    //
-    // 가중치(w, b)는 매번 내린다 — 호스트가 순전파에서 바로 읽기 때문이다.
-    // m, v 를 읽는 곳은 CPU 쪽 step() 과 save() 뿐이라 동기화 지점이 셋뿐이고,
-    // 하나 빠뜨려도 "관성이 옛날 값" 이지 "예측이 틀림" 은 아니다. 가중치까지
-    // 상주시키면 빠뜨렸을 때 조용히 틀린 답이 나오므로 거기까지는 안 간다.
-    private bool _gpuOptOnGpu = false;
+    // 가중치와 옵티마이저 상태의 최신본이 GPU 에 있는가. GPU 로 연달아 학습할 때
+    // 이걸 매 호출 내렸다 올리는 것이 남아있던 고정비의 대부분이었다.
+    // 호스트가 만지려 할 때만 회수한다 — 그 시점을 Network 의 훅이 잡아준다.
+    private bool _gpuResident = false;
+    private bool _gpuSyncing  = false;   // 회수 도중 훅이 다시 불리는 것 방지
 
-    // 호스트가 m, v 를 읽기 전에 부른다. GPU 에 최신본이 있으면 내려받는다.
-    private void _gpuSyncOpt() {
-        if (!_gpuOptOnGpu) return;
-        _gpuOptOnGpu = false;      // 실패하더라도 두 번 시도하지 않는다
+    // 신경망을 거치지 않고 가중치를 직접 훑는 쪽(export_weights)이 부른다.
+    void syncFromGpu() { _gpuSyncBack(); }
+
+    // GPU 에 남아있는 w, b, m, v 를 호스트로 회수한다. Network._sync 가 부른다.
+    private void _gpuSyncBack() {
+        if (!_gpuResident || _gpuSyncing) return;
+        _gpuSyncing = true;
+        _gpuResident = false;      // 실패하더라도 두 번 시도하지 않는다
+        scope(exit) _gpuSyncing = false;
         foreach (ref gl; _gpuLayers) {
             auto L = gl.host;
             if (L is null) continue;
             size_t wn = cast(size_t) gl.outSz * gl.inSz;
             auto flat = _gpuFlat[0 .. wn];
+            if (!gpucl.download(gl.w, flat)) return;
+            foreach (j; 0..gl.outSz) foreach (k; 0..gl.inSz) L.w[j][k] = flat[j*gl.inSz+k];
             if (!gpucl.download(gl.mW, flat)) return;
             foreach (j; 0..gl.outSz) foreach (k; 0..gl.inSz) L.mW[j][k] = flat[j*gl.inSz+k];
             if (!gpucl.download(gl.vW, flat)) return;
             foreach (j; 0..gl.outSz) foreach (k; 0..gl.inSz) L.vW[j][k] = flat[j*gl.inSz+k];
-            if (!gpucl.download(gl.mB, L.mB) || !gpucl.download(gl.vB, L.vB)) return;
+            if (!gpucl.download(gl.b, L.b) || !gpucl.download(gl.mB, L.mB) ||
+                !gpucl.download(gl.vB, L.vB)) return;
         }
-    }
-
-    // CPU 쪽 갱신. step() 이 m, v 를 읽고 쓰므로 반드시 먼저 내려받아야 한다.
-    private void _stepCPU() {
-        _gpuSyncOpt();
-        net.step(opt, lr);
     }
 
     int nHeads() const nothrow @nogc { return cast(int) outSizes.length; }
@@ -1380,6 +1395,9 @@ class BlackBoxAI {
             writefln(" [%s] 새로 생성되었습니다. %s->%s", name, 층설명(), outSizes);
             ready = true;
         }
+        // GPU 가 가중치를 장치에 남겨두고 갈 수 있으므로, 신경망을 읽는 입구마다
+        // 회수가 걸리도록 훅을 꽂는다. net 이 바뀌면(load 포함) 다시 꽂아야 한다.
+        net.gpuSync = &_gpuSyncBack;
         _allocBufs();
     }
 
@@ -1517,7 +1535,7 @@ class BlackBoxAI {
                 }
             }
             net.backwardBatch(B);
-            _stepCPU();
+            net.step(opt, lr);
             return;
         }
 
@@ -1557,7 +1575,7 @@ class BlackBoxAI {
             }
             net.backward();
         }
-        _stepCPU();
+        net.step(opt, lr);
     }
 
     // ── 지도학습 1스텝 (헤드별 정답; 이산은 인덱스, cos 는 목표값) ──
@@ -1589,7 +1607,7 @@ class BlackBoxAI {
             }
         }
         net.backward();
-        _stepCPU();
+        net.step(opt, lr);
     }
 
     // GPU 로 넘길 만한 크기인지 판단. 이 라이브러리는 배치=1 온라인 학습이 핵심
@@ -1627,7 +1645,7 @@ class BlackBoxAI {
 
         // 버퍼를 다시 잡기 전에 GPU 에 있던 옵티마이저 상태를 회수한다.
         // 안 그러면 지금까지의 관성이 통째로 사라진다.
-        _gpuSyncOpt();
+        _gpuSyncBack();
         foreach (ref gl; _gpuLayers) gl.free();
         gpucl.freeBuf(_gpuX);
         _gpuLayers = new GLayer[n + 1];
@@ -1694,23 +1712,23 @@ class BlackBoxAI {
 
         // 가중치·옵티마이저 상태를 올린다. 평탄화 버퍼 하나를 돌려쓴다 (채우고 바로
         // 올리고 다시 채운다) — 예전엔 배열 셋을 층마다 새로 잡았다.
+        //
+        // 이미 GPU 에 남아있으면(_gpuResident) 통째로 건너뛴다. 연달아 GPU 로
+        // 학습할 때 이 전송이 남아있던 고정비의 대부분이었다
+        // (측정: [1024,2048,2048] 에서 190ms 중 75ms).
         bool uploadLinear(ref GLayer gl, Linear* L) {
             gl.host = L;
+            if (_gpuResident) return true;
             size_t wn = cast(size_t) gl.outSz * gl.inSz;
             auto flat = _gpuFlat[0 .. wn];
             foreach (j; 0..gl.outSz) foreach (k; 0..gl.inSz) flat[j*gl.inSz+k] = L.w[j][k];
             if (!gpucl.upload(gl.w, flat)) return false;
-            // 옵티마이저 상태(m, v)는 GPU 에 남겨둔다. 호스트에서 누가 건드렸을 때만
-            // 다시 올린다 — 이게 GPU 경로에서 제일 큰 고정비였다 (측정: [1024,2048,2048]
-            // 에서 190ms 중 52ms).
-            if (!_gpuOptOnGpu) {
-                foreach (j; 0..gl.outSz) foreach (k; 0..gl.inSz) flat[j*gl.inSz+k] = L.mW[j][k];
-                if (!gpucl.upload(gl.mW, flat)) return false;
-                foreach (j; 0..gl.outSz) foreach (k; 0..gl.inSz) flat[j*gl.inSz+k] = L.vW[j][k];
-                if (!gpucl.upload(gl.vW, flat)) return false;
-                if (!gpucl.upload(gl.mB, L.mB) || !gpucl.upload(gl.vB, L.vB)) return false;
-            }
-            return gpucl.upload(gl.b, L.b);
+            foreach (j; 0..gl.outSz) foreach (k; 0..gl.inSz) flat[j*gl.inSz+k] = L.mW[j][k];
+            if (!gpucl.upload(gl.mW, flat)) return false;
+            foreach (j; 0..gl.outSz) foreach (k; 0..gl.inSz) flat[j*gl.inSz+k] = L.vW[j][k];
+            if (!gpucl.upload(gl.vW, flat)) return false;
+            return gpucl.upload(gl.b, L.b) && gpucl.upload(gl.mB, L.mB)
+                && gpucl.upload(gl.vB, L.vB);
         }
 
         // ── 은닉층 순전파 ──
@@ -1763,26 +1781,26 @@ class BlackBoxAI {
         }
 
         // ── Adam step (GPU 위에서) + 갱신된 가중치/옵티마이저 상태 다운로드 ──
+        // t 는 전부 성공한 뒤에 올린다. 중간에 실패하면 호출자가 CPU 경로로 다시
+        // 도는데, 그때 t 만 앞서 있으면 Adam 의 편향보정이 한 스텝 어긋난다.
+        // (가중치 쪽은 안전하다 — 실패하면 _gpuResident 를 안 세우므로 호스트 값이
+        //  그대로고, GPU 버퍼의 부분 갱신은 다음 업로드가 덮는다.)
         float bc1 = 1f, bc2 = 1f;
         foreach (ref gl; layers) {
             auto L = gl.host;
-            L.t++;
-            if (opt == Opt.adam) { bc1 = 1f - 0.9f^^L.t; bc2 = 1f - 0.999f^^L.t; }
+            int t1 = L.t + 1;
+            if (opt == Opt.adam) { bc1 = 1f - 0.9f^^t1; bc2 = 1f - 0.999f^^t1; }
             size_t wn = cast(size_t) gl.outSz * gl.inSz;
             if (!gpucl.adamStep(gl.w, gl.gradW, gl.mW, gl.vW, lr, bc1, bc2, cast(int) opt, cast(int) wn))
                 return false;
             if (!gpucl.adamStep(gl.b, gl.gradB, gl.mB, gl.vB, lr, bc1, bc2, cast(int) opt, gl.outSz))
                 return false;
 
-            // 내릴 때도 평탄화 버퍼 하나를 돌려쓴다 (내리고 바로 흩뿌리고 다시 내린다)
-            auto flat = _gpuFlat[0 .. wn];
-            if (!gpucl.download(gl.w, flat)) return false;
-            foreach (j; 0..gl.outSz) foreach (k; 0..gl.inSz) L.w[j][k] = flat[j*gl.inSz+k];
-            // m, v 는 안 내린다 — GPU 에 최신본이 있고, 호스트가 필요로 할 때
-            // (_gpuSyncOpt) 그때 내린다.
-            if (!gpucl.download(gl.b, L.b)) return false;
+            // 아무것도 안 내린다 — 최신본은 GPU 에 있고, 호스트가 만지려 할 때
+            // Network 의 훅이 _gpuSyncBack() 을 불러 그때 회수한다.
         }
-        _gpuOptOnGpu = true;   // 이제 m, v 의 최신본은 GPU 에 있다
+        foreach (ref gl; layers) gl.host.t++;   // 여기까지 왔을 때만 올린다
+        _gpuResident = true;   // 이제 w, b, m, v 의 최신본은 GPU 에 있다
         gpucl.runCount++;   // 여기까지 왔을 때만 센다 (중간 return false 는 CPU 폴백)
         return true;
     }
@@ -1825,7 +1843,7 @@ class BlackBoxAI {
                 }
             }
             net.backwardBatch(B);
-            _stepCPU();
+            net.step(opt, lr);
             return;
         }
 
@@ -1857,7 +1875,7 @@ class BlackBoxAI {
             net.backward();
         }
 
-        _stepCPU();
+        net.step(opt, lr);
     }
 
     // ── jepa 용 진입점 ────────────────────────────────────────────────
@@ -1890,7 +1908,7 @@ class BlackBoxAI {
 
     void save() {
         if (!ready) return;
-        _gpuSyncOpt();          // m, v 를 파일에 쓰므로 GPU 에 있는 최신본을 먼저 내린다
+        _gpuSyncBack();          // m, v 를 파일에 쓰므로 GPU 에 있는 최신본을 먼저 내린다
         auto f = File(file, "wb");
         void wu(uint v)  { f.rawWrite((&v)[0..1]); }
         void wf(float v) { f.rawWrite((&v)[0..1]); }
@@ -2098,8 +2116,8 @@ class Jepa {
         // 8) 모아둔 기울기로 한 번씩만 갱신
         // step() 이 옵티마이저 상태를 읽는다 — GPU 에 최신본이 있으면 먼저 내린다
         // (요약기가 전에 sl() 로 GPU 경로를 탔을 수 있다)
-        enc._gpuSyncOpt();  enc.net.step(enc.opt, enc.lr);
-        pred._gpuSyncOpt(); pred.net.step(pred.opt, pred.lr);
+        enc._gpuSyncBack();  enc.net.step(enc.opt, enc.lr);
+        pred._gpuSyncBack(); pred.net.step(pred.opt, pred.lr);
         return loss;
     }
 
@@ -2620,6 +2638,7 @@ PyObject* py_ml_export_weights(PyObject* self, PyObject* args) {
         auto ai = cast(BlackBoxAI) PyCapsule_GetPointer(cap, "BlackBoxAI");
         auto d  = PyDict_New();
         if (!ai || !ai.ready) return d;
+        ai.syncFromGpu();   // 가중치를 직접 훑는다 — Network 훅을 안 거치므로 직접 부른다
         auto net = ai.net;
         foreach (i, ref h; net.lins) {
             auto wflat = PyList_New(h.outSz * h.inSz); Py_ssize_t idx = 0;
