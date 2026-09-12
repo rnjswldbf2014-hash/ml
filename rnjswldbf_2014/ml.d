@@ -1246,6 +1246,19 @@ private int[] buildMask(string[] all, string[] legal) {
 // ─────────────────────────────────────────────
 private enum float GCLIP = 5.0f;   // cos 기울기 상한
 
+// GPU 학습 경로가 층 하나에 대해 들고 있는 버퍼들. 호출마다 새로 만들지 않고
+// BlackBoxAI 가 캐시한다 — clCreateBuffer 는 싸지 않고, 큰 망이면 호출당 수십 개다.
+private struct GLayer {
+    gpucl.GpuBuf w, b, gradW, gradB, mW, vW, mB, vB, pre, act, dZ, dIn;
+    int inSz, outSz;
+    Linear* host;
+
+    void free() nothrow {
+        foreach (ref buf; [&w,&b,&gradW,&gradB,&mW,&vW,&mB,&vB,&pre,&act,&dZ,&dIn])
+            gpucl.freeBuf(*buf);
+    }
+}
+
 class BlackBoxAI {
     string     name;
     string[][] actionLists;   // 헤드별 액션 이름 (cos 헤드는 빈 배열)
@@ -1266,6 +1279,47 @@ class BlackBoxAI {
     private float[]   _envBuf;
     private float[][] _probBufs;   // 헤드별 확률 스크래치
     private int[][]   _maskBufs;   // 헤드별 마스크 스크래치
+
+    // GPU 학습 경로 캐시 — 버퍼와 호스트 평탄화 배열을 호출 간에 재사용한다.
+    // 예전엔 호출마다 전부 새로 잡았는데, [512,1024,1024] 기준 GC 할당만 40MB 가
+    // 넘어서 호출당 30ms 가 그냥 나갔다 (전송 자체는 2ms 남짓이다).
+    private GLayer[]      _gpuLayers;
+    private gpucl.GpuBuf  _gpuX;
+    private int           _gpuCapB;      // 캐시된 버퍼가 감당하는 배치 크기
+    private float[]       _gpuFlat;      // 가중치 평탄화용 (층 중 제일 큰 것 기준)
+    private float[]       _gpuHeadBuf;   // 헤드 출력/기울기용 [B]
+
+    // 옵티마이저 상태(m, v)의 최신본이 GPU 에 있는가. GPU 로 연속 학습할 때 이걸
+    // 매번 내렸다 올리는 게 제일 큰 낭비라 GPU 에 남겨둔다.
+    //
+    // 가중치(w, b)는 매번 내린다 — 호스트가 순전파에서 바로 읽기 때문이다.
+    // m, v 를 읽는 곳은 CPU 쪽 step() 과 save() 뿐이라 동기화 지점이 셋뿐이고,
+    // 하나 빠뜨려도 "관성이 옛날 값" 이지 "예측이 틀림" 은 아니다. 가중치까지
+    // 상주시키면 빠뜨렸을 때 조용히 틀린 답이 나오므로 거기까지는 안 간다.
+    private bool _gpuOptOnGpu = false;
+
+    // 호스트가 m, v 를 읽기 전에 부른다. GPU 에 최신본이 있으면 내려받는다.
+    private void _gpuSyncOpt() {
+        if (!_gpuOptOnGpu) return;
+        _gpuOptOnGpu = false;      // 실패하더라도 두 번 시도하지 않는다
+        foreach (ref gl; _gpuLayers) {
+            auto L = gl.host;
+            if (L is null) continue;
+            size_t wn = cast(size_t) gl.outSz * gl.inSz;
+            auto flat = _gpuFlat[0 .. wn];
+            if (!gpucl.download(gl.mW, flat)) return;
+            foreach (j; 0..gl.outSz) foreach (k; 0..gl.inSz) L.mW[j][k] = flat[j*gl.inSz+k];
+            if (!gpucl.download(gl.vW, flat)) return;
+            foreach (j; 0..gl.outSz) foreach (k; 0..gl.inSz) L.vW[j][k] = flat[j*gl.inSz+k];
+            if (!gpucl.download(gl.mB, L.mB) || !gpucl.download(gl.vB, L.vB)) return;
+        }
+    }
+
+    // CPU 쪽 갱신. step() 이 m, v 를 읽고 쓰므로 반드시 먼저 내려받아야 한다.
+    private void _stepCPU() {
+        _gpuSyncOpt();
+        net.step(opt, lr);
+    }
 
     int nHeads() const nothrow @nogc { return cast(int) outSizes.length; }
 
@@ -1463,7 +1517,7 @@ class BlackBoxAI {
                 }
             }
             net.backwardBatch(B);
-            net.step(opt, lr);
+            _stepCPU();
             return;
         }
 
@@ -1503,7 +1557,7 @@ class BlackBoxAI {
             }
             net.backward();
         }
-        net.step(opt, lr);
+        _stepCPU();
     }
 
     // ── 지도학습 1스텝 (헤드별 정답; 이산은 인덱스, cos 는 목표값) ──
@@ -1535,7 +1589,7 @@ class BlackBoxAI {
             }
         }
         net.backward();
-        net.step(opt, lr);
+        _stepCPU();
     }
 
     // GPU 로 넘길 만한 크기인지 판단. 이 라이브러리는 배치=1 온라인 학습이 핵심
@@ -1551,6 +1605,65 @@ class BlackBoxAI {
         foreach (i; 0..n) flops += 2L * net._inSz[i] * net._outSz[i];
         flops *= B;
         return flops >= _gpuMinFlops;
+    }
+
+    // GPU 버퍼와 호스트 평탄화 배열을 준비한다. 모양이 그대로면 아무것도 안 한다
+    // — 재사용이 요점이다 (호출마다 새로 잡으면 그 비용이 계산보다 크다).
+    // 배치가 줄어든 경우는 그냥 쓴다 (버퍼가 넉넉하니까). 커지면 다시 잡는다.
+    private bool _gpuEnsure(int n, int B) {
+        bool 그대로 = (_gpuLayers.length == n + 1) && (B <= _gpuCapB);
+        if (그대로) {
+            // 층 폭이 달라졌으면(모델이 바뀌었으면) 다시 잡아야 한다
+            int prev = net.inputSz;
+            foreach (i; 0..n) {
+                if (_gpuLayers[i].inSz != prev || _gpuLayers[i].outSz != net._outSz[i])
+                    { 그대로 = false; break; }
+                prev = net._outSz[i];
+            }
+            if (그대로 && (_gpuLayers[n].inSz != prev
+                          || _gpuLayers[n].outSz != net.heads[0].outSz)) 그대로 = false;
+        }
+        if (그대로) return true;
+
+        // 버퍼를 다시 잡기 전에 GPU 에 있던 옵티마이저 상태를 회수한다.
+        // 안 그러면 지금까지의 관성이 통째로 사라진다.
+        _gpuSyncOpt();
+        foreach (ref gl; _gpuLayers) gl.free();
+        gpucl.freeBuf(_gpuX);
+        _gpuLayers = new GLayer[n + 1];
+
+        int inputSz = net.inputSz;
+        _gpuX = gpucl.allocBuf(cast(size_t) B * inputSz);
+        if (!_gpuX.valid) return false;
+
+        size_t maxFlat = cast(size_t) B * inputSz;   // 입력 평탄화에도 같은 버퍼를 쓴다
+        int prev = inputSz;
+        foreach (i; 0..n + 1) {
+            auto gl = &_gpuLayers[i];
+            gl.inSz  = prev;
+            gl.outSz = (i < n) ? net._outSz[i] : net.heads[0].outSz;
+            size_t wsz = cast(size_t) gl.outSz * gl.inSz;
+            if (wsz > maxFlat) maxFlat = wsz;
+            gl.w  = gpucl.allocBuf(wsz);        gl.b  = gpucl.allocBuf(gl.outSz);
+            gl.gradW = gpucl.allocBuf(wsz);     gl.gradB = gpucl.allocBuf(gl.outSz);
+            gl.mW = gpucl.allocBuf(wsz);        gl.vW = gpucl.allocBuf(wsz);
+            gl.mB = gpucl.allocBuf(gl.outSz);   gl.vB = gpucl.allocBuf(gl.outSz);
+            gl.pre = gpucl.allocBuf(cast(size_t) B * gl.outSz);
+            gl.dZ  = gpucl.allocBuf(cast(size_t) B * gl.outSz);
+            gl.dIn = gpucl.allocBuf(cast(size_t) B * gl.inSz);
+            // 헤드 뒤에는 ReLU 가 없어서 act 가 필요 없다
+            if (i < n) gl.act = gpucl.allocBuf(cast(size_t) B * gl.outSz);
+            if (!gl.w.valid||!gl.b.valid||!gl.gradW.valid||!gl.gradB.valid||!gl.mW.valid||
+                !gl.vW.valid||!gl.mB.valid||!gl.vB.valid||!gl.pre.valid||!gl.dZ.valid||
+                !gl.dIn.valid||(i < n && !gl.act.valid)) return false;
+            prev = gl.outSz;
+        }
+
+        _gpuFlat = new float[maxFlat];       _gpuFlat[] = 0f;
+        _gpuHeadBuf = new float[cast(size_t) B * net.heads[0].outSz];
+        _gpuHeadBuf[] = 0f;
+        _gpuCapB = B;
+        return true;
     }
 
     // GPU 배치 학습 경로 — v1 범위: 순수 Linear 망 + 헤드 1개 + cos(실수) 출력만
@@ -1570,66 +1683,45 @@ class BlackBoxAI {
         if (!gpucl.available()) return false;
 
         int inputSz = net.inputSz;
-        auto xFlat = new float[B*inputSz];
-        foreach (b; 0..B) foreach (k; 0..inputSz) xFlat[b*inputSz+k] = inputs[b][k];
+        if (!_gpuEnsure(n, B)) return false;
+        auto layers = _gpuLayers;
+        auto xBuf = _gpuX;
 
-        auto xBuf = gpucl.allocBuf(B*inputSz);
-        scope(exit) gpucl.freeBuf(xBuf);
-        if (!xBuf.valid || !gpucl.upload(xBuf, xFlat)) return false;
-
-        static struct GLayer {
-            gpucl.GpuBuf w, b, gradW, gradB, mW, vW, mB, vB, pre, act, dZ, dIn;
-            int inSz, outSz;
-            Linear* host;
-        }
-        auto layers = new GLayer[n + 1];  // 마지막 슬롯 = 헤드
-        scope(exit) foreach (ref gl; layers) {
-            foreach (ref buf; [&gl.w,&gl.b,&gl.gradW,&gl.gradB,&gl.mW,&gl.vW,&gl.mB,&gl.vB,
-                               &gl.pre,&gl.act,&gl.dZ,&gl.dIn])
-                gpucl.freeBuf(*buf);
-        }
+        foreach (b; 0..B) foreach (k; 0..inputSz) _gpuFlat[b*inputSz+k] = inputs[b][k];
+        if (!gpucl.upload(xBuf, _gpuFlat[0 .. B*inputSz])) return false;
 
         gpucl.GpuBuf curIn = xBuf; int curInSz = inputSz;
-        bool ok = true;
 
-        void uploadLinear(ref GLayer gl, Linear* L) {
+        // 가중치·옵티마이저 상태를 올린다. 평탄화 버퍼 하나를 돌려쓴다 (채우고 바로
+        // 올리고 다시 채운다) — 예전엔 배열 셋을 층마다 새로 잡았다.
+        bool uploadLinear(ref GLayer gl, Linear* L) {
             gl.host = L;
-            auto wFlat = new float[gl.outSz*gl.inSz];
-            auto mWFlat = new float[gl.outSz*gl.inSz];
-            auto vWFlat = new float[gl.outSz*gl.inSz];
-            foreach (j; 0..gl.outSz) foreach (k; 0..gl.inSz) {
-                wFlat[j*gl.inSz+k] = L.w[j][k];
-                mWFlat[j*gl.inSz+k] = L.mW[j][k];
-                vWFlat[j*gl.inSz+k] = L.vW[j][k];
+            size_t wn = cast(size_t) gl.outSz * gl.inSz;
+            auto flat = _gpuFlat[0 .. wn];
+            foreach (j; 0..gl.outSz) foreach (k; 0..gl.inSz) flat[j*gl.inSz+k] = L.w[j][k];
+            if (!gpucl.upload(gl.w, flat)) return false;
+            // 옵티마이저 상태(m, v)는 GPU 에 남겨둔다. 호스트에서 누가 건드렸을 때만
+            // 다시 올린다 — 이게 GPU 경로에서 제일 큰 고정비였다 (측정: [1024,2048,2048]
+            // 에서 190ms 중 52ms).
+            if (!_gpuOptOnGpu) {
+                foreach (j; 0..gl.outSz) foreach (k; 0..gl.inSz) flat[j*gl.inSz+k] = L.mW[j][k];
+                if (!gpucl.upload(gl.mW, flat)) return false;
+                foreach (j; 0..gl.outSz) foreach (k; 0..gl.inSz) flat[j*gl.inSz+k] = L.vW[j][k];
+                if (!gpucl.upload(gl.vW, flat)) return false;
+                if (!gpucl.upload(gl.mB, L.mB) || !gpucl.upload(gl.vB, L.vB)) return false;
             }
-            if (!gpucl.upload(gl.w, wFlat) || !gpucl.upload(gl.b, L.b) ||
-                !gpucl.upload(gl.mW, mWFlat) || !gpucl.upload(gl.vW, vWFlat) ||
-                !gpucl.upload(gl.mB, L.mB) || !gpucl.upload(gl.vB, L.vB))
-                ok = false;
+            return gpucl.upload(gl.b, L.b);
         }
 
         // ── 은닉층 순전파 ──
         foreach (i; 0..n) {
             auto L = &net.lins[net.slot[i]];
             auto gl = &layers[i];
-            gl.inSz = curInSz; gl.outSz = net._outSz[i];
             size_t wsz = cast(size_t) gl.outSz * gl.inSz;
-            gl.w = gpucl.allocBuf(wsz); gl.b = gpucl.allocBuf(gl.outSz);
-            gl.gradW = gpucl.allocBuf(wsz); gl.gradB = gpucl.allocBuf(gl.outSz);
-            gl.mW = gpucl.allocBuf(wsz); gl.vW = gpucl.allocBuf(wsz);
-            gl.mB = gpucl.allocBuf(gl.outSz); gl.vB = gpucl.allocBuf(gl.outSz);
-            gl.pre = gpucl.allocBuf(cast(size_t) B*gl.outSz);
-            gl.act = gpucl.allocBuf(cast(size_t) B*gl.outSz);
-            gl.dZ  = gpucl.allocBuf(cast(size_t) B*gl.outSz);
-            gl.dIn = gpucl.allocBuf(cast(size_t) B*gl.inSz);
-            if (!gl.w.valid||!gl.b.valid||!gl.gradW.valid||!gl.gradB.valid||!gl.mW.valid||
-                !gl.vW.valid||!gl.mB.valid||!gl.vB.valid||!gl.pre.valid||!gl.act.valid||
-                !gl.dZ.valid||!gl.dIn.valid) return false;
-            // gradW/gradB 는 커널이 "+=" 로 누적하므로 미리 0으로 채워야 한다
-            // (clCreateBuffer 의 초기 내용은 정의돼 있지 않다).
+            // gradW/gradB 는 커널이 "+=" 로 누적하므로 매 호출 0으로 되돌려야 한다
+            // (버퍼를 재사용하니 지난 호출의 값이 그대로 남아있다).
             if (!gpucl.zeroBuf(gl.gradW, wsz) || !gpucl.zeroBuf(gl.gradB, gl.outSz)) return false;
-            uploadLinear(*gl, L);
-            if (!ok) return false;
+            if (!uploadLinear(*gl, L)) return false;
             if (!gpucl.linearForward(gl.w, gl.b, curIn, gl.pre, gl.inSz, gl.outSz, B)) return false;
             if (!gpucl.relu(gl.pre, gl.act, B*gl.outSz)) return false;
             curIn = gl.act; curInSz = gl.outSz;
@@ -1638,31 +1730,18 @@ class BlackBoxAI {
         // ── 헤드 순전파 (ReLU 없음) ──
         auto head = &net.heads[0];
         auto hl = &layers[n];
-        hl.inSz = curInSz; hl.outSz = head.outSz;   // == 1 (cos)
         size_t hwsz = cast(size_t) hl.outSz * hl.inSz;
-        hl.w = gpucl.allocBuf(hwsz); hl.b = gpucl.allocBuf(hl.outSz);
-        hl.gradW = gpucl.allocBuf(hwsz); hl.gradB = gpucl.allocBuf(hl.outSz);
-        hl.mW = gpucl.allocBuf(hwsz); hl.vW = gpucl.allocBuf(hwsz);
-        hl.mB = gpucl.allocBuf(hl.outSz); hl.vB = gpucl.allocBuf(hl.outSz);
-        hl.pre = gpucl.allocBuf(cast(size_t) B*hl.outSz);
-        hl.dZ  = gpucl.allocBuf(cast(size_t) B*hl.outSz);
-        hl.dIn = gpucl.allocBuf(cast(size_t) B*hl.inSz);
-        if (!hl.w.valid||!hl.b.valid||!hl.gradW.valid||!hl.gradB.valid||!hl.mW.valid||
-            !hl.vW.valid||!hl.mB.valid||!hl.vB.valid||!hl.pre.valid||!hl.dZ.valid||!hl.dIn.valid)
-            return false;
         if (!gpucl.zeroBuf(hl.gradW, hwsz) || !gpucl.zeroBuf(hl.gradB, hl.outSz)) return false;
-        uploadLinear(*hl, head);
-        if (!ok) return false;
+        if (!uploadLinear(*hl, head)) return false;
         if (!gpucl.linearForward(hl.w, hl.b, curIn, hl.pre, hl.inSz, hl.outSz, B)) return false;
 
         // ── 손실 기울기 (cos: (예측-정답)/B) — 호스트에서 계산 (B개 스칼라라 저렴) ──
-        auto headOut = new float[B*hl.outSz];
-        if (!gpucl.download(hl.pre, headOut)) return false;
+        auto headBuf = _gpuHeadBuf[0 .. B*hl.outSz];
+        if (!gpucl.download(hl.pre, headBuf)) return false;
         immutable float inv = 1.0f / cast(float) B;
-        auto dHead = new float[B*hl.outSz];
         foreach (b; 0..B)
-            dHead[b] = use[b][0] ? (headOut[b] - ansVal[b][0]) * inv : 0f;
-        if (!gpucl.upload(hl.dZ, dHead)) return false;
+            headBuf[b] = use[b][0] ? (headBuf[b] - ansVal[b][0]) * inv : 0f;
+        if (!gpucl.upload(hl.dZ, headBuf)) return false;
 
         // ── 헤드 역전파 ──
         if (!gpucl.linearBackwardGradW(curIn, hl.dZ, hl.gradW, hl.gradB, hl.inSz, hl.outSz, B))
@@ -1695,16 +1774,15 @@ class BlackBoxAI {
             if (!gpucl.adamStep(gl.b, gl.gradB, gl.mB, gl.vB, lr, bc1, bc2, cast(int) opt, gl.outSz))
                 return false;
 
-            auto wFlat = new float[wn];
-            if (!gpucl.download(gl.w, wFlat) || !gpucl.download(gl.b, L.b)) return false;
-            foreach (j; 0..gl.outSz) foreach (k; 0..gl.inSz) L.w[j][k] = wFlat[j*gl.inSz+k];
-            auto mWFlat = new float[wn]; auto vWFlat = new float[wn];
-            if (!gpucl.download(gl.mW, mWFlat) || !gpucl.download(gl.vW, vWFlat) ||
-                !gpucl.download(gl.mB, L.mB) || !gpucl.download(gl.vB, L.vB)) return false;
-            foreach (j; 0..gl.outSz) foreach (k; 0..gl.inSz) {
-                L.mW[j][k] = mWFlat[j*gl.inSz+k]; L.vW[j][k] = vWFlat[j*gl.inSz+k];
-            }
+            // 내릴 때도 평탄화 버퍼 하나를 돌려쓴다 (내리고 바로 흩뿌리고 다시 내린다)
+            auto flat = _gpuFlat[0 .. wn];
+            if (!gpucl.download(gl.w, flat)) return false;
+            foreach (j; 0..gl.outSz) foreach (k; 0..gl.inSz) L.w[j][k] = flat[j*gl.inSz+k];
+            // m, v 는 안 내린다 — GPU 에 최신본이 있고, 호스트가 필요로 할 때
+            // (_gpuSyncOpt) 그때 내린다.
+            if (!gpucl.download(gl.b, L.b)) return false;
         }
+        _gpuOptOnGpu = true;   // 이제 m, v 의 최신본은 GPU 에 있다
         gpucl.runCount++;   // 여기까지 왔을 때만 센다 (중간 return false 는 CPU 폴백)
         return true;
     }
@@ -1747,7 +1825,7 @@ class BlackBoxAI {
                 }
             }
             net.backwardBatch(B);
-            net.step(opt, lr);
+            _stepCPU();
             return;
         }
 
@@ -1779,7 +1857,7 @@ class BlackBoxAI {
             net.backward();
         }
 
-        net.step(opt, lr);
+        _stepCPU();
     }
 
     // ── jepa 용 진입점 ────────────────────────────────────────────────
@@ -1812,6 +1890,7 @@ class BlackBoxAI {
 
     void save() {
         if (!ready) return;
+        _gpuSyncOpt();          // m, v 를 파일에 쓰므로 GPU 에 있는 최신본을 먼저 내린다
         auto f = File(file, "wb");
         void wu(uint v)  { f.rawWrite((&v)[0..1]); }
         void wf(float v) { f.rawWrite((&v)[0..1]); }
@@ -2017,8 +2096,10 @@ class Jepa {
         enc.embedBackward(_dSx[0..B*D], B, null);
 
         // 8) 모아둔 기울기로 한 번씩만 갱신
-        enc.net.step(enc.opt, enc.lr);
-        pred.net.step(pred.opt, pred.lr);
+        // step() 이 옵티마이저 상태를 읽는다 — GPU 에 최신본이 있으면 먼저 내린다
+        // (요약기가 전에 sl() 로 GPU 경로를 탔을 수 있다)
+        enc._gpuSyncOpt();  enc.net.step(enc.opt, enc.lr);
+        pred._gpuSyncOpt(); pred.net.step(pred.opt, pred.lr);
         return loss;
     }
 

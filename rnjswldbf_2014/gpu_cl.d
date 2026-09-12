@@ -94,42 +94,72 @@ private __gshared cl_context _ctx;
 private __gshared cl_command_queue _queue;
 private __gshared cl_device_id _device;
 private __gshared cl_program _prog;
-private __gshared cl_kernel _kLinearFwd, _kRelu, _kReluBwd, _kGradW, _kGradB, _kDInput, _kAdamStep;
+private __gshared cl_kernel _kLinearFwd, _kRelu, _kReluBwd, _kGradW, _kGradB, _kDInput,
+                             _kAdamStep, _kFillZero;
 
 // ── 커널 소스 ────────────────────────────────────────────────────────────
 private enum string KERNEL_SRC = `
-// 세 개의 행렬곱 커널은 전부 같은 타일링 구조다. work-group 하나가 TS x TS 출력
-// 타일을 맡고, 줄어드는 축을 TS 씩 끊어 로컬 메모리로 올린 뒤 곱한다.
+// 세 개의 행렬곱 커널은 전부 같은 구조다. work-group 하나가 TS x TS 출력 타일을
+// 맡고, 줄어드는 축을 TS 씩 끊어 로컬 메모리로 올린 뒤 곱한다. 다만 스레드를
+// TS x TS 개 띄우지 않고 TS x RTS 개만 띄워서, 스레드 하나가 WPT 개 출력을 맡는다
+// (레지스터 블로킹). 로컬 메모리에서 읽은 값 하나를 WPT 번 재사용하므로 로컬
+// 메모리 대역폭이 병목에서 빠진다.
 //
-// 지켜야 하는 두 가지:
+// 지켜야 하는 세 가지:
 //  ① 전역 메모리 읽기는 get_local_id(0) 이 "붙어있는" 축을 훑게 한다. 이게 어긋나면
 //     lane 마다 다른 캐시라인을 건드려서 대역폭이 수십분의 1로 떨어진다.
-//     (예전 커널이 정확히 이랬다 — 이론 성능의 0.2% 밖에 못 냈다.)
-//  ② 로컬 배열은 [TS][TS+1] 로 한 칸 패딩한다. TS 가 뱅크 수의 약수라 패딩 없이는
-//     열 방향 접근이 전부 같은 뱅크로 몰린다.
-#define TS 16
+//     (맨 처음 커널이 정확히 이랬다 — 이론 성능의 0.2% 밖에 못 냈다.)
+//     dZ 는 [count][outSz] 라 j 가, xs/w 는 k 가 붙어있다. 그래서 커널마다 어느
+//     인덱스를 lane 에 태우는지가 다르다 — 베껴 쓸 때 제일 틀리기 쉬운 부분.
+//  ② 로컬 배열은 [TS][TS+1] 로 한 칸 패딩한다. 패딩이 없으면 열 방향 접근이
+//     전부 같은 뱅크로 몰린다.
+//  ③ 누적 루프의 로컬 읽기 중 하나는 lane 간 broadcast, 다른 하나는 연속이어야
+//     한다. 둘 다 흩어지면 패딩을 해도 느리다.
+#define TS  32
+#define WPT 4
+#define RTS (TS/WPT)
 
-// pre[c][j] = b[j] + sum_k w[j][k] * xs[c][k]
-__kernel void k_linear_forward(__global const float* w, __global const float* b,
+// pre[c][j] = b[j] + sum_k wt[j][k] * xs[c][k]
+__kernel void k_linear_forward(__global const float* wt, __global const float* bs,
                                 __global const float* xs, __global float* pre,
                                 int inSz, int outSz, int count) {
-    int lj = get_local_id(0), lc = get_local_id(1);
+    int lj = get_local_id(0);          // 0..TS-1   -> j (출력에서 붙어있는 축)
+    int lc = get_local_id(1);          // 0..RTS-1  -> c (WPT 개를 맡는다)
     int j0 = get_group_id(0) * TS, c0 = get_group_id(1) * TS;
-    int j = j0 + lj, c = c0 + lc;
+    int j = j0 + lj;
 
     __local float Ax[TS][TS+1];   // Ax[a][b] = xs[c0+a][k0+b]
-    __local float Bw[TS][TS+1];   // Bw[a][b] =  w[j0+a][k0+b]
+    __local float Bw[TS][TS+1];   // Bw[a][b] = wt[j0+a][k0+b]
 
-    float acc = 0.0f;
+    float acc[WPT];
+    for (int q = 0; q < WPT; q++) acc[q] = 0.0f;
+
     for (int k0 = 0; k0 < inSz; k0 += TS) {
-        int k = k0 + lj;                                  // lj 가 k 를 훑는다 -> 병합
-        Ax[lc][lj] = (c < count   && k < inSz) ? xs[(long)c      * inSz + k] : 0.0f;
-        Bw[lc][lj] = (j0+lc < outSz && k < inSz) ? w[(long)(j0+lc) * inSz + k] : 0.0f;
+        int k = k0 + lj;                              // lj 가 k 를 훑는다 -> 병합
+        for (int q = 0; q < WPT; q++) {
+            int r = lc + q*RTS;
+            Ax[r][lj] = (c0+r < count && k < inSz) ? xs[(long)(c0+r) * inSz + k] : 0.0f;
+            Bw[r][lj] = (j0+r < outSz && k < inSz) ? wt[(long)(j0+r) * inSz + k] : 0.0f;
+        }
         barrier(CLK_LOCAL_MEM_FENCE);
-        for (int t = 0; t < TS; t++) acc += Ax[lc][t] * Bw[lj][t];
+        for (int t = 0; t < TS; t++) {
+            float bv = Bw[lj][t];                     // lane 마다 다름 (연속)
+            for (int q = 0; q < WPT; q++)
+                acc[q] += Ax[lc + q*RTS][t] * bv;     // lane 간 broadcast
+        }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
-    if (c < count && j < outSz) pre[(long)c * outSz + j] = b[j] + acc;
+    if (j >= outSz) return;
+    float bias = bs[j];
+    for (int q = 0; q < WPT; q++) {
+        int c = c0 + lc + q*RTS;
+        if (c < count) pre[(long)c * outSz + j] = bias + acc[q];
+    }
+}
+
+__kernel void k_fill_zero(__global float* dst, int n) {
+    int i = get_global_id(0);
+    if (i < n) dst[i] = 0.0f;
 }
 
 // in-place 아님 — pre 는 backward 의 ReLU 도함수 마스킹에 그대로 남아있어야 한다.
@@ -154,24 +184,40 @@ __kernel void k_relu_backward(__global const float* pre, __global const float* d
 __kernel void k_linear_backward_gradW(__global const float* xs, __global const float* dZ,
                                        __global float* gradW,
                                        int inSz, int outSz, int count) {
-    int lk = get_local_id(0), lj = get_local_id(1);
+    int lk = get_local_id(0);          // 0..TS-1   -> k (출력에서 붙어있는 축)
+    int lj = get_local_id(1);          // 0..RTS-1  -> j (WPT 개를 맡는다)
     int k0 = get_group_id(0) * TS, j0 = get_group_id(1) * TS;
-    int k = k0 + lk, j = j0 + lj;
+    int k = k0 + lk;
 
     __local float Ad[TS][TS+1];   // Ad[a][b] = dZ[c0+b][j0+a]   (j 가 앞)
     __local float Bx[TS][TS+1];   // Bx[a][b] = xs[c0+a][k0+b]
 
-    float acc = 0.0f;
+    float acc[WPT];
+    for (int q = 0; q < WPT; q++) acc[q] = 0.0f;
+
     for (int c0 = 0; c0 < count; c0 += TS) {
-        int c = c0 + lj;
-        // dZ 는 [count][outSz] 라 j 가 붙어있다 -> lk 로 j 를 훑어야 병합된다
-        Ad[lk][lj] = (c < count && j0+lk < outSz) ? dZ[(long)c * outSz + j0+lk] : 0.0f;
-        Bx[lj][lk] = (c < count && k      < inSz) ? xs[(long)c * inSz  + k    ] : 0.0f;
+        // 타일을 채울 때 lj 가 맡는 축은 c 다 (출력에서 맡는 j 와는 다른 축이다 —
+        // 두 축 모두 RTS 간격으로 TS 개를 덮으므로 식만 같아 보인다. 헷갈리기 쉬움).
+        for (int q = 0; q < WPT; q++) {
+            int cl = lj + q*RTS;                      // 타일 안에서의 c
+            int c  = c0 + cl;
+            // dZ 는 [count][outSz] 라 j 가 붙어있다 -> lk 로 j 를 훑어야 병합된다
+            Ad[lk][cl] = (c < count && j0+lk < outSz) ? dZ[(long)c * outSz + j0+lk] : 0.0f;
+            Bx[cl][lk] = (c < count && k      < inSz) ? xs[(long)c * inSz  + k    ] : 0.0f;
+        }
         barrier(CLK_LOCAL_MEM_FENCE);
-        for (int t = 0; t < TS; t++) acc += Ad[lj][t] * Bx[t][lk];
+        for (int t = 0; t < TS; t++) {               // t = 타일 안에서의 c
+            float bv = Bx[t][lk];                     // lane 마다 다름 (연속)
+            for (int q = 0; q < WPT; q++)
+                acc[q] += Ad[lj + q*RTS][t] * bv;     // lane 간 broadcast (여기선 j)
+        }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
-    if (j < outSz && k < inSz) gradW[(long)j * inSz + k] += acc;
+    if (k >= inSz) return;
+    for (int q = 0; q < WPT; q++) {
+        int j = j0 + lj + q*RTS;
+        if (j < outSz) gradW[(long)j * inSz + k] += acc[q];
+    }
 }
 
 // gradB[j] += sum_c dZ[c][j].  일이 outSz*count 뿐이라 타일링할 게 없다.
@@ -186,26 +232,40 @@ __kernel void k_linear_backward_gradB(__global const float* dZ, __global float* 
 
 // dIn[c][k] = sum_j dZ[c][j] * w[j][k]
 // dZ 도 w 도 줄어드는 축(j)이 각각 뒤/앞에 자연스럽게 놓여 있어 셋 중 제일 단순하다.
-__kernel void k_linear_backward_dInput(__global const float* w, __global const float* dZ,
+__kernel void k_linear_backward_dInput(__global const float* wt, __global const float* dZ,
                                         __global float* dIn, int inSz, int outSz, int count) {
-    int lk = get_local_id(0), lc = get_local_id(1);
+    int lk = get_local_id(0);          // 0..TS-1   -> k (출력에서 붙어있는 축)
+    int lc = get_local_id(1);          // 0..RTS-1  -> c (WPT 개를 맡는다)
     int k0 = get_group_id(0) * TS, c0 = get_group_id(1) * TS;
-    int k = k0 + lk, c = c0 + lc;
+    int k = k0 + lk;
 
     __local float Ad[TS][TS+1];   // Ad[a][b] = dZ[c0+a][j0+b]
-    __local float Bw[TS][TS+1];   // Bw[a][b] =  w[j0+a][k0+b]
+    __local float Bw[TS][TS+1];   // Bw[a][b] = wt[j0+a][k0+b]
 
-    float acc = 0.0f;
+    float acc[WPT];
+    for (int q = 0; q < WPT; q++) acc[q] = 0.0f;
+
     for (int j0 = 0; j0 < outSz; j0 += TS) {
-        int j = j0 + lk;
-        Ad[lc][lk] = (c < count   && j      < outSz) ? dZ[(long)c      * outSz + j] : 0.0f;
-        Bw[lc][lk] = (j0+lc < outSz && k    < inSz)  ?  w[(long)(j0+lc) * inSz  + k] : 0.0f;
+        int j = j0 + lk;                              // Ad 를 채울 땐 lk 가 j 를 훑는다
+        for (int q = 0; q < WPT; q++) {
+            int r = lc + q*RTS;                       // Ad 에선 c, Bw 에선 j
+            Ad[r][lk] = (c0+r < count && j    < outSz) ? dZ[(long)(c0+r) * outSz + j] : 0.0f;
+            Bw[r][lk] = (j0+r < outSz && k    < inSz)  ? wt[(long)(j0+r) * inSz  + k] : 0.0f;
+        }
         barrier(CLK_LOCAL_MEM_FENCE);
-        for (int t = 0; t < TS; t++) acc += Ad[lc][t] * Bw[t][lk];
+        for (int t = 0; t < TS; t++) {               // t = 타일 안에서의 j
+            float bv = Bw[t][lk];                     // lane 마다 다름 (연속)
+            for (int q = 0; q < WPT; q++)
+                acc[q] += Ad[lc + q*RTS][t] * bv;     // lane 간 broadcast
+        }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
     // 예전 커널은 0으로 채운 뒤 누적했다 — 결국 대입과 같다.
-    if (c < count && k < inSz) dIn[(long)c * inSz + k] = acc;
+    if (k >= inSz) return;
+    for (int q = 0; q < WPT; q++) {
+        int c = c0 + lc + q*RTS;
+        if (c < count) dIn[(long)c * inSz + k] = acc[q];
+    }
 }
 
 // optKind: 0=adam 1=sgd 2=rmsprop 3=adagrad
@@ -316,6 +376,8 @@ bool ensureInit() nothrow {
         if (err != CL_SUCCESS) return false;
         _kAdamStep = clCreateKernel(_prog, "k_adam_step", &err);
         if (err != CL_SUCCESS) return false;
+        _kFillZero = clCreateKernel(_prog, "k_fill_zero", &err);
+        if (err != CL_SUCCESS) return false;
 
         // 어느 장치를 잡았는지 기록해둔다 — GPU 가 실제로 쓰이고 있는지 밖에서
         // 확인할 방법이 없으면 "켜져 있다고 믿는데 사실은 CPU" 를 못 잡아낸다.
@@ -387,12 +449,20 @@ bool upload(GpuBuf b, const(float)[] src) nothrow {
 
 // OpenCL 은 clCreateBuffer 로 새로 만든 버퍼의 내용을 0으로 보장하지 않는다 —
 // gradW/gradB 처럼 커널이 "+=" 로 누적하는 버퍼는 반드시 먼저 이걸로 채워야 한다.
+//
+// GPU 에서 직접 채운다. 예전엔 호스트에 0 배열을 만들어 업로드했는데, 큰 층이면
+// 호출마다 수 MB 를 할당하고 전송하는 셈이라 그 자체가 병목이었다.
 bool zeroBuf(GpuBuf b, size_t nFloats) nothrow {
-    if (!b.valid) return false;
+    if (!b.valid || !available) return false;
     try {
-        auto zeros = new float[nFloats];
-        zeros[] = 0f;   // D 는 new float[] 를 NaN 으로 채운다 — 반드시 직접 0 을 넣어야 한다.
-        return upload(b, zeros);
+        int n = cast(int) nFloats;
+        auto da = b.handle;
+        void*[2] args = [cast(void*)&da, cast(void*)&n];
+        size_t[2] sizes = [(void*).sizeof, int.sizeof];
+        if (!setArgs(_kFillZero, args[], sizes[])) return false;
+        size_t gws = nFloats;
+        return clEnqueueNDRangeKernel(_queue, _kFillZero, 1, null, &gws, null,
+                                      0, null, null) == CL_SUCCESS;
     } catch (Throwable) { return false; }
 }
 
@@ -418,17 +488,22 @@ private bool setArgs(cl_kernel k, void*[] args, size_t[] sizes) nothrow {
     return true;
 }
 
-// 타일링 커널 공통 실행. 커널 소스의 TS 와 반드시 같아야 한다 — work-group 이
-// TS x TS 라는 전제로 로컬 배열을 잡아놨기 때문에 어긋나면 조용히 틀린 값이 나온다.
-private enum int TS = 16;
+// 타일링 커널 공통 실행. 이 세 값은 커널 소스의 TS/WPT/RTS 와 반드시 같아야 한다
+// — 로컬 배열 크기와 스레드 배치가 그 전제로 짜여 있어서, 어긋나면 오류도 없이
+// 조용히 틀린 값이 나온다.
+private enum int TS  = 32;
+private enum int WPT = 4;
+private enum int RTS = TS / WPT;
 
-// 출력 (dim0 x dim1) 을 TS 배수로 올려서 띄운다. 남는 work-item 은 커널 안의
-// 범위 검사에서 걸러진다 (로컬 타일에는 0 이 들어가므로 합에 영향이 없다).
+// 출력 타일은 TS x TS 지만 스레드는 TS x RTS 개만 띄운다 (스레드 하나가 WPT 개
+// 출력을 맡는다). 그래서 dim1 쪽 global size 는 타일 수 x RTS 다.
+// 남는 work-item 은 커널 안의 범위 검사에서 걸러지고, 로컬 타일의 빈 자리에는
+// 0 이 들어가므로 합에 영향이 없다.
 private bool runTiled(cl_kernel k, int dim0, int dim1) nothrow {
     try {
-        size_t[2] lws = [TS, TS];
+        size_t[2] lws = [TS, RTS];
         size_t[2] gws = [cast(size_t)((dim0 + TS - 1) / TS) * TS,
-                          cast(size_t)((dim1 + TS - 1) / TS) * TS];
+                          cast(size_t)((dim1 + TS - 1) / TS) * RTS];
         return clEnqueueNDRangeKernel(_queue, k, 2, null, gws.ptr, lws.ptr,
                                       0, null, null) == CL_SUCCESS;
     } catch (Throwable) { return false; }

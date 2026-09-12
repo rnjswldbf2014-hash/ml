@@ -169,6 +169,90 @@ for layers, batch in [([17, 33, 19], 7),        # every dimension below one tile
     err = max(abs(x - y) / max(1.0, abs(x), abs(y)) for x, y in zip(a, b))
     check(f"{layers} x{batch}", err < TOLERANCE, f"relative error {err:.2e}")
 
+# ── optimizer state left on the device ───────────────────────────────────
+# The GPU path keeps Adam's m/v on the device between calls and only pulls them
+# back when the host needs them (a CPU step(), or save()). That is worth ~30% of
+# the runtime, but a missed sync point strands stale m/v on the host with no
+# visible symptom until the weights are written out -- training keeps running
+# and keeps looking plausible. So compare a GPU run against a CPU-only run of
+# the same fixed sequence, including sequences that alternate between the two.
+print("\n[sync] Adam state survives GPU/CPU interleaving")
+SYNC_CHILD = os.path.join(TESTS, "gpu_sync_child.py")
+SYNC_LAYERS = [64, 128, 128]
+
+
+SYNC_PTH = "sy_ml_memory.pth"
+
+
+def sync_run(seq, gpu, start=None):
+    shutil.rmtree(WORK, ignore_errors=True)
+    os.makedirs(WORK)
+    # every run has to start from the same weights -- make() randomises a fresh
+    # model, so without this the two runs are simply different models
+    if start is not None:
+        with open(os.path.join(WORK, SYNC_PTH), "wb") as f:
+            f.write(start)
+    env = {**os.environ, "MYML_GPU": gpu,
+           # low enough that the big batch clears it, so batch size alone picks
+           # the route and one process can alternate
+           "MYML_GPU_MIN_FLOPS": "1000000", "MYML_GPU_MIN_B": "64"}
+    proc = subprocess.run([sys.executable, SYNC_CHILD, WORK, seq],
+                          capture_output=True, text=True, encoding="utf-8",
+                          errors="replace", cwd=ROOT, env=env)
+    path = os.path.join(WORK, SYNC_PTH)
+    if not os.path.exists(path):
+        print(proc.stdout); print(proc.stderr)
+        raise SystemExit("sync child produced no weight file")
+    runs = 0
+    for ln in (proc.stdout or "").splitlines():
+        if ln.startswith("RUNS "):
+            runs = int(ln[5:])
+    with open(path, "rb") as f:
+        blob = f.read()
+    # header: magic, ver, opt, inputSz, nLay, nLay*(kind,a,b), nHeads,
+    #         then per head (outSz, cos, nActions) -- a cos head carries no names
+    nlay = len(SYNC_LAYERS) - 1
+    head = 4 * 5 + nlay * 12 + 4 + 12
+    vals = struct.unpack(f"<{(len(blob) - head) // 4}f", blob[head:head + ((len(blob) - head) // 4) * 4])
+    return vals, runs
+
+
+# Start from a model that already has a few CPU steps on it, not a fresh one.
+# On Adam's very first step the second moment is still zero, so the update
+# degenerates to +/-lr per weight -- the magnitude of the gradient drops out and
+# only its sign matters. Any gradient that lands near zero then flips sign
+# between two float summation orders and the weight moves the opposite way, so a
+# from-scratch comparison diverges for reasons that have nothing to do with
+# syncing. A few steps in, the second moment is non-zero and the two paths track
+# each other closely.
+_, _ = sync_run("ccc", "0")
+with open(os.path.join(WORK, SYNC_PTH), "rb") as f:
+    SYNC_START = f.read()
+
+def deviation(ref, got):
+    """Largest disagreement, measured against the scale of the array.
+
+    Per-element relative error is the wrong tool here: weights and Adam's first
+    moment cross zero, so a value that lands near 0.0 produces a huge relative
+    error from pure rounding while meaning nothing. (Second moments never cross
+    zero and do stay within 1e-5 element-wise.) Scaling by the array's RMS keeps
+    the check sensitive to a whole block being stale -- which is what a missed
+    sync looks like -- without tripping on sign noise.
+    """
+    rms = (sum(x * x for x in ref) / max(1, len(ref))) ** 0.5
+    return max(abs(a - b) for a, b in zip(ref, got)) / max(rms, 1e-6)
+
+
+for seq in ["gggg", "ggcc", "gcgcgc", "cggc"]:
+    ref, _ = sync_run(seq, "0", SYNC_START)
+    got, runs = sync_run(seq, "auto", SYNC_START)
+    if runs == 0:
+        check(f"sequence {seq}", False, "no GPU steps actually ran")
+        continue
+    dev = deviation(ref, got)
+    check(f"sequence {seq} ({runs} GPU steps)", dev < 0.05,
+          f"largest disagreement vs CPU-only, over array RMS: {dev:.2e}")
+
 shutil.rmtree(SNAP, ignore_errors=True)
 shutil.rmtree(WORK, ignore_errors=True)
 print("\n" + ("ALL GPU CHECKS PASS" if ok else "GPU CHECKS FAILED"))
