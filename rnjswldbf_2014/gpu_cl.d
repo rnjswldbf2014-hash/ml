@@ -89,6 +89,7 @@ private __gshared FnReleaseContext clReleaseContext;
 // 다시 찾아보는 비용을 피한다).
 private __gshared bool _triedInit = false;
 private __gshared bool _available = false;
+private __gshared string _deviceName = "";
 private __gshared cl_context _ctx;
 private __gshared cl_command_queue _queue;
 private __gshared cl_device_id _device;
@@ -264,6 +265,19 @@ bool ensureInit() nothrow {
         _kAdamStep = clCreateKernel(_prog, "k_adam_step", &err);
         if (err != CL_SUCCESS) return false;
 
+        // 어느 장치를 잡았는지 기록해둔다 — GPU 가 실제로 쓰이고 있는지 밖에서
+        // 확인할 방법이 없으면 "켜져 있다고 믿는데 사실은 CPU" 를 못 잡아낸다.
+        try {
+            char[256] nameBuf;
+            size_t got;
+            if (clGetDeviceInfo(_device, CL_DEVICE_NAME, nameBuf.length,
+                                nameBuf.ptr, &got) == CL_SUCCESS && got > 0) {
+                if (got > nameBuf.length) got = nameBuf.length;
+                while (got > 0 && nameBuf[got-1] == '\0') got--;
+                _deviceName = nameBuf[0..got].idup;
+            }
+        } catch (Throwable) {}
+
         _available = true;
         return true;
     } catch (Throwable) {
@@ -275,6 +289,14 @@ bool ensureInit() nothrow {
 bool available() nothrow {
     return ensureInit();
 }
+
+// 잡은 GPU 이름. 아직 프로브 안 했거나 GPU 가 없으면 빈 문자열.
+string deviceName() nothrow {
+    return _deviceName;
+}
+
+// GPU 경로가 실제로 끝까지 돈 횟수. 중간에 실패해서 CPU 로 폴백한 건 안 센다.
+__gshared long runCount = 0;
 
 // ── 버퍼 래퍼 ────────────────────────────────────────────────────────────
 struct GpuBuf {
@@ -322,6 +344,13 @@ bool zeroBuf(GpuBuf b, size_t nFloats) nothrow {
     } catch (Throwable) { return false; }
 }
 
+// 큐에 쌓인 작업이 다 끝날 때까지 기다린다. 블로킹 download 가 이미 같은 일을
+// 하므로 보통은 쓸 일이 없다 — 커널 오류를 그 자리에서 보고 싶을 때만.
+bool finish() nothrow {
+    if (!available) return false;
+    try { return clFinish(_queue) == CL_SUCCESS; } catch (Throwable) { return false; }
+}
+
 bool download(GpuBuf b, float[] dst) nothrow {
     if (!b.valid) return false;
     try {
@@ -349,7 +378,7 @@ bool linearForward(GpuBuf w, GpuBuf b, GpuBuf xs, GpuBuf pre, int inSz, int outS
         size_t[2] gws = [cast(size_t) outSz, cast(size_t) count];
         if (clEnqueueNDRangeKernel(_queue, _kLinearFwd, 2, null, gws.ptr, null, 0, null, null) != CL_SUCCESS)
             return false;
-        return clFinish(_queue) == CL_SUCCESS;
+        return true;   // clFinish 안 한다 — 큐가 in-order 라 다음 작업이 알아서 뒤에 선다
     } catch (Throwable) { return false; }
 }
 
@@ -363,7 +392,7 @@ bool relu(GpuBuf pre, GpuBuf act, int n) nothrow {
         size_t gws = cast(size_t) n;
         if (clEnqueueNDRangeKernel(_queue, _kRelu, 1, null, &gws, null, 0, null, null) != CL_SUCCESS)
             return false;
-        return clFinish(_queue) == CL_SUCCESS;
+        return true;   // clFinish 안 한다 — 큐가 in-order 라 다음 작업이 알아서 뒤에 선다
     } catch (Throwable) { return false; }
 }
 
@@ -377,7 +406,7 @@ bool reluBackward(GpuBuf pre, GpuBuf dOut, GpuBuf dZ, int n) nothrow {
         size_t gws = cast(size_t) n;
         if (clEnqueueNDRangeKernel(_queue, _kReluBwd, 1, null, &gws, null, 0, null, null) != CL_SUCCESS)
             return false;
-        return clFinish(_queue) == CL_SUCCESS;
+        return true;   // clFinish 안 한다 — 큐가 in-order 라 다음 작업이 알아서 뒤에 선다
     } catch (Throwable) { return false; }
 }
 
@@ -394,7 +423,7 @@ bool linearBackwardGradW(GpuBuf xs, GpuBuf dZ, GpuBuf gradW, GpuBuf gradB,
         size_t gws = cast(size_t) outSz;
         if (clEnqueueNDRangeKernel(_queue, _kGradW, 1, null, &gws, null, 0, null, null) != CL_SUCCESS)
             return false;
-        return clFinish(_queue) == CL_SUCCESS;
+        return true;   // clFinish 안 한다 — 큐가 in-order 라 다음 작업이 알아서 뒤에 선다
     } catch (Throwable) { return false; }
 }
 
@@ -410,7 +439,7 @@ bool linearBackwardDInput(GpuBuf w, GpuBuf dZ, GpuBuf dIn, int inSz, int outSz, 
         size_t gws = cast(size_t) count;
         if (clEnqueueNDRangeKernel(_queue, _kDInput, 1, null, &gws, null, 0, null, null) != CL_SUCCESS)
             return false;
-        return clFinish(_queue) == CL_SUCCESS;
+        return true;   // clFinish 안 한다 — 큐가 in-order 라 다음 작업이 알아서 뒤에 선다
     } catch (Throwable) { return false; }
 }
 
@@ -428,6 +457,6 @@ bool adamStep(GpuBuf w, GpuBuf grad, GpuBuf m, GpuBuf v, float lr, float bc1, fl
         size_t gws = cast(size_t) n;
         if (clEnqueueNDRangeKernel(_queue, _kAdamStep, 1, null, &gws, null, 0, null, null) != CL_SUCCESS)
             return false;
-        return clFinish(_queue) == CL_SUCCESS;
+        return true;   // clFinish 안 한다 — 큐가 in-order 라 다음 작업이 알아서 뒤에 선다
     } catch (Throwable) { return false; }
 }

@@ -44,9 +44,15 @@ import gpucl;
 __gshared bool _noBatch = false;
 __gshared int  _nThreads = 1;
 // GPU 사용 여부: "0"=완전 비활성(OpenCL.dll 프로브도 안 함), "1"=강제(문턱값 무시),
-// 미설정="auto"(문턱값 넘는 큰 배치에서만 지연 프로브). 배치=1 온라인 경로는 절대
-// 안 건드린다 — GPU 디스패치 오버헤드가 이 라이브러리의 핵심 사용처보다 훨씬 크다.
-__gshared string _gpuMode = "auto";
+// "auto"=문턱값 넘는 큰 배치에서만 지연 프로브.
+//
+// 기본값은 "0" 이다. 지금 GPU 경로는 이 기계(AMD gfx1035 내장 GPU)에서 CPU 배치
+// 경로보다 17~25배 "느리다" — 커널이 타일링도 병합 접근도 없는 순진한 행렬곱이라
+// 이론 성능의 0.2% 밖에 못 낸다. 예전엔 기본이 "auto" 여서, OpenCL 이 깔린 기계에서
+// 묶음이 문턱값을 넘으면 사용자가 영문도 모르고 20배 느려졌다. 결과는 맞으므로
+// 알아챌 방법도 없었다. 어디서든 빠르다는 걸 보이기 전까지는 켜지 않는다.
+// 켜보려면 MYML_GPU=1 (강제) 또는 MYML_GPU=auto (문턱값).
+__gshared string _gpuMode = "0";
 __gshared long   _gpuMinFlops = 50_000_000;
 __gshared int    _gpuMinB = 64;
 shared static this() {
@@ -1699,6 +1705,7 @@ class BlackBoxAI {
                 L.mW[j][k] = mWFlat[j*gl.inSz+k]; L.vW[j][k] = vWFlat[j*gl.inSz+k];
             }
         }
+        gpucl.runCount++;   // 여기까지 왔을 때만 센다 (중간 return false 는 CPU 폴백)
         return true;
     }
 
@@ -2323,6 +2330,24 @@ PyObject* py_ml_embed(PyObject* self, PyObject* args) {
         ai.embedOne(pyFloatList(inp), v, h);
         return toPyFloats(v);
     } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _ml_embed"); return null; }
+}
+
+// GPU 를 실제로 쓰고 있는지 확인용. "켜 뒀는데 사실 CPU 로 돌고 있었다" 를
+// 알아챌 방법이 달리 없다.
+PyObject* py_ml_gpu_info(PyObject* self, PyObject* args) {
+    try {
+        auto d = PyDict_New();
+        void put(string k, PyObject* v) { PyDict_SetItemString(d, toStringz(k), v); Py_DecRef(v); }
+        // MYML_GPU=0 이면 프로브 자체를 하지 않는다 (완전 비활성 약속을 지킨다)
+        bool avail = (_gpuMode != "0") && gpucl.available();
+        put("available", PyLong_FromLong(avail ? 1 : 0));
+        put("device", PyUnicode_FromString(toStringz(avail ? gpucl.deviceName() : "")));
+        put("mode", PyUnicode_FromString(toStringz(_gpuMode)));
+        put("runs", PyLong_FromLong(cast(long) gpucl.runCount));
+        put("min_flops", PyLong_FromLong(_gpuMinFlops));
+        put("min_batch", PyLong_FromLong(_gpuMinB));
+        return d;
+    } catch (Throwable) { PyErr_SetString(_pyRuntimeError, "my_ml: exception in _ml_gpu_info"); return null; }
 }
 
 PyObject* py_jepa_make(PyObject* self, PyObject* args) {
@@ -3043,6 +3068,21 @@ def change(model_name):
     return True
 
 
+def gpu_info():
+    """GPU 를 실제로 쓰고 있는지 확인한다.
+
+        {'available': 1,            # OpenCL GPU 를 잡았나
+         'device': 'gfx1035',       # 잡은 장치 이름
+         'mode': 'auto',            # MYML_GPU 설정
+         'runs': 12,                # GPU 경로가 실제로 끝까지 돈 횟수
+         'min_flops': 50000000,     # auto 모드 문턱값
+         'min_batch': 64}
+
+    available 이 1이어도 runs 가 0이면 문턱값을 못 넘어 CPU 로만 돌았다는 뜻이다.
+    """
+    return _ml_gpu_info()
+
+
 def gc_disable(): _ml_gc_disable()
 def gc_collect(): _ml_gc_collect()
 def resset(model_name): _ml_resset(model_name)
@@ -3052,12 +3092,13 @@ builtins.resset     = resset
 builtins.change     = change
 builtins.gc_disable = gc_disable
 builtins.gc_collect = gc_collect
+builtins.gpu_info   = gpu_info
 `;
 
 // ─────────────────────────────────────────────
 // Module init
 // ─────────────────────────────────────────────
-private __gshared PyMethodDef[21] _methods;
+private __gshared PyMethodDef[22] _methods;
 private __gshared PyModuleDef     _moddef;
 
 extern(C) export PyObject* PyInit_ml() nothrow @trusted {
@@ -3082,7 +3123,8 @@ extern(C) export PyObject* PyInit_ml() nothrow @trusted {
         _methods[17] = PyMethodDef("_jepa_imagine",      &py_jepa_imagine,       METH_VARARGS, null);
         _methods[18] = PyMethodDef("_jepa_save",         &py_jepa_save,          METH_VARARGS, null);
         _methods[19] = PyMethodDef("_jepa_meta",         &py_jepa_meta,          METH_VARARGS, null);
-        _methods[20] = PyMethodDef(null, null, 0, null);
+        _methods[20] = PyMethodDef("_ml_gpu_info",       &py_ml_gpu_info,        METH_VARARGS, null);
+        _methods[21] = PyMethodDef(null, null, 0, null);
 
         _moddef.m_base.ob_base.ob_refcnt = 1;
         _moddef.m_name    = "my_ml";
