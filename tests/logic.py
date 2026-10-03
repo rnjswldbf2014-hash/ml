@@ -1,4 +1,4 @@
-"""Tests for the logic() layer (neuro-symbolic gate learning) in ml.d.
+"""Tests for the logic() layer, plus the weight-file version handling it bumped.
 
 Three things matter here, and the first two are what make the layer worth
 having over a plain Linear:
@@ -21,6 +21,12 @@ having over a plain Linear:
 
 Determinism and batched-vs-serial equivalence for logic layers live in
 regression.py, as the "logic", "logic2" and "logicmix" topologies.
+
+The last section covers the file format. The logic layer took it from ver 9 to
+ver 10 (a ver-9 reader would mistake a logic layer for an each layer), so:
+ver 9 still loads, saving upgrades it in place, and a file from some *newer*
+version is moved aside rather than silently overwritten on the next save --
+"cannot read it" is not the same as "safe to throw away".
 
 Usage: python tests/logic.py     (exit 0 = pass)
 """
@@ -170,6 +176,74 @@ for _ in range(1500):
 hit = sum(1 for x, y in zip(X, Y) if maj.predict(x)[0] == y[0])
 check("majority fits", hit == len(X), f"{hit}/{len(X)}")
 check("both stacked layers report rules", len(maj.rules()) == 2)
+
+# ── weight-file version handling ────────────────────────────────────────
+print("\n[version] ver 9 loads, save upgrades it, newer files are kept")
+import struct   # noqa: E402
+
+VPTH = "vr_ml_memory.pth"
+VLAY = [6, 12, 10]
+
+
+def file_ver(p):
+    with open(p, "rb") as f:
+        magic, v = struct.unpack("<II", f.read(8))
+    assert magic == 0xBEEFCAFE, hex(magic)
+    return v
+
+
+def set_file_ver(p, v):
+    with open(p, "r+b") as f:
+        f.seek(4)
+        f.write(struct.pack("<I", v))
+
+
+wipe()
+vr = make("vr", VLAY, [cos], autosave=0)
+rows = [[0.1 * k for k in range(6)]] * 4
+for _ in range(10):
+    vr.sl(rows, [[0.3]] * 4)
+vprobe = [0.2, -0.4, 0.1, 0.5, -0.3, 0.0]
+vbefore = vr.predict(vprobe)[0]
+vr.save()
+check("save() writes ver 10", file_ver(VPTH) == 10, f"got {file_ver(VPTH)}")
+
+# ver 9 has the same layout for a network with no logic layer, so stamping the
+# version back to 9 makes a faithful "old file".
+set_file_ver(VPTH, 9)
+vr2 = make("vr", VLAY, [cos], autosave=0)
+check("ver 9 file still loads", vr2.predict(vprobe)[0] == vbefore,
+      f"{vbefore} vs {vr2.predict(vprobe)[0]}")
+vr2.save()
+check("saving a ver 9 file upgrades it to ver 10", file_ver(VPTH) == 10,
+      f"got {file_ver(VPTH)}")
+
+# A file from a newer version cannot be parsed, but it must not be destroyed.
+set_file_ver(VPTH, 99)
+with open(VPTH, "rb") as f:
+    newer_bytes = f.read()
+vr3 = make("vr", VLAY, [cos], autosave=0)
+bak = VPTH + ".bak"
+moved = os.path.exists(bak) and open(bak, "rb").read() == newer_bytes
+check("newer-version file is moved aside intact", moved)
+vr3.save()
+still = os.path.exists(bak) and open(bak, "rb").read() == newer_bytes
+check("the moved file survives the next save()", still)
+
+# A second failure must not clobber the first backup.
+set_file_ver(VPTH, 99)
+make("vr", VLAY, [cos], autosave=0)
+check("a second rescue numbers the backup", os.path.exists(VPTH + ".bak2"))
+
+# Changing the layer spec is a deliberate reset, so it should NOT leave backups.
+wipe()
+for f in os.listdir("."):
+    if ".pth" in f:
+        os.remove(f)
+make("vr", [6, 12, 10], [cos], autosave=0).save()
+make("vr", [6, 99, 10], [cos], autosave=0)
+leftovers = sorted(f for f in os.listdir(".") if f.startswith(VPTH))
+check("a structure change leaves no backup", leftovers == [VPTH], f"{leftovers}")
 
 os.chdir(ROOT)
 shutil.rmtree(WORK, ignore_errors=True)

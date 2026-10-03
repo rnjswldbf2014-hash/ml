@@ -1717,6 +1717,32 @@ class BlackBoxAI {
             } catch (Exception e) {
                 알림(" [%s] 불러오기 실패 (%s). 새로 시작합니다.", name, e.msg);
                 ready = false;
+                // 못 읽은 파일을 그대로 두면 다음 save() 가 덮어쓴다. 그런데
+                // "읽을 수 없다" 가 "버려도 된다" 는 아니다 — 더 새 버전에서
+                // 저장했거나, 예전 포맷이라 change() 가 필요한 경우일 수 있다.
+                // 옆으로 치워두고 새로 시작한다.
+                //
+                // 구조가 달라서 새로 만드는 경우(위 !same)는 사용자가 층을 바꾼
+                // 것이라 의도된 초기화다 — 거기선 백업하지 않는다 (실험할 때마다
+                // .bak 이 쌓인다).
+                try {
+                    string bak;
+                    foreach (i; 0..10) {
+                        bak = file ~ ".bak" ~ (i == 0 ? "" : to!string(i + 1));
+                        if (!exists(bak)) break;
+                        bak = null;
+                    }
+                    if (bak is null)
+                        알림(" [%s] 원본을 옮기지 못했습니다 (.bak 자리가 다 찼습니다)."
+                             ~ " %s 를 직접 치워주세요.", name, file);
+                    else {
+                        rename(file, bak);
+                        알림(" [%s] 원본은 %s 로 옮겨뒀습니다.", name, bak);
+                    }
+                } catch (Exception e2) {
+                    알림(" [%s] 원본을 옮기지 못했습니다 (%s). %s 가 덮어써질 수"
+                         ~ " 있으니 직접 치워주세요.", name, e2.msg, file);
+                }
             }
         }
         if (!ready) {
