@@ -30,6 +30,14 @@ def topo_layers(topo):
         return [4, ml.attn(4), ml.each(8), 8]
     if topo == "mixed":
         return [4, ml.attn(4), ml.each(8), ml.attn(4), ml.each(4), 8]
+    if topo == "logic":
+        return [4, 16, ml.logic(8), 8]
+    # two logic layers back to back: the second must NOT squash its input
+    # again (it is already 0..1), so this covers that branch too
+    if topo == "logic2":
+        return [4, ml.logic(8), ml.logic(8), 8]
+    if topo == "logicmix":
+        return [4, ml.attn(4), ml.each(8), ml.logic(12), 8]
     raise ValueError(f"unknown topology {topo!r}")
 
 

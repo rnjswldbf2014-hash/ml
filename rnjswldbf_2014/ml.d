@@ -836,6 +836,282 @@ private struct AttnLayer {
 }
 
 // ─────────────────────────────────────────────
+// LogicLayer — 논리 게이트를 학습하는 층 (뉴로심볼릭)
+// ─────────────────────────────────────────────
+// 출력 유닛 하나하나가 "논리 게이트 한 개" 다. 유닛 j 는 입력 두 칸(ia[j], ib[j])을
+// 보고, 그 둘로 뭘 할지를 16가지 중에서 고른다 (AND, OR, XOR, NAND, "a 를 그대로",
+// "항상 참" ...). 고르는 방식이 학습 대상이다.
+//
+// 어떻게 미분 가능하게 만드나:
+//   게이트 선택을 softmax 로 부드럽게 섞는다. y = Σ_g p_g · g(a,b).
+//   학습 중에는 "70% AND, 20% OR, ..." 같은 상태로 있다가 한쪽으로 몰린다.
+//   다 끝나면 제일 큰 것만 남겨서 읽으면 그게 진짜 논리식이다 (rules() 참고).
+//   이게 이 층을 쓰는 이유다 — Linear 로는 "무슨 규칙을 배웠는지" 를 못 읽는다.
+//
+// 참/거짓 대신 0~1 사이 값을 쓰고, 게이트는 확률곱으로 완화한다
+// (a∧b → a·b, a∨b → a+b-ab, ¬a → 1-a). a, b 가 딱 0/1 이면 보통 논리와 같아진다.
+//
+// 입력 두 칸은 생성할 때 무작위로 정하고 고정한다 (학습하지 않는다 — 연결까지
+// 학습시키면 탐색 공간이 터진다. Petersen 등의 differentiable logic gate network
+// 와 같은 선택이다). 무작위이므로 파일에 같이 저장해야 한다.
+private enum int NGATE = 16;
+
+// 16가지 게이트. 인덱스가 곧 진리표다 (하위 비트가 (a,b) = 00,01,10,11).
+private immutable string[NGATE] GATE_NAME = [
+    "거짓", "a∧b", "a∧¬b", "a", "¬a∧b", "b", "a⊕b", "a∨b",
+    "¬(a∨b)", "a↔b", "¬b", "a∨¬b", "¬a", "¬a∨b", "¬(a∧b)", "참"
+];
+
+// g(a,b) 를 확률곱으로 완화한 값. 16개를 한 번에 채운다.
+private void gateValues(float a, float b, ref float[NGATE] g) pure nothrow @nogc {
+    immutable float ab = a * b;
+    g[0]  = 0f;
+    g[1]  = ab;                 // a∧b
+    g[2]  = a - ab;             // a∧¬b
+    g[3]  = a;
+    g[4]  = b - ab;             // ¬a∧b
+    g[5]  = b;
+    g[6]  = a + b - 2f*ab;      // a⊕b
+    g[7]  = a + b - ab;         // a∨b
+    g[8]  = 1f - g[7];          // ¬(a∨b)
+    g[9]  = 1f - g[6];          // a↔b
+    g[10] = 1f - b;
+    g[11] = 1f - b + ab;        // a∨¬b
+    g[12] = 1f - a;
+    g[13] = 1f - a + ab;        // ¬a∨b
+    g[14] = 1f - ab;            // ¬(a∧b)
+    g[15] = 1f;
+}
+
+// ∂g/∂a 와 ∂g/∂b. 위 식을 손으로 미분한 것 — 바꿀 때 둘을 같이 고쳐야 한다.
+private void gateGrads(float a, float b, ref float[NGATE] da, ref float[NGATE] db)
+        pure nothrow @nogc {
+    da[0]=0f;      db[0]=0f;
+    da[1]=b;       db[1]=a;
+    da[2]=1f-b;    db[2]=-a;
+    da[3]=1f;      db[3]=0f;
+    da[4]=-b;      db[4]=1f-a;
+    da[5]=0f;      db[5]=1f;
+    da[6]=1f-2f*b; db[6]=1f-2f*a;
+    da[7]=1f-b;    db[7]=1f-a;
+    da[8]=b-1f;    db[8]=a-1f;
+    da[9]=2f*b-1f; db[9]=2f*a-1f;
+    da[10]=0f;     db[10]=-1f;
+    da[11]=b;      db[11]=a-1f;
+    da[12]=-1f;    db[12]=0f;
+    da[13]=b-1f;   db[13]=a;
+    da[14]=-b;     db[14]=-a;
+    da[15]=0f;     db[15]=0f;
+}
+
+private struct LogicLayer {
+    int inSz, outSz;
+    int[] ia, ib;        // 유닛 j 가 보는 두 입력 칸 (고정, 파일에 저장)
+    float[] gw;          // [outSz*NGATE] 게이트 선택 가중치 (학습 대상)
+    float[] ggw;         // 기울기
+    float[] mg, vg;      // Adam 상태
+    int t;
+
+    // 들어온 값을 0~1 로 눌러야 하는가. 바로 앞이 또 로직 층이면 이미 0~1 이라
+    // 다시 누르면 [0.5, 0.73] 로 찌그러져서 신호가 죽는다. 그래서 생성 시 정한다.
+    bool squash;
+
+    float[] prob;        // [outSz*NGATE] softmax 결과 (순전파에서 채움)
+    float[] sx;          // [inSz] 눌러놓은 입력 — 역전파에서 미분계수에 필요
+    float[] outCache;    // [outSz] 출력값 — softmax 역전파에 필요
+    float[] dsx;         // [inSz] 입력에 대한 기울기 모으는 곳
+
+    int _bcap;
+    float[] sxB, outB, dsxB;   // 배치용 (각각 B*inSz, B*outSz, B*inSz)
+
+    this(int inSz_, int outSz_, bool squash_) {
+        inSz = inSz_; outSz = outSz_; squash = squash_;
+        ia = new int[outSz]; ib = new int[outSz];
+        foreach (j; 0..outSz) {
+            ia[j] = uniform(0, inSz, rng);
+            // 두 입력이 같으면 게이트 절반이 의미를 잃는다 (a∧a == a). 피한다.
+            if (inSz > 1) {
+                int b2 = uniform(0, inSz - 1, rng);
+                ib[j] = (b2 >= ia[j]) ? b2 + 1 : b2;
+            } else ib[j] = 0;
+        }
+        gw  = new float[outSz*NGATE]; gw[]  = 0f;   // 전부 0 = 처음엔 16개 균등
+        ggw = new float[outSz*NGATE]; ggw[] = 0f;
+        mg  = new float[outSz*NGATE]; mg[]  = 0f;
+        vg  = new float[outSz*NGATE]; vg[]  = 0f;
+        prob = new float[outSz*NGATE]; prob[] = 0f;
+        sx = new float[inSz]; sx[] = 0f;
+        outCache = new float[outSz]; outCache[] = 0f;
+        dsx = new float[inSz]; dsx[] = 0f;
+    }
+
+    private void _allocBatch(int B) {
+        if (B <= _bcap) return;
+        sxB  = new float[B*inSz];  sxB[]  = 0f;
+        outB = new float[B*outSz]; outB[] = 0f;
+        dsxB = new float[B*inSz];  dsxB[] = 0f;
+        _bcap = B;
+    }
+
+    // 게이트 선택 확률. gw 가 바뀔 때마다 다시 구해야 한다.
+    private void _softmaxGates() {
+        _parChunk(outSz, (int jlo, int jhi) {
+            foreach (j; jlo .. jhi) {
+                auto z = gw[j*NGATE .. (j+1)*NGATE];
+                auto p = prob[j*NGATE .. (j+1)*NGATE];
+                float mx = z[0];
+                foreach (v; z) if (v > mx) mx = v;
+                float s = 0f;
+                foreach (k; 0..NGATE) { p[k] = exp(z[k] - mx); s += p[k]; }
+                float inv = 1f / s;
+                foreach (k; 0..NGATE) p[k] *= inv;
+            }
+        });
+    }
+
+    private static float _sig(float v) pure nothrow @nogc {
+        return 1f / (1f + exp(-v));
+    }
+
+    void fwd(const(float)[] x, float[] y) {
+        _softmaxGates();
+        foreach (i; 0..inSz) sx[i] = squash ? _sig(x[i]) : x[i];
+        _parChunk(outSz, (int jlo, int jhi) {
+            float[NGATE] g;
+            foreach (j; jlo .. jhi) {
+                gateValues(sx[ia[j]], sx[ib[j]], g);
+                auto p = prob[j*NGATE .. (j+1)*NGATE];
+                float acc = 0f;
+                foreach (k; 0..NGATE) acc += p[k] * g[k];
+                outCache[j] = acc;
+                y[j] = acc;
+            }
+        });
+    }
+
+    // dy -> dx.  ggw 에도 누적한다.
+    //
+    // 2단계로 나눈다. 1단계는 j 로 쪼개도 안전하다 (유닛마다 자기 16칸만 건드린다).
+    // 2단계는 안 된다 — 서로 다른 유닛이 같은 입력 칸을 볼 수 있어서 dsx 가 겹친다.
+    // 그래서 j 오름차순으로 직렬 누적한다 (순서를 고정해야 직렬과 비트가 같다).
+    void bwd(const(float)[] x, const(float)[] dy, float[] dx) {
+        _parChunk(outSz, (int jlo, int jhi) {
+            float[NGATE] g;
+            foreach (j; jlo .. jhi) {
+                gateValues(sx[ia[j]], sx[ib[j]], g);
+                auto p = prob[j*NGATE .. (j+1)*NGATE];
+                auto gg = ggw[j*NGATE .. (j+1)*NGATE];
+                // y = Σ p_k g_k, p = softmax(z) 이므로 dy/dz_m = p_m (g_m - y)
+                float yv = outCache[j], d = dy[j];
+                foreach (k; 0..NGATE) gg[k] += d * p[k] * (g[k] - yv);
+            }
+        });
+
+        dsx[] = 0f;
+        float[NGATE] da, db;
+        foreach (j; 0..outSz) {
+            int A = ia[j], B2 = ib[j];
+            gateGrads(sx[A], sx[B2], da, db);
+            auto p = prob[j*NGATE .. (j+1)*NGATE];
+            float sa = 0f, sb = 0f;
+            foreach (k; 0..NGATE) { sa += p[k]*da[k]; sb += p[k]*db[k]; }
+            dsx[A]  += dy[j] * sa;
+            dsx[B2] += dy[j] * sb;
+        }
+        foreach (i; 0..inSz)
+            dx[i] += squash ? dsx[i] * sx[i] * (1f - sx[i]) : dsx[i];
+    }
+
+    // X: [B*inSz] -> Y: [B*outSz]
+    void fwdBatch(const(float)[] X, float[] Y, int B) {
+        _allocBatch(B);
+        _softmaxGates();
+        _parChunk(B, (int blo, int bhi) {
+            float[NGATE] g;
+            foreach (b; blo .. bhi) {
+                auto s = sxB[b*inSz .. (b+1)*inSz];
+                foreach (i; 0..inSz) s[i] = squash ? _sig(X[b*inSz + i]) : X[b*inSz + i];
+                foreach (j; 0..outSz) {
+                    gateValues(s[ia[j]], s[ib[j]], g);
+                    auto p = prob[j*NGATE .. (j+1)*NGATE];
+                    float acc = 0f;
+                    foreach (k; 0..NGATE) acc += p[k] * g[k];
+                    outB[b*outSz + j] = acc;
+                    Y[b*outSz + j] = acc;
+                }
+            }
+        });
+    }
+
+    // dY -> dX (누적). 1단계는 j 로, 2단계는 b 로 쪼갠다 — 둘 다 겹치지 않는다.
+    void bwdBatch(const(float)[] X, const(float)[] dY, float[] dX, int B) {
+        _parChunk(outSz, (int jlo, int jhi) {
+            float[NGATE] g;
+            foreach (j; jlo .. jhi) {
+                auto p = prob[j*NGATE .. (j+1)*NGATE];
+                auto gg = ggw[j*NGATE .. (j+1)*NGATE];
+                foreach (b; 0..B) {         // b 오름차순 고정 = 결정적
+                    auto s = sxB[b*inSz .. (b+1)*inSz];
+                    gateValues(s[ia[j]], s[ib[j]], g);
+                    float yv = outB[b*outSz + j], d = dY[b*outSz + j];
+                    foreach (k; 0..NGATE) gg[k] += d * p[k] * (g[k] - yv);
+                }
+            }
+        });
+
+        _parChunk(B, (int blo, int bhi) {
+            float[NGATE] da, db;
+            foreach (b; blo .. bhi) {
+                auto s  = sxB[b*inSz .. (b+1)*inSz];
+                auto ds = dsxB[b*inSz .. (b+1)*inSz];
+                ds[] = 0f;
+                foreach (j; 0..outSz) {
+                    int A = ia[j], B2 = ib[j];
+                    gateGrads(s[A], s[B2], da, db);
+                    auto p = prob[j*NGATE .. (j+1)*NGATE];
+                    float sa = 0f, sb = 0f;
+                    foreach (k; 0..NGATE) { sa += p[k]*da[k]; sb += p[k]*db[k]; }
+                    float d = dY[b*outSz + j];
+                    ds[A]  += d * sa;
+                    ds[B2] += d * sb;
+                }
+                foreach (i; 0..inSz)
+                    dX[b*inSz + i] += squash ? ds[i] * s[i] * (1f - s[i]) : ds[i];
+            }
+        });
+    }
+
+    void zeroGrad() nothrow @nogc { ggw[] = 0f; }
+
+    void step(Opt o, float lr) nothrow {
+        adamVec(gw, ggw, mg, vg, o, lr, t);
+        t++;
+    }
+
+    // 학습된 회로를 사람이 읽을 수 있게. 유닛마다 "제일 유력한 게이트" 와
+    // 그 확신도를 돌려준다. 이 층을 쓰는 목적이 사실 이것이다.
+    string[] rules() {
+        _softmaxGates();
+        auto r = new string[outSz];
+        foreach (j; 0..outSz) {
+            auto p = prob[j*NGATE .. (j+1)*NGATE];
+            int best = 0;
+            foreach (k; 1..NGATE) if (p[k] > p[best]) best = k;
+            string nm = GATE_NAME[best];
+            // a, b 를 실제 입력 번호로 바꿔 끼운다
+            string s;
+            foreach (dchar c; nm) {
+                if      (c == 'a') s ~= "x" ~ to!string(ia[j]);
+                else if (c == 'b') s ~= "x" ~ to!string(ib[j]);
+                else               s ~= to!string(c);
+            }
+            r[j] = s ~ "   (" ~ to!string(cast(int)(p[best]*100f + 0.5f)) ~ "%)";
+        }
+        return r;
+    }
+}
+
+// ─────────────────────────────────────────────
 // VICReg — "다 같은 값으로 뭉개지는 것"(collapse) 막기
 // ─────────────────────────────────────────────
 // jepa 처럼 "요약끼리 비교" 하는 학습은 요약기가 잔머리를 굴릴 수 있다: 입력이 뭐든
@@ -924,13 +1200,14 @@ private struct VicReg {
 private class Network {
     // 은닉층은 Linear(+ReLU) 와 Attn 이 섞일 수 있다.
     // kinds[i] == 0 이면 lins[slot[i]], 1 이면 attns[slot[i]]
-    ubyte[]     kinds;
-    int[]       slot;
-    Linear[]    lins;
-    AttnLayer[] attns;
-    EachLayer[] eachs;
-    Linear[]    heads;
-    int         inputSz;
+    ubyte[]      kinds;
+    int[]        slot;
+    Linear[]     lins;
+    AttnLayer[]  attns;
+    EachLayer[]  eachs;
+    LogicLayer[] logics;
+    Linear[]     heads;
+    int          inputSz;
 
     int[]     _inSz, _outSz;
     float[][] _inp, _pre;
@@ -951,7 +1228,8 @@ private class Network {
 
     int layerCount() const nothrow @nogc { return cast(int) kinds.length; }
 
-    // specKind[i]: 0=Linear(specA=출력폭), 1=Attn(specA=조각수, specB=헤드수)
+    // specKind[i]: 0=Linear(specA=출력폭), 1=Attn(specA=조각수, specB=헤드수),
+    //              2=Each(specA=항목수, specB=항목당 출력폭), 3=Logic(specA=게이트 수)
     this(int inputSz_, const(ubyte)[] specKind, const(int)[] specA, const(int)[] specB,
          int[] headSizes) {
         inputSz = inputSz_;
@@ -966,6 +1244,14 @@ private class Network {
                 attns ~= AttnLayer(prev, specA[i], specB[i]);
                 kinds ~= 1; slot ~= cast(int)(attns.length - 1);
                 _inSz ~= prev; _outSz ~= prev;      // 폭 유지
+            } else if (specKind[i] == 3) {
+                // Logic: specA=게이트(출력) 수.
+                // 바로 앞이 또 로직 층이면 입력이 이미 0~1 이라 다시 누르지 않는다.
+                bool 앞도로직 = (i > 0 && specKind[i-1] == 3);
+                logics ~= LogicLayer(prev, specA[i], !앞도로직);
+                kinds ~= 3; slot ~= cast(int)(logics.length - 1);
+                _inSz ~= prev; _outSz ~= specA[i];
+                prev = specA[i];
             } else {
                 // Each: specA=항목수, specB=항목당 출력폭
                 int items = specA[i], ow = specB[i];
@@ -1034,6 +1320,13 @@ private class Network {
                         foreach (k; 0..oS) _inp[i+1][k] = _pre[i][k];
                     else
                         foreach (k; 0..oS) _hout[k] = _pre[i][k];
+                } else if (kinds[i] == 3) {
+                    // 출력이 이미 0~1 이라 ReLU 를 걸지 않는다
+                    logics[slot[i]].fwd(_inp[i], _pre[i]);
+                    if (i + 1 < n)
+                        foreach (k; 0..oS) _inp[i+1][k] = _pre[i][k];
+                    else
+                        foreach (k; 0..oS) _hout[k] = _pre[i][k];
                 } else {
                     eachs[slot[i]].fwd(_inp[i], _pre[i]);   // ReLU 는 안에서
                     if (i + 1 < n)
@@ -1065,6 +1358,9 @@ private class Network {
             } else if (kinds[i] == 1) {
                 _dB[0..iS] = 0f;
                 attns[slot[i]].bwd(_inp[i], _dA[0..oS], _dB[0..iS]);
+            } else if (kinds[i] == 3) {
+                _dB[0..iS] = 0f;
+                logics[slot[i]].bwd(_inp[i], _dA[0..oS], _dB[0..iS]);
             } else {
                 _dB[0..iS] = 0f;
                 eachs[slot[i]].bwd(_inp[i], _dA[0..oS], _dB[0..iS], _dC);
@@ -1145,6 +1441,9 @@ private class Network {
                     case 2:
                         eachs[slot[i]].fwdBatch(inp, 다음, B);
                         break;
+                    case 3:
+                        logics[slot[i]].fwdBatch(inp, 다음, B);
+                        break;
                 }
             }
         }
@@ -1207,6 +1506,11 @@ private class Network {
                     // 읽고 쓰는 원소별 변환)라 그 자리에서 덮어써도 안전하다.
                     eachs[slot[i]].bwdBatch(inp, dOut, dIn, _bDZ[i], B);
                     break;
+                case 3:
+                    // LogicLayer.bwdBatch 도 (Attn 처럼) dX 에 누적만 한다
+                    dIn[] = 0f;
+                    logics[slot[i]].bwdBatch(inp, dOut, dIn, B);
+                    break;
             }
         }
     }
@@ -1215,6 +1519,7 @@ private class Network {
         foreach (ref h; lins)  h.zeroGrad();
         foreach (ref a; attns) a.zeroGrad();
         foreach (ref e; eachs) e.zeroGrad();
+        foreach (ref g; logics) g.zeroGrad();
         foreach (ref h; heads) h.zeroGrad();
     }
 
@@ -1224,6 +1529,7 @@ private class Network {
         foreach (ref h; lins)  h.step(opt, lr);
         foreach (ref a; attns) a.step(opt, lr);
         foreach (ref e; eachs) e.step(opt, lr);
+        foreach (ref g; logics) g.step(opt, lr);
         foreach (ref h; heads) h.step(opt, lr);
     }
 }
@@ -1379,6 +1685,7 @@ class BlackBoxAI {
                 if (i) r ~= ", ";
                 if      (layKind[i] == 0) r ~= to!string(layA[i]);
                 else if (layKind[i] == 1) r ~= "attn(" ~ to!string(layA[i]) ~ "," ~ to!string(layB[i]) ~ ")";
+                else if (layKind[i] == 3) r ~= "logic(" ~ to!string(layA[i]) ~ ")";
                 else                      r ~= "each(" ~ to!string(layB[i]) ~ ")";
             }
             return r ~ "]";
@@ -1934,7 +2241,9 @@ class BlackBoxAI {
         auto f = File(file, "wb");
         void wu(uint v)  { f.rawWrite((&v)[0..1]); }
         void wf(float v) { f.rawWrite((&v)[0..1]); }
-        wu(0xBEEFCAFE); wu(9); wu(cast(uint)opt);
+        // ver 10 = 로직 층(kind 3)이 생긴 버전. 9 와 구조는 같지만, kind 3 이 든
+        // 파일을 옛 바이너리가 읽으면 Each 로 오해해서 조용히 깨진다 — 그래서 올린다.
+        wu(0xBEEFCAFE); wu(10); wu(cast(uint)opt);
         wu(cast(uint)net.inputSz);
         wu(cast(uint)layKind.length);
         foreach (i; 0..layKind.length) {
@@ -1968,6 +2277,16 @@ class BlackBoxAI {
             else if (net.kinds[i] == 1) {
                 auto a = &net.attns[net.slot[i]];
                 wn(a.ln); wl(a.wq); wl(a.wk); wl(a.wv); wl(a.wo);
+            } else if (net.kinds[i] == 3) {
+                auto g = &net.logics[net.slot[i]];
+                // 입력 연결(ia, ib)은 생성할 때 무작위로 뽑은 것이라 반드시 같이
+                // 저장해야 한다. 안 그러면 불러온 뒤 완전히 다른 회로가 된다.
+                foreach (v; g.ia) wu(cast(uint)v);
+                foreach (v; g.ib) wu(cast(uint)v);
+                foreach (v; g.gw) wf(v);
+                foreach (v; g.mg) wf(v);
+                foreach (v; g.vg) wf(v);
+                wu(cast(uint)g.t);
             } else {
                 wl(net.eachs[net.slot[i]].lin);
             }
@@ -1982,6 +2301,8 @@ class BlackBoxAI {
         if (ru() != 0xBEEFCAFE) throw new Exception("magic mismatch");
         uint ver = ru();
         if (ver < 9) throw new Exception("예전 포맷입니다. change() 로 변환하세요");
+        if (ver > 10) throw new Exception("더 새 버전에서 저장한 파일입니다 (ver "
+                                        ~ to!string(ver) ~ ")");
         opt = cast(Opt)ru();
         int inputSz = ru();
         int nLay = ru();
@@ -2019,6 +2340,14 @@ class BlackBoxAI {
             else if (net.kinds[i] == 1) {
                 auto a = &net.attns[net.slot[i]];
                 rn_(a.ln); rl_(a.wq); rl_(a.wk); rl_(a.wv); rl_(a.wo);
+            } else if (net.kinds[i] == 3) {
+                auto g = &net.logics[net.slot[i]];
+                foreach (ref v; g.ia) v = cast(int)ru();
+                foreach (ref v; g.ib) v = cast(int)ru();
+                foreach (ref v; g.gw) v = rf();
+                foreach (ref v; g.mg) v = rf();
+                foreach (ref v; g.vg) v = rf();
+                g.t = ru();
             } else {
                 rl_(net.eachs[net.slot[i]].lin);
             }
@@ -2251,7 +2580,7 @@ string changeFile(string path) {
 
     auto w = File(path, "wb");
     void wu(uint v) { w.rawWrite((&v)[0..1]); }
-    wu(0xBEEFCAFE); wu(9); wu(cast(uint) o);
+    wu(0xBEEFCAFE); wu(10); wu(cast(uint) o);
     wu(cast(uint) inputSz);
     wu(cast(uint) nH);
     foreach (i; 0..nH) { wu(cast(uint) kK[i]); wu(cast(uint) kA[i]); wu(cast(uint) kB[i]); }
@@ -2490,6 +2819,21 @@ PyObject* py_ml_gpu_info(PyObject* self, PyObject* args) {
         put("min_batch", PyLong_FromLong(_gpuMinB));
         return d;
     } catch (Throwable t) { setPyError("my_ml: _ml_gpu_info", t); return null; }
+}
+
+// 로직 층이 배운 회로를 글로. 층별 리스트의 리스트를 돌려준다.
+PyObject* py_ml_logic_rules(PyObject* self, PyObject* args) {
+    try {
+        PyObject* cap;
+        if (!PyArg_ParseTuple(args, "O", &cap)) return null;
+        auto ai = cast(BlackBoxAI) PyCapsule_GetPointer(cap, "BlackBoxAI");
+        if (!ai || !ai.ready) return PyList_New(0);
+        ai.syncFromGpu();   // 신경망을 안 거치고 직접 훑는다
+        auto outer = PyList_New(ai.net.logics.length);
+        foreach (i; 0..ai.net.logics.length)
+            PyList_SetItem(outer, i, toPyList(ai.net.logics[i].rules()));
+        return outer;
+    } catch (Throwable t) { setPyError("my_ml: _ml_logic_rules", t); return null; }
 }
 
 PyObject* py_jepa_make(PyObject* self, PyObject* args) {
@@ -2791,6 +3135,33 @@ class _Each:
 each = _Each()
 
 
+class _Logic:
+    """논리 게이트를 배우는 층 (뉴로심볼릭).
+
+        logic(32)   -> 게이트 32개
+
+    유닛 하나하나가 논리 게이트 한 개다. 들어온 값 중 두 칸을 보고 그 둘로 뭘
+    할지(AND, OR, XOR, NAND, "그대로", "항상 참" ... 16가지)를 학습한다.
+    학습이 끝나면 rules() 로 배운 식을 글로 읽을 수 있다 — 일반 층은 못 하는 것.
+
+    들어온 값은 0~1 로 눌러서 참/거짓처럼 쓴다 (로직 층을 연달아 쌓을 때는
+    이미 0~1 이므로 다시 누르지 않는다). 나오는 값도 0~1 이다.
+    """
+    __slots__ = ("gates",)
+
+    def __init__(self, gates=0):
+        self.gates = int(gates)
+
+    def __call__(self, gates):
+        if gates < 1: raise ValueError("logic(개수) 는 1 이상이어야 합니다")
+        return _Logic(gates)
+
+    def __repr__(self):
+        return f"logic({self.gates})"
+
+logic = _Logic()
+
+
 class _Vec:
     """숫자 여러 개를 한 덩어리로 내는 출력.
 
@@ -2871,6 +3242,20 @@ class BlackBoxAI:
             self._since = 0
             return True
         return False
+
+    def rules(self):
+        """로직 층이 배운 논리식을 글로 읽는다. 층이 여러 개면 리스트의 리스트.
+
+            ai = make("M", [8, 16, logic(6)], [["예","아니오"]])
+            ai.sl(...)
+            for 층 in ai.rules():
+                for i, 식 in enumerate(층):
+                    print(i, 식)      # 예) 3 x5∧¬x2   (91%)
+
+        괄호 안 숫자는 확신도다 (16가지 중 그 게이트에 몰린 정도).
+        낮으면 아직 안 굳은 것이니 더 학습시키거나 그 유닛을 무시한다.
+        """
+        return _ml_logic_rules(self._h)
 
     def embed(self, input_list, head=0):
         """그 출력의 값 전체를 리스트로. vec 출력을 꺼낼 때 쓴다.
@@ -3071,6 +3456,10 @@ def make(model_name, layers, outputs, optimizer='adam', sigma=1.0, entropy=0.01,
             lay_kind.append(1); lay_a.append(L.items); lay_b.append(L.heads)
             항목수 = L.items
             # 폭 그대로
+        elif isinstance(L, _Logic):
+            lay_kind.append(3); lay_a.append(L.gates); lay_b.append(0)
+            폭 = L.gates
+            항목수 = 0                       # 게이트는 항목 구분을 유지하지 않는다
         elif isinstance(L, _Each):
             if 항목수 < 1:
                 raise ValueError(
@@ -3241,7 +3630,7 @@ builtins.gpu_info   = gpu_info
 // ─────────────────────────────────────────────
 // Module init
 // ─────────────────────────────────────────────
-private __gshared PyMethodDef[22] _methods;
+private __gshared PyMethodDef[23] _methods;
 private __gshared PyModuleDef     _moddef;
 
 extern(C) export PyObject* PyInit_ml() nothrow @trusted {
@@ -3267,7 +3656,8 @@ extern(C) export PyObject* PyInit_ml() nothrow @trusted {
         _methods[18] = PyMethodDef("_jepa_save",         &py_jepa_save,          METH_VARARGS, null);
         _methods[19] = PyMethodDef("_jepa_meta",         &py_jepa_meta,          METH_VARARGS, null);
         _methods[20] = PyMethodDef("_ml_gpu_info",       &py_ml_gpu_info,        METH_VARARGS, null);
-        _methods[21] = PyMethodDef(null, null, 0, null);
+        _methods[21] = PyMethodDef("_ml_logic_rules",    &py_ml_logic_rules,     METH_VARARGS, null);
+        _methods[22] = PyMethodDef(null, null, 0, null);
 
         _moddef.m_base.ob_base.ob_refcnt = 1;
         _moddef.m_name    = "my_ml";
