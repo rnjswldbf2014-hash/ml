@@ -204,7 +204,8 @@ private struct Linear {
         gradB[] = 0f;
     }
 
-    void step(Opt opt, float lr) nothrow {
+    // decay = 가중치 감쇠. 0 이면 아무 일도 안 한다 (기본).
+    void step(Opt opt, float lr, float decay = 0f) nothrow {
         enum float B1=0.9f, B2=0.999f, EPS=1e-8f, RHO=0.99f;
         final switch (opt) {
             case Opt.adam:
@@ -260,6 +261,19 @@ private struct Linear {
                     }
                 });
                 break;
+        }
+
+        // 가중치 감쇠. 기울기에 더하지 않고 따로 곱한다 (AdamW 가 하는 방식) —
+        // Adam 은 기울기를 제 나름으로 정규화하므로, 거기에 감쇠를 섞으면 실제로
+        // 걸리는 힘이 가중치마다 달라져 예측이 안 된다.
+        //
+        // 편향(b)에는 안 건다. 편향은 "전체적으로 얼마나 밀어올릴지" 라서 0 으로
+        // 당기면 맞춰야 할 값을 못 맞춘다 (관례도 그렇다).
+        if (decay != 0f) {
+            immutable float keep = 1f - lr * decay;
+            _parChunkNT(outSz, (int jlo, int jhi) nothrow {
+                foreach (j; jlo .. jhi) foreach (k; 0..inSz) w[j][k] *= keep;
+            });
         }
     }
 
@@ -536,7 +550,7 @@ private struct EachLayer {
     }
 
     void zeroGrad() nothrow @nogc { lin.zeroGrad(); }
-    void step(Opt o, float lr) nothrow { lin.step(o, lr); }
+    void step(Opt o, float lr, float decay = 0f) nothrow { lin.step(o, lr, decay); }
 }
 
 // ─────────────────────────────────────────────
@@ -829,9 +843,10 @@ private struct AttnLayer {
         wq.zeroGrad(); wk.zeroGrad(); wv.zeroGrad(); wo.zeroGrad();
     }
 
-    void step(Opt o, float lr) nothrow {
-        ln.step(o, lr);
-        wq.step(o, lr); wk.step(o, lr); wv.step(o, lr); wo.step(o, lr);
+    void step(Opt o, float lr, float decay = 0f) nothrow {
+        ln.step(o, lr);          // LayerNorm 의 scale/shift 에는 감쇠를 걸지 않는다
+        wq.step(o, lr, decay); wk.step(o, lr, decay);
+        wv.step(o, lr, decay); wo.step(o, lr, decay);
     }
 }
 
@@ -1524,13 +1539,17 @@ private class Network {
     }
 
     // nothrow 를 지키려고 여기서만 try 로 감싼다 (훅은 GPU 다운로드를 한다).
-    void step(Opt opt, float lr) nothrow {
+    //
+    // 감쇠는 Linear 가중치 행렬에만 건다. logic 층의 게이트 선택 가중치는 softmax
+    // 로짓이라 0 으로 당기면 "16가지를 똑같이 섞어라" 가 되는데, 그건 가중치 감쇠가
+    // 뜻하는 것과 다른 종류의 압력이라 놀랄 일이 된다 — 그래서 뺀다.
+    void step(Opt opt, float lr, float decay = 0f) nothrow {
         try { _sync(); } catch (Throwable) {}
-        foreach (ref h; lins)  h.step(opt, lr);
-        foreach (ref a; attns) a.step(opt, lr);
-        foreach (ref e; eachs) e.step(opt, lr);
+        foreach (ref h; lins)  h.step(opt, lr, decay);
+        foreach (ref a; attns) a.step(opt, lr, decay);
+        foreach (ref e; eachs) e.step(opt, lr, decay);
         foreach (ref g; logics) g.step(opt, lr);
-        foreach (ref h; heads) h.step(opt, lr);
+        foreach (ref h; heads) h.step(opt, lr, decay);
     }
 }
 
@@ -1602,6 +1621,8 @@ class BlackBoxAI {
     float      lr = 0.01f;
     float      cosSigma = 1.0f;   // cos 헤드 탐험 폭
     float      entropy  = 0.01f;  // 이산 헤드 엔트로피 보너스
+    float      decay    = 0.0f;   // 가중치 감쇠 (0 = 끔). Linear 가중치 행렬에만 걸린다
+    float      temp     = 1.0f;   // 고르기 샘플링 온도. 낮으면 과감하지 않게, 0 이면 최선만
     Opt        opt;
     string     file;
 
@@ -1668,9 +1689,11 @@ class BlackBoxAI {
 
     this(string name, int inputSz, ubyte[] lk, int[] la, int[] lb, int[] heads,
          string[][] actions, bool[] cos,
-         Opt opt = Opt.adam, float sigma = 1.0f, float ent = 0.01f) {
+         Opt opt = Opt.adam, float sigma = 1.0f, float ent = 0.01f,
+         float lr_ = 0.01f, float decay_ = 0.0f, float temp_ = 1.0f) {
         this.name = name; this.opt = opt;
         cosSigma = sigma; entropy = ent;
+        lr = lr_; decay = decay_; temp = temp_;
         layKind = lk.dup; layA = la.dup; layB = lb.dup;
         hiddenSizes = [];
         foreach (i; 0..lk.length) if (lk[i] == 0) hiddenSizes ~= la[i];
@@ -1799,7 +1822,19 @@ class BlackBoxAI {
             } else {
                 auto lg = (h < legal.length) ? legal[h] : null;
                 int mlen = maskOf(h, lg);
-                foreach (k; 0..mlen) _probBufs[h][k] = net._hd[h][_maskBufs[h][k]];
+                // 온도: 점수를 temp 로 나눠서 softmax 에 넣는다. 1 보다 작으면 차이가
+                // 벌어져 제일 좋은 것만 고르게 되고, 크면 차이가 좁혀져 골고루 찔러본다.
+                // 0 이하면 아예 최선만 (무작위성 없음 — 배포용).
+                if (temp <= 0f) {
+                    int best = 0;
+                    foreach (k; 1..mlen)
+                        if (net._hd[h][_maskBufs[h][k]] > net._hd[h][_maskBufs[h][best]]) best = k;
+                    chosen[h] = _maskBufs[h][best];
+                    value[h]  = 0f;
+                    continue;
+                }
+                immutable float invT = 1f / temp;
+                foreach (k; 0..mlen) _probBufs[h][k] = net._hd[h][_maskBufs[h][k]] * invT;
                 softmaxInPlace(_probBufs[h][0..mlen]);
                 double r = uniform01!double(rng), cum = 0.0;
                 int c = mlen - 1;
@@ -1890,7 +1925,7 @@ class BlackBoxAI {
                 }
             }
             net.backwardBatch(B);
-            net.step(opt, lr);
+            net.step(opt, lr, decay);
             return;
         }
 
@@ -1930,7 +1965,7 @@ class BlackBoxAI {
             }
             net.backward();
         }
-        net.step(opt, lr);
+        net.step(opt, lr, decay);
     }
 
     // ── 지도학습 1스텝 (헤드별 정답; 이산은 인덱스, cos 는 목표값) ──
@@ -1962,7 +1997,7 @@ class BlackBoxAI {
             }
         }
         net.backward();
-        net.step(opt, lr);
+        net.step(opt, lr, decay);
     }
 
     // GPU 로 넘길 만한 크기인지 판단. 이 라이브러리는 배치=1 온라인 학습이 핵심
@@ -2198,7 +2233,7 @@ class BlackBoxAI {
                 }
             }
             net.backwardBatch(B);
-            net.step(opt, lr);
+            net.step(opt, lr, decay);
             return;
         }
 
@@ -2230,7 +2265,7 @@ class BlackBoxAI {
             net.backward();
         }
 
-        net.step(opt, lr);
+        net.step(opt, lr, decay);
     }
 
     // ── jepa 용 진입점 ────────────────────────────────────────────────
@@ -2493,8 +2528,8 @@ class Jepa {
         // 8) 모아둔 기울기로 한 번씩만 갱신
         // step() 이 옵티마이저 상태를 읽는다 — GPU 에 최신본이 있으면 먼저 내린다
         // (요약기가 전에 sl() 로 GPU 경로를 탔을 수 있다)
-        enc._gpuSyncBack();  enc.net.step(enc.opt, enc.lr);
-        pred._gpuSyncBack(); pred.net.step(pred.opt, pred.lr);
+        enc._gpuSyncBack();  enc.net.step(enc.opt, enc.lr, enc.decay);
+        pred._gpuSyncBack(); pred.net.step(pred.opt, pred.lr, pred.decay);
         return loss;
     }
 
@@ -2764,9 +2799,10 @@ PyObject* py_ml_make(PyObject* self, PyObject* args) {
     try {
         PyObject* nm; int inputSz; PyObject* hid; PyObject* heads;
         PyObject* acts; PyObject* coss; PyObject* opt;
-        PyObject* lk; PyObject* lb2; double sigma, ent;
-        if (!PyArg_ParseTuple(args, "OiOOOOOOOdd", &nm, &inputSz, &lk, &hid, &lb2,
-                              &heads, &acts, &coss, &opt, &sigma, &ent))
+        PyObject* lk; PyObject* lb2; double sigma, ent, lr, decay, temp;
+        if (!PyArg_ParseTuple(args, "OiOOOOOOOddddd", &nm, &inputSz, &lk, &hid, &lb2,
+                              &heads, &acts, &coss, &opt, &sigma, &ent,
+                              &lr, &decay, &temp))
             return null;
         string name   = fromStringz(PyUnicode_AsUTF8(nm)).idup;
         string optStr = fromStringz(PyUnicode_AsUTF8(opt)).idup;
@@ -2781,7 +2817,8 @@ PyObject* py_ml_make(PyObject* self, PyObject* args) {
         auto cosB = new bool[cosI.length];
         foreach (i, v; cosI) cosB[i] = v != 0;
         auto ai = new BlackBoxAI(name, inputSz, lkb, la, lbv, hsz, al, cosB, parseOpt(optStr),
-                                 cast(float)sigma, cast(float)ent);
+                                 cast(float)sigma, cast(float)ent,
+                                 cast(float)lr, cast(float)decay, cast(float)temp);
         GC.addRoot(cast(void*) ai);
         return PyCapsule_New(cast(void*) ai, "BlackBoxAI", &bbai_dtor);
     } catch (Throwable t) { setPyError("my_ml: _ml_make", t); return null; }
@@ -2857,6 +2894,35 @@ PyObject* py_ml_gpu_info(PyObject* self, PyObject* args) {
 }
 
 // 로직 층이 배운 회로를 글로. 층별 리스트의 리스트를 돌려준다.
+// 학습 중에 바꿀 수 있어야 하는 값들 (학습률 스케줄, 탐험 식히기 등).
+// 하나에 몰아넣는다 — 값마다 함수를 만들면 추가할 때마다 메서드 표가 늘어난다.
+PyObject* py_ml_tune(PyObject* self, PyObject* args) {
+    try {
+        PyObject* cap; PyObject* nameObj; PyObject* valObj;
+        if (!PyArg_ParseTuple(args, "OOO", &cap, &nameObj, &valObj)) return null;
+        auto ai = cast(BlackBoxAI) PyCapsule_GetPointer(cap, "BlackBoxAI");
+        string k = fromStringz(PyUnicode_AsUTF8(nameObj)).idup;
+
+        // valObj 가 None 이면 읽기, 아니면 쓰기
+        bool 쓰기 = (valObj !is _pyNone);
+        float v = 쓰기 ? cast(float) PyFloat_AsDouble(valObj) : 0f;
+
+        float cur;
+        switch (k) {
+            case "lr":      if (쓰기) ai.lr = v;       cur = ai.lr;       break;
+            case "decay":   if (쓰기) ai.decay = v;    cur = ai.decay;    break;
+            case "temp":    if (쓰기) ai.temp = v;     cur = ai.temp;     break;
+            case "sigma":   if (쓰기) ai.cosSigma = v; cur = ai.cosSigma; break;
+            case "entropy": if (쓰기) ai.entropy = v;  cur = ai.entropy;  break;
+            default:
+                PyErr_SetString(_pyRuntimeError,
+                    "my_ml: 모르는 설정값입니다 (lr, decay, temp, sigma, entropy)");
+                return null;
+        }
+        return PyFloat_FromDouble(cur);
+    } catch (Throwable t) { setPyError("my_ml: _ml_tune", t); return null; }
+}
+
 PyObject* py_ml_logic_rules(PyObject* self, PyObject* args) {
     try {
         PyObject* cap;
@@ -3270,6 +3336,35 @@ class BlackBoxAI:
     @autosave.setter
     def autosave(self, n):  self._autosave = int(n)
 
+    # ── 학습 중에 바꿀 수 있는 값들 ──────────────────────────────────
+    # 학습률 스케줄("처음엔 크게, 나중엔 작게")이나 탐험 식히기에 쓴다.
+    #     ai.lr = 0.001
+    #     ai.temp = max(0.1, 1.0 - 진행도)
+    @property
+    def lr(self):           return _ml_tune(self._h, "lr", None)
+    @lr.setter
+    def lr(self, v):        _ml_tune(self._h, "lr", float(v))
+
+    @property
+    def decay(self):        return _ml_tune(self._h, "decay", None)
+    @decay.setter
+    def decay(self, v):     _ml_tune(self._h, "decay", float(v))
+
+    @property
+    def temp(self):         return _ml_tune(self._h, "temp", None)
+    @temp.setter
+    def temp(self, v):      _ml_tune(self._h, "temp", float(v))
+
+    @property
+    def sigma(self):        return _ml_tune(self._h, "sigma", None)
+    @sigma.setter
+    def sigma(self, v):     _ml_tune(self._h, "sigma", float(v))
+
+    @property
+    def entropy(self):      return _ml_tune(self._h, "entropy", None)
+    @entropy.setter
+    def entropy(self, v):   _ml_tune(self._h, "entropy", float(v))
+
     def _파일에쓸까(self):
         """save(scored) 가 학습한 뒤 파일까지 쓸지."""
         self._since += 1
@@ -3454,7 +3549,7 @@ def _헤드스펙인가(x):
 
 
 def make(model_name, layers, outputs, optimizer='adam', sigma=1.0, entropy=0.01,
-         autosave=1):
+         autosave=1, lr=0.01, decay=0.0, temp=1.0):
     """
     model_name : 모델 이름 (가중치 파일명)
     layers     : [입력수, 은닉...]   출력은 outputs 에서 정해진다
@@ -3472,6 +3567,16 @@ def make(model_name, layers, outputs, optimizer='adam', sigma=1.0, entropy=0.01,
                  파일 쓰기는 망이 커지면 학습보다 비싸다. 매 스텝 학습하는
                  온라인 RL 이면 100 정도로 두고, 끝낼 때 ai.save() 로 마무리한다.
                  0 이면 자동으로 안 쓴다 (ai.save() 를 직접 불러야 한다).
+    lr         : 학습률 — 틀렸을 때 얼마나 크게 고칠지 (기본 0.01)
+                 안 배워지면 제일 먼저 만져볼 값이다. 크면 요동치고, 작으면 느리다.
+    decay      : 가중치 감쇠 — 외우기(과적합)를 막는 힘 (기본 0 = 끔)
+                 가중치를 0 쪽으로 살살 당겨서 꼭 필요한 것만 남게 한다.
+                 1e-4 ~ 1e-2 정도부터 시작한다. 편향과 logic 게이트에는 안 걸린다.
+    temp       : 고르기 샘플링 온도 (기본 1.0)
+                 작으면 제일 좋아 보이는 것만, 크면 골고루 찔러본다.
+                 0 이면 무작위성 없이 최선만 (배포용). predict() 에는 영향 없다.
+
+    lr / decay / temp / sigma / entropy 는 만든 뒤에도 바꿀 수 있다 (ai.lr = 0.001).
     """
     if len(layers) < 1:
         raise ValueError("layers 는 [입력수, 은닉...] 형태입니다")
@@ -3524,7 +3629,8 @@ def make(model_name, layers, outputs, optimizer='adam', sigma=1.0, entropy=0.01,
         vecs.append(isinstance(spec, _Vec))
 
     h = _ml_make(model_name, inputSz, lay_kind, lay_a, lay_b, sizes, al_arg, cos_arg,
-                 optimizer, float(sigma), float(entropy))
+                 optimizer, float(sigma), float(entropy),
+                 float(lr), float(decay), float(temp))
     return BlackBoxAI(h, model_name, heads, vecs, autosave)
 
 
@@ -3665,7 +3771,7 @@ builtins.gpu_info   = gpu_info
 // ─────────────────────────────────────────────
 // Module init
 // ─────────────────────────────────────────────
-private __gshared PyMethodDef[23] _methods;
+private __gshared PyMethodDef[24] _methods;
 private __gshared PyModuleDef     _moddef;
 
 extern(C) export PyObject* PyInit_ml() nothrow @trusted {
@@ -3692,7 +3798,8 @@ extern(C) export PyObject* PyInit_ml() nothrow @trusted {
         _methods[19] = PyMethodDef("_jepa_meta",         &py_jepa_meta,          METH_VARARGS, null);
         _methods[20] = PyMethodDef("_ml_gpu_info",       &py_ml_gpu_info,        METH_VARARGS, null);
         _methods[21] = PyMethodDef("_ml_logic_rules",    &py_ml_logic_rules,     METH_VARARGS, null);
-        _methods[22] = PyMethodDef(null, null, 0, null);
+        _methods[22] = PyMethodDef("_ml_tune",           &py_ml_tune,            METH_VARARGS, null);
+        _methods[23] = PyMethodDef(null, null, 0, null);
 
         _moddef.m_base.ob_base.ob_refcnt = 1;
         _moddef.m_name    = "my_ml";
