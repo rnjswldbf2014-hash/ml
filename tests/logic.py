@@ -22,16 +22,19 @@ having over a plain Linear:
 Determinism and batched-vs-serial equivalence for logic layers live in
 regression.py, as the "logic", "logic2" and "logicmix" topologies.
 
-The last section covers the file format. The logic layer took it from ver 9 to
-ver 10 (a ver-9 reader would mistake a logic layer for an each layer), so:
-ver 9 still loads, saving upgrades it in place, and a file from some *newer*
-version is moved aside rather than silently overwritten on the next save --
-"cannot read it" is not the same as "safe to throw away".
+The last section covers the file format. Every new layer kind bumps it, because
+an older reader would mistake the new kind for an each layer (logic took it to
+ver 10, memory to ver 11). The rules under test: old versions still load, saving
+upgrades them in place, and a file from some *newer* version is moved aside
+rather than silently overwritten on the next save -- "cannot read it" is not the
+same as "safe to throw away".
 
 Usage: python tests/logic.py     (exit 0 = pass)
 """
 import os
+import random
 import shutil
+import struct
 import subprocess
 import sys
 
@@ -122,9 +125,15 @@ print("\n[round trip] random input wiring and gate weights persist")
 wipe()
 LAYERS = [6, 12, logic(10), logic(10), 8]
 ai = make("lg_rt", LAYERS, [cos], autosave=0)
-rows = [[0.3 * ((i * 7 + k * 3) % 5) - 0.6 for k in range(6)] for i in range(16)]
-targets = [[0.1 * (i % 4)] for i in range(16)]
-for _ in range(200):
+# Varied rows and targets. With only a handful of distinct input values and a
+# cyclic target, two stacked logic layers settle on constant gates and the whole
+# network answers the same number for every input -- which makes the round-trip
+# comparison below pass without testing anything. The probe-spread check guards
+# against that, so keep the training data rich enough to avoid it.
+rnd = random.Random(5)
+rows = [[rnd.gauss(0, 1) for _ in range(6)] for _ in range(24)]
+targets = [[sum(r[:3]) * 0.2] for r in rows]
+for _ in range(120):
     ai.sl(rows, targets)
 
 # Several probes, not one. A single probe can land somewhere the wiring does
@@ -179,8 +188,6 @@ check("both stacked layers report rules", len(maj.rules()) == 2)
 
 # ── weight-file version handling ────────────────────────────────────────
 print("\n[version] ver 9 loads, save upgrades it, newer files are kept")
-import struct   # noqa: E402
-
 VPTH = "vr_ml_memory.pth"
 VLAY = [6, 12, 10]
 
@@ -206,7 +213,7 @@ for _ in range(10):
 vprobe = [0.2, -0.4, 0.1, 0.5, -0.3, 0.0]
 vbefore = vr.predict(vprobe)[0]
 vr.save()
-check("save() writes ver 10", file_ver(VPTH) == 10, f"got {file_ver(VPTH)}")
+check("save() writes the current version (11)", file_ver(VPTH) == 11, f"got {file_ver(VPTH)}")
 
 # ver 9 has the same layout for a network with no logic layer, so stamping the
 # version back to 9 makes a faithful "old file".
@@ -215,7 +222,7 @@ vr2 = make("vr", VLAY, [cos], autosave=0)
 check("ver 9 file still loads", vr2.predict(vprobe)[0] == vbefore,
       f"{vbefore} vs {vr2.predict(vprobe)[0]}")
 vr2.save()
-check("saving a ver 9 file upgrades it to ver 10", file_ver(VPTH) == 10,
+check("saving a ver 9 file upgrades it to the current version", file_ver(VPTH) == 11,
       f"got {file_ver(VPTH)}")
 
 # A file from a newer version cannot be parsed, but it must not be destroyed.

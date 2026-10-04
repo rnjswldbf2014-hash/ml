@@ -31,7 +31,7 @@ version(Windows) {
 }
 
 import std.stdio     : writefln, File;
-import std.math      : exp, sqrt, pow, log, cos, PI, abs;
+import std.math      : exp, sqrt, pow, log, cos, tanh, PI, abs;
 import std.random    : Random, uniform, uniform01, unpredictableSeed;
 import std.file      : exists, remove, rename;
 import std.algorithm : countUntil, min;
@@ -1127,6 +1127,121 @@ private struct LogicLayer {
 }
 
 // ─────────────────────────────────────────────
+// RnnLayer — 기억(메모장)을 들고 다니는 층
+// ─────────────────────────────────────────────
+// 신경망 안에 숫자 n개짜리 메모장(h)을 둔다. 매번 호출될 때마다 "이번 입력과 지금
+// 메모를 보고 메모를 어떻게 고칠지" 를 계산한다. 그래서 입력을 늘리지 않고도 과거를
+// 볼 수 있고, 몇 스텝 전까지 볼지 미리 정할 필요가 없다.
+//
+// 갱신식 (게이트 하나짜리 — GRU 를 절반으로 줄인 형태):
+//     z  = sigmoid(zx(x) + zh(h))        게이트: 이번에 얼마나 고칠까
+//     c  = tanh(gx(x) + gh(h))           고칠 후보값
+//     h' = (1-z)*h + z*c
+//
+// 게이트가 있는 이유: 게이트 없이 h' = tanh(...) 로만 쓰면 매 스텝 tanh 로 눌려서
+// 옛 기억이 금방 사라진다. z 가 0 에 가까우면 h 가 **그대로 통과**하므로 오래 간다.
+// 이 라이브러리가 노리는 "몇십 스텝 전을 기억" 에 그 차이가 크다.
+//
+// ── 제약 (문서에도 적어둔다) ──────────────────────────────────────────
+// ① 기울기는 **1스텝만** 거슬러 간다. (1-z)*h 항에서 h 로 가는 기울기를 끊는다.
+//    끝까지 거슬러 가려면(BPTT) 과거 전체를 들고 있어야 하는데, 이 라이브러리는
+//    "한 스텝씩 들어오는 온라인" 구조라 그럴 자리가 없다.
+//
+//    여기서 오는 결과를 정확히 알아둘 필요가 있다. 중간 스텝들은 정답이 없어서
+//    (sl(x, [None])) 기울기가 0 이고, 1스텝 절단이라 그 0 이 더 거슬러 가지도
+//    않는다. 그래서 **게이트가 "언제 열고 닫을지" 를 아예 못 배운다** — z 는
+//    초기값(0.5) 근처에 머문다. 학습되는 건 마지막 스텝의 "메모 읽는 법" 뿐이다.
+//
+//    즉 도달 거리는 학습이 아니라 **forward 감쇠**가 정한다 (≈0.5^K).
+//    실측 (단서가 t=0 에만 보이고 K 스텝 뒤에 답해야 하는 문제, 5시드):
+//        K=2  5/5      K=4  5/5      K=8  0/5      K=16  0/5
+//    몇 스텝짜리 기억엔 확실히 쓸모 있고, 수십 스텝은 안 된다.
+//    늘리려면 여러 스텝 BPTT 가 필요한데, 그건 "에피소드 구간" 개념이 API 에
+//    있어야 해서 지금 구조로는 안 된다.
+//
+// ② 배치 경로가 없다. 배치는 샘플을 서로 독립으로 처리하는데 메모는 순서대로
+//    이어져야 해서 뜻이 안 맞는다. rnn 이 든 망은 항상 per-sample 직렬로 돈다
+//    (그래서 배치/직렬 결과가 어긋날 일도 없다).
+private struct RnnLayer {
+    int inSz, outSz;
+    Linear gx, gh;        // 후보값: 입력 쪽 / 메모 쪽
+    Linear zx, zh;        // 게이트: 입력 쪽 / 메모 쪽
+
+    float[] h;            // 메모장. 호출 사이에 남는다 (학습된 값이 아니라 현재 상태)
+    float[] hPrev, cc, c, cz, z, ccH, czH;
+    float[] dcc, dcz, dxTmp, dhSink;
+
+    this(int inSz_, int outSz_) {
+        inSz = inSz_; outSz = outSz_;
+        gx = Linear(inSz_, outSz_); gh = Linear(outSz_, outSz_);
+        zx = Linear(inSz_, outSz_); zh = Linear(outSz_, outSz_);
+        // 게이트 편향은 0 으로 둔다 (Linear 의 기본값 그대로) = z 가 0.5 에서 출발.
+        //
+        // LSTM 의 forget-gate-bias 관례를 따라 "유지" 쪽(음수)으로 밀어봤는데
+        // 실측으로 더 나빴다. z 는 유지만 조절하는 게 아니라 쓰기도 같이 조절하기
+        // 때문이다 (h' = (1-z)h + z·c) — z 를 작게 하면 오래 남지만 애초에 적히는
+        // 양도 그만큼 적어진다. 5시드 × K 측정 (90% 넘게 푼 횟수):
+        //       편향   K=2    K=4    K=8
+        //         0    5/5    5/5    0/5
+        //        -1    5/5    4/5    0/5
+        //        -2    5/5    4/5    1/5
+        //        -3    3/5    0/5    0/5
+        // 바꾸려면 이 표를 다시 재고 나서 바꿀 것.
+        foreach (ref a; [&h, &hPrev, &cc, &c, &cz, &z, &ccH, &czH, &dcc, &dcz, &dhSink])
+            { *a = new float[outSz_]; (*a)[] = 0f; }
+        dxTmp = new float[inSz_]; dxTmp[] = 0f;
+    }
+
+    private static float _sig(float v) nothrow @nogc {
+        return 1f / (1f + exp(-v));
+    }
+
+    // 메모를 비운다. 에피소드가 바뀔 때 부른다.
+    void forget() nothrow @nogc { h[] = 0f; }
+
+    void fwd(const(float)[] x, float[] y) {
+        hPrev[] = h[];
+        gx.forward(x, cc);  gh.forward(hPrev, ccH);
+        zx.forward(x, cz);  zh.forward(hPrev, czH);
+        foreach (i; 0..outSz) {
+            cc[i] += ccH[i];  c[i] = tanh(cc[i]);
+            cz[i] += czH[i];  z[i] = _sig(cz[i]);
+            h[i] = (1f - z[i])*hPrev[i] + z[i]*c[i];
+            y[i] = h[i];
+        }
+    }
+
+    // dy -> dx (누적). 가중치 기울기도 네 Linear 에 누적한다.
+    void bwd(const(float)[] x, const(float)[] dy, float[] dx) {
+        foreach (i; 0..outSz) {
+            float dz = dy[i] * (c[i] - hPrev[i]);
+            float dcv = dy[i] * z[i];
+            dcc[i] = dcv * (1f - c[i]*c[i]);          // tanh'
+            dcz[i] = dz  * z[i] * (1f - z[i]);        // sigmoid'
+        }
+        // 입력 쪽: 두 Linear 가 같은 버퍼에 누적한다 (accum 은 더하기만 한다)
+        dxTmp[] = 0f;
+        gx.accum(x, dcc, dxTmp);
+        zx.accum(x, dcz, dxTmp);
+        foreach (k; 0..inSz) dx[k] += dxTmp[k];
+
+        // 메모 쪽: 가중치 기울기는 받되 입력(=지난 메모)으로 가는 기울기는 버린다.
+        // 이게 "1스텝 절단" 이다 — 여기서 안 끊으면 과거 전체를 들고 있어야 한다.
+        dhSink[] = 0f; gh.accum(hPrev, dcc, dhSink);
+        dhSink[] = 0f; zh.accum(hPrev, dcz, dhSink);
+    }
+
+    void zeroGrad() nothrow @nogc {
+        gx.zeroGrad(); gh.zeroGrad(); zx.zeroGrad(); zh.zeroGrad();
+    }
+
+    void step(Opt o, float lr, float decay = 0f) nothrow {
+        gx.step(o, lr, decay); gh.step(o, lr, decay);
+        zx.step(o, lr, decay); zh.step(o, lr, decay);
+    }
+}
+
+// ─────────────────────────────────────────────
 // VICReg — "다 같은 값으로 뭉개지는 것"(collapse) 막기
 // ─────────────────────────────────────────────
 // jepa 처럼 "요약끼리 비교" 하는 학습은 요약기가 잔머리를 굴릴 수 있다: 입력이 뭐든
@@ -1221,8 +1336,15 @@ private class Network {
     AttnLayer[]  attns;
     EachLayer[]  eachs;
     LogicLayer[] logics;
+    RnnLayer[]   rnns;
     Linear[]     heads;
     int          inputSz;
+
+    // rnn 이 하나라도 있으면 배치 경로를 쓸 수 없다 (메모가 순서대로 이어져야 해서).
+    bool hasRnn() const nothrow @nogc { return rnns.length > 0; }
+
+    // 모든 메모를 비운다. 에피소드 경계에서 부른다.
+    void forget() nothrow @nogc { foreach (ref r; rnns) r.forget(); }
 
     int[]     _inSz, _outSz;
     float[][] _inp, _pre;
@@ -1259,6 +1381,12 @@ private class Network {
                 attns ~= AttnLayer(prev, specA[i], specB[i]);
                 kinds ~= 1; slot ~= cast(int)(attns.length - 1);
                 _inSz ~= prev; _outSz ~= prev;      // 폭 유지
+            } else if (specKind[i] == 4) {
+                // Rnn: specA=메모 칸 수 (= 출력 폭)
+                rnns ~= RnnLayer(prev, specA[i]);
+                kinds ~= 4; slot ~= cast(int)(rnns.length - 1);
+                _inSz ~= prev; _outSz ~= specA[i];
+                prev = specA[i];
             } else if (specKind[i] == 3) {
                 // Logic: specA=게이트(출력) 수.
                 // 바로 앞이 또 로직 층이면 입력이 이미 0~1 이라 다시 누르지 않는다.
@@ -1342,6 +1470,13 @@ private class Network {
                         foreach (k; 0..oS) _inp[i+1][k] = _pre[i][k];
                     else
                         foreach (k; 0..oS) _hout[k] = _pre[i][k];
+                } else if (kinds[i] == 4) {
+                    // 여기서 메모가 한 스텝 나아간다 (tanh 출력이라 ReLU 안 건다)
+                    rnns[slot[i]].fwd(_inp[i], _pre[i]);
+                    if (i + 1 < n)
+                        foreach (k; 0..oS) _inp[i+1][k] = _pre[i][k];
+                    else
+                        foreach (k; 0..oS) _hout[k] = _pre[i][k];
                 } else {
                     eachs[slot[i]].fwd(_inp[i], _pre[i]);   // ReLU 는 안에서
                     if (i + 1 < n)
@@ -1376,6 +1511,9 @@ private class Network {
             } else if (kinds[i] == 3) {
                 _dB[0..iS] = 0f;
                 logics[slot[i]].bwd(_inp[i], _dA[0..oS], _dB[0..iS]);
+            } else if (kinds[i] == 4) {
+                _dB[0..iS] = 0f;
+                rnns[slot[i]].bwd(_inp[i], _dA[0..oS], _dB[0..iS]);
             } else {
                 _dB[0..iS] = 0f;
                 eachs[slot[i]].bwd(_inp[i], _dA[0..oS], _dB[0..iS], _dC);
@@ -1459,6 +1597,11 @@ private class Network {
                     case 3:
                         logics[slot[i]].fwdBatch(inp, 다음, B);
                         break;
+                    case 4:
+                        // 여기까지 왔으면 호출자가 rnn 망을 배치 경로로 보낸 것이다.
+                        // slMany/learnBatch 는 hasRnn() 으로 걸러서 직렬로 보낸다.
+                        throw new Exception("rnn 층은 배치 경로를 쓸 수 없습니다"
+                            ~ " (메모가 순서대로 이어져야 합니다)");
                 }
             }
         }
@@ -1526,6 +1669,8 @@ private class Network {
                     dIn[] = 0f;
                     logics[slot[i]].bwdBatch(inp, dOut, dIn, B);
                     break;
+                case 4:
+                    throw new Exception("rnn 층은 배치 경로를 쓸 수 없습니다");
             }
         }
     }
@@ -1535,6 +1680,7 @@ private class Network {
         foreach (ref a; attns) a.zeroGrad();
         foreach (ref e; eachs) e.zeroGrad();
         foreach (ref g; logics) g.zeroGrad();
+        foreach (ref r; rnns)  r.zeroGrad();
         foreach (ref h; heads) h.zeroGrad();
     }
 
@@ -1549,6 +1695,7 @@ private class Network {
         foreach (ref a; attns) a.step(opt, lr, decay);
         foreach (ref e; eachs) e.step(opt, lr, decay);
         foreach (ref g; logics) g.step(opt, lr);
+        foreach (ref r; rnns)  r.step(opt, lr, decay);
         foreach (ref h; heads) h.step(opt, lr, decay);
     }
 }
@@ -1709,6 +1856,7 @@ class BlackBoxAI {
                 if      (layKind[i] == 0) r ~= to!string(layA[i]);
                 else if (layKind[i] == 1) r ~= "attn(" ~ to!string(layA[i]) ~ "," ~ to!string(layB[i]) ~ ")";
                 else if (layKind[i] == 3) r ~= "logic(" ~ to!string(layA[i]) ~ ")";
+                else if (layKind[i] == 4) r ~= "memory(" ~ to!string(layA[i]) ~ ")";
                 else                      r ~= "each(" ~ to!string(layB[i]) ~ ")";
             }
             return r ~ "]";
@@ -1886,7 +2034,8 @@ class BlackBoxAI {
         // 재사용할 게 없는 상태에선 그냥 손해다 (측정: [64,256,256] 에서
         // 0.94ms -> 0.85ms). 배치=1 온라인 학습이 이 라이브러리의 핵심 용도라
         // 그 경로를 제일 짧게 둔다.
-        if (!_noBatch && inputs.length > 1) {
+        // rnn 이 있으면 배치 경로를 쓸 수 없다 — 메모가 순서대로 이어져야 한다.
+        if (!_noBatch && !net.hasRnn && inputs.length > 1) {
             int B = cast(int) inputs.length;
             net._allocBatch(B);
             net.forwardBatch(inputs, B);
@@ -2206,7 +2355,7 @@ class BlackBoxAI {
 
         // ── 묶음 경로: 가중치 행을 배치 전체에 재사용 — Linear/Attn/Each 전부 지원 ──
         // MYML_NOBATCH 환경변수로 끌 수 있다 (per-sample 와 동치 검증용).
-        if (!_noBatch) {
+        if (!_noBatch && !net.hasRnn) {
             int B = cast(int) inputs.length;
             if (_gpuSlMany(inputs, ansVal, use, B)) return;
             net._allocBatch(B);
@@ -2302,9 +2451,10 @@ class BlackBoxAI {
         auto f = File(file, "wb");
         void wu(uint v)  { f.rawWrite((&v)[0..1]); }
         void wf(float v) { f.rawWrite((&v)[0..1]); }
-        // ver 10 = 로직 층(kind 3)이 생긴 버전. 9 와 구조는 같지만, kind 3 이 든
-        // 파일을 옛 바이너리가 읽으면 Each 로 오해해서 조용히 깨진다 — 그래서 올린다.
-        wu(0xBEEFCAFE); wu(10); wu(cast(uint)opt);
+        // ver 10 = 로직 층(kind 3), ver 11 = 기억 층(kind 4). 구조는 9 와 같지만,
+        // 새 kind 가 든 파일을 옛 바이너리가 읽으면 Each 로 오해해서 조용히 깨진다
+        // — 그래서 kind 를 늘릴 때마다 버전을 올린다. 9~11 은 전부 읽는다.
+        wu(0xBEEFCAFE); wu(11); wu(cast(uint)opt);
         wu(cast(uint)net.inputSz);
         wu(cast(uint)layKind.length);
         foreach (i; 0..layKind.length) {
@@ -2348,6 +2498,11 @@ class BlackBoxAI {
                 foreach (v; g.mg) wf(v);
                 foreach (v; g.vg) wf(v);
                 wu(cast(uint)g.t);
+            } else if (net.kinds[i] == 4) {
+                // 메모(h)는 저장하지 않는다 — 배운 값이 아니라 "지금 어디까지 왔나"
+                // 라는 현재 상태다. 불러오면 빈 메모로 시작한다.
+                auto r = &net.rnns[net.slot[i]];
+                wl(r.gx); wl(r.gh); wl(r.zx); wl(r.zh);
             } else {
                 wl(net.eachs[net.slot[i]].lin);
             }
@@ -2362,7 +2517,7 @@ class BlackBoxAI {
         if (ru() != 0xBEEFCAFE) throw new Exception("magic mismatch");
         uint ver = ru();
         if (ver < 9) throw new Exception("예전 포맷입니다. change() 로 변환하세요");
-        if (ver > 10) throw new Exception("더 새 버전에서 저장한 파일입니다 (ver "
+        if (ver > 11) throw new Exception("더 새 버전에서 저장한 파일입니다 (ver "
                                         ~ to!string(ver) ~ ")");
         opt = cast(Opt)ru();
         int inputSz = ru();
@@ -2409,6 +2564,9 @@ class BlackBoxAI {
                 foreach (ref v; g.mg) v = rf();
                 foreach (ref v; g.vg) v = rf();
                 g.t = ru();
+            } else if (net.kinds[i] == 4) {
+                auto r = &net.rnns[net.slot[i]];
+                rl_(r.gx); rl_(r.gh); rl_(r.zx); rl_(r.zh);
             } else {
                 rl_(net.eachs[net.slot[i]].lin);
             }
@@ -2641,7 +2799,7 @@ string changeFile(string path) {
 
     auto w = File(path, "wb");
     void wu(uint v) { w.rawWrite((&v)[0..1]); }
-    wu(0xBEEFCAFE); wu(10); wu(cast(uint) o);
+    wu(0xBEEFCAFE); wu(11); wu(cast(uint) o);
     wu(cast(uint) inputSz);
     wu(cast(uint) nH);
     foreach (i; 0..nH) { wu(cast(uint) kK[i]); wu(cast(uint) kA[i]); wu(cast(uint) kB[i]); }
@@ -2896,6 +3054,17 @@ PyObject* py_ml_gpu_info(PyObject* self, PyObject* args) {
 // 로직 층이 배운 회로를 글로. 층별 리스트의 리스트를 돌려준다.
 // 학습 중에 바꿀 수 있어야 하는 값들 (학습률 스케줄, 탐험 식히기 등).
 // 하나에 몰아넣는다 — 값마다 함수를 만들면 추가할 때마다 메서드 표가 늘어난다.
+// 기억(rnn) 층의 메모를 비운다. 에피소드 경계에서 부른다.
+PyObject* py_ml_forget(PyObject* self, PyObject* args) {
+    try {
+        PyObject* cap;
+        if (!PyArg_ParseTuple(args, "O", &cap)) return null;
+        auto ai = cast(BlackBoxAI) PyCapsule_GetPointer(cap, "BlackBoxAI");
+        if (ai && ai.ready) ai.net.forget();
+        Py_IncRef(_pyNone); return _pyNone;
+    } catch (Throwable t) { setPyError("my_ml: _ml_forget", t); return null; }
+}
+
 PyObject* py_ml_tune(PyObject* self, PyObject* args) {
     try {
         PyObject* cap; PyObject* nameObj; PyObject* valObj;
@@ -3263,6 +3432,38 @@ class _Logic:
 logic = _Logic()
 
 
+class _Memory:
+    """기억을 들고 다니는 층 (순환신경망).
+
+        memory(32)   -> 숫자 32개짜리 메모장
+
+    신경망 안에 메모장을 둔다. 부를 때마다 "이번 입력과 지금 메모를 보고 메모를
+    어떻게 고칠지" 를 계산한다. 그래서 입력을 늘리지 않고도 과거를 볼 수 있고,
+    몇 스텝 전까지 볼지 미리 정할 필요가 없다.
+
+    에피소드가 바뀌면 ai.forget() 으로 메모를 비운다.
+
+    알아둘 것 두 가지:
+      - 기울기가 1스텝만 거슬러 간다. 메모에 든 걸 **읽어 쓰는 법**은 배우지만,
+        "지금 적어두면 20스텝 뒤에 득이 된다" 는 잘 못 배운다.
+      - 묶음(배치) 학습을 쓸 수 없다. 메모는 순서대로 이어져야 하는데 배치는
+        샘플을 독립으로 처리해서 뜻이 안 맞는다. 자동으로 하나씩 처리한다.
+    """
+    __slots__ = ("cells",)
+
+    def __init__(self, cells=0):
+        self.cells = int(cells)
+
+    def __call__(self, cells):
+        if cells < 1: raise ValueError("memory(개수) 는 1 이상이어야 합니다")
+        return _Memory(cells)
+
+    def __repr__(self):
+        return f"memory({self.cells})"
+
+memory = _Memory()
+
+
 class _Vec:
     """숫자 여러 개를 한 덩어리로 내는 출력.
 
@@ -3372,6 +3573,14 @@ class BlackBoxAI:
             self._since = 0
             return True
         return False
+
+    def forget(self):
+        """memory() 층의 메모를 비운다. 에피소드가 바뀔 때 부른다.
+
+        안 부르면 지난 판의 기억을 들고 새 판을 시작한다.
+        memory() 층이 없으면 아무 일도 하지 않는다.
+        """
+        _ml_forget(self._h)
 
     def rules(self):
         """로직 층이 배운 논리식을 글로 읽는다. 층이 여러 개면 리스트의 리스트.
@@ -3596,6 +3805,10 @@ def make(model_name, layers, outputs, optimizer='adam', sigma=1.0, entropy=0.01,
             lay_kind.append(1); lay_a.append(L.items); lay_b.append(L.heads)
             항목수 = L.items
             # 폭 그대로
+        elif isinstance(L, _Memory):
+            lay_kind.append(4); lay_a.append(L.cells); lay_b.append(0)
+            폭 = L.cells
+            항목수 = 0                       # 메모는 항목 구분을 유지하지 않는다
         elif isinstance(L, _Logic):
             lay_kind.append(3); lay_a.append(L.gates); lay_b.append(0)
             폭 = L.gates
@@ -3771,7 +3984,7 @@ builtins.gpu_info   = gpu_info
 // ─────────────────────────────────────────────
 // Module init
 // ─────────────────────────────────────────────
-private __gshared PyMethodDef[24] _methods;
+private __gshared PyMethodDef[25] _methods;
 private __gshared PyModuleDef     _moddef;
 
 extern(C) export PyObject* PyInit_ml() nothrow @trusted {
@@ -3799,7 +4012,8 @@ extern(C) export PyObject* PyInit_ml() nothrow @trusted {
         _methods[20] = PyMethodDef("_ml_gpu_info",       &py_ml_gpu_info,        METH_VARARGS, null);
         _methods[21] = PyMethodDef("_ml_logic_rules",    &py_ml_logic_rules,     METH_VARARGS, null);
         _methods[22] = PyMethodDef("_ml_tune",           &py_ml_tune,            METH_VARARGS, null);
-        _methods[23] = PyMethodDef(null, null, 0, null);
+        _methods[23] = PyMethodDef("_ml_forget",         &py_ml_forget,          METH_VARARGS, null);
+        _methods[24] = PyMethodDef(null, null, 0, null);
 
         _moddef.m_base.ob_base.ob_refcnt = 1;
         _moddef.m_name    = "my_ml";
