@@ -60,6 +60,21 @@ CONFIGS = [
     ("default", {}),
 ]
 
+# Topologies holding a memory() layer run with BPTT off. The batched path
+# back-propagates through the whole bundle; the serial path physically cannot
+# (it interleaves forward and backward per sample, so the rest of the chain
+# does not exist yet when a sample's backward runs). So with BPTT on, the two
+# paths compute deliberately different gradients and "nobatch == batched" is
+# not a property either path is trying to have. Turning it off for BOTH sides
+# restores the comparison, which is what this harness is for: it still
+# exercises the shared machinery -- the tape, the item/slot wiring, the
+# gradient accumulation order. The BPTT path has its own checks in
+# tests/memory.py (it is the only thing that makes K=8 solvable at all).
+PER_TOPO_ENV = {
+    "memory":    {"MYML_BPTT": "0"},
+    "memorymix": {"MYML_BPTT": "0"},
+}
+
 
 def build_module():
     if os.path.isdir(MODULE_DIR):
@@ -127,7 +142,7 @@ def main():
         name = f"probe_{topo}"
         init_dir = os.path.join(SCRATCH, topo, "_init")
         os.makedirs(init_dir, exist_ok=True)
-        run_probe("init", topo, name, init_dir, {})
+        run_probe("init", topo, name, init_dir, PER_TOPO_ENV.get(topo, {}))
         pth_name = f"{name}_ml_memory.pth"
         snapshot = os.path.join(init_dir, pth_name)
         if not os.path.isfile(snapshot):
@@ -140,7 +155,9 @@ def main():
             cfg_dir = os.path.join(SCRATCH, topo, cfg_name)
             os.makedirs(cfg_dir, exist_ok=True)
             shutil.copyfile(snapshot, os.path.join(cfg_dir, pth_name))
-            outputs[cfg_name] = run_probe("run", topo, name, cfg_dir, extra_env)
+            env = dict(extra_env)
+            env.update(PER_TOPO_ENV.get(topo, {}))
+            outputs[cfg_name] = run_probe("run", topo, name, cfg_dir, env)
 
         # tier 1: threads1/threadsN/default must be bit-exact (same code path)
         strict_baseline = outputs["threads1"]

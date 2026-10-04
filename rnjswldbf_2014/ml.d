@@ -42,6 +42,13 @@ import std.range     : iota;
 import gpucl;
 
 __gshared bool _noBatch = false;
+// 묶음을 하나의 사슬로 보고 시간을 거슬러 올라간다 (BPTT). **기본 켜짐.**
+// 1스텝 절단이 진짜 기울기와 얼마나 다른지 재봤는데 최대 기울기의 60% 였다 —
+// 대안이 아니라 그냥 틀린 값이다. MYML_BPTT=0 으로 예전 동작(1스텝 절단)으로
+// 돌릴 수 있고, 그건 "묶음 == 직렬" 동치 검증용이다 (직렬 경로는 순전파와
+// 역전파를 샘플마다 번갈아 하므로 사슬 전체를 들고 있을 수가 없어서 BPTT 가
+// 구조적으로 불가능하다. 그래서 둘을 비교할 때는 양쪽 다 꺼야 한다).
+__gshared bool _bptt = true;
 __gshared int  _nThreads = 1;
 // GPU 사용 여부: "0"=완전 비활성(OpenCL.dll 프로브도 안 함), "1"=강제(문턱값 무시),
 // "auto"=문턱값 넘는 큰 배치에서만 지연 프로브.
@@ -57,6 +64,7 @@ __gshared long   _gpuMinFlops = 50_000_000;
 __gshared int    _gpuMinB = 64;
 shared static this() {
     try { _noBatch = environment.get("MYML_NOBATCH", "") == "1"; } catch (Exception e) {}
+    try { _bptt = environment.get("MYML_BPTT", "1") != "0"; } catch (Exception e) {}
     try {
         auto s = environment.get("MYML_THREADS", "");
         _nThreads = (s.length ? s.to!int : totalCPUs);
@@ -1142,26 +1150,37 @@ private struct LogicLayer {
 // 옛 기억이 금방 사라진다. z 가 0 에 가까우면 h 가 **그대로 통과**하므로 오래 간다.
 // 이 라이브러리가 노리는 "몇십 스텝 전을 기억" 에 그 차이가 크다.
 //
-// ── 제약 (문서에도 적어둔다) ──────────────────────────────────────────
-// ① 기울기는 **1스텝만** 거슬러 간다. (1-z)*h 항에서 h 로 가는 기울기를 끊는다.
-//    끝까지 거슬러 가려면(BPTT) 과거 전체를 들고 있어야 하는데, 이 라이브러리는
-//    "한 스텝씩 들어오는 온라인" 구조라 그럴 자리가 없다.
+// ── 도달 거리는 "어떻게 주느냐" 가 정한다 ────────────────────────────
+// 기울기가 과거로 몇 스텝 거슬러 가는지가 전부인데, 그게 호출 모양에 달려있다.
 //
-//    여기서 오는 결과를 정확히 알아둘 필요가 있다. 중간 스텝들은 정답이 없어서
-//    (sl(x, [None])) 기울기가 0 이고, 1스텝 절단이라 그 0 이 더 거슬러 가지도
-//    않는다. 그래서 **게이트가 "언제 열고 닫을지" 를 아예 못 배운다** — z 는
-//    초기값(0.5) 근처에 머문다. 학습되는 건 마지막 스텝의 "메모 읽는 법" 뿐이다.
+// ① **한 스텝씩** sl() 을 부르면 1스텝 절단이다. 그 호출에 사슬이라고 할 게
+//    없으니(B=1) 어쩔 수 없다. 중간 스텝은 정답이 없어서(sl(x,[None])) 기울기가
+//    0 이고 그 0 이 더 거슬러 가지도 않는다. 그래서 **게이트가 "언제 열고 닫을지"
+//    를 못 배우고** z 는 초기값 0.5 근처에 머문다. 배우는 건 마지막 스텝의
+//    "메모 읽는 법" 뿐이고, 도달 거리는 학습이 아니라 forward 감쇠(≈0.5^K)가
+//    정한다.
 //
-//    즉 도달 거리는 학습이 아니라 **forward 감쇠**가 정한다 (≈0.5^K).
-//    실측 (단서가 t=0 에만 보이고 K 스텝 뒤에 답해야 하는 문제, 5시드):
-//        K=2  5/5      K=4  5/5      K=8  0/5      K=16  0/5
-//    몇 스텝짜리 기억엔 확실히 쓸모 있고, 수십 스텝은 안 된다.
-//    늘리려면 여러 스텝 BPTT 가 필요한데, 그건 "에피소드 구간" 개념이 API 에
-//    있어야 해서 지금 구조로는 안 된다.
+// ② **에피소드를 묶음으로** 주면 사슬 전체를 거슬러 간다 (BPTT). fwdBatch 가
+//    샘플마다 hPrevB/cB/zB 를 남기므로 테이프가 이미 있고, bwdBatch 가 b 를
+//    내림차순으로 돌면서 h 로 가는 기울기를 이어 넘긴다 (_bwdBatchBptt).
+//    이제 게이트도 배운다.
 //
-// ② 배치 경로가 없다. 배치는 샘플을 서로 독립으로 처리하는데 메모는 순서대로
-//    이어져야 해서 뜻이 안 맞는다. rnn 이 든 망은 항상 per-sample 직렬로 돈다
-//    (그래서 배치/직렬 결과가 어긋날 일도 없다).
+//        with ai.round():
+//            ai.sl(한_에피소드_입력들, 한_에피소드_정답들)
+//
+// 실측 (단서가 t=0 에만 보이고 K 스텝 뒤에 답해야 하는 문제, 10시드,
+// [2, memory(16), 16], lr=0.02, 4000판):
+//        K          4       8      16      32
+//     ① 한 스텝씩  9/10   1/10    0/10    0/10
+//     ② 묶음+BPTT  10/10  10/10   5/10    1/10
+// 묶어서 주되 BPTT 를 끄면 ① 과 같다 — 이득은 묶음이 아니라 BPTT 가 낸다.
+// 비용은 학습 시간 +15~25%. 쓸모 있는 범위가 K≈4 에서 K≈8(확실)~16(반반)로 늘었다.
+// K=32 는 여전히 안 된다. 결과가 양극단으로 갈리는 성질은 그대로다.
+//
+// 1스텝 절단이 진짜 기울기와 얼마나 다른지도 재봤다: **최대 기울기의 60%**.
+// 유한차분 ↔ 독립 파이썬 역전파 ↔ 이 코드 3중으로 확인했다 (각각 1e-5, 1e-7).
+// 임시 프로브로 한 번 보고 지웠다 — 상시 감시는 tests/memory.py 의 K=8 과
+// "B=1 이면 BPTT 를 켜도 꺼도 같은 값" 이다.
 private struct RnnLayer {
     int inSz, outSz;
     Linear gx, gh;        // 후보값: 입력 쪽 / 메모 쪽
@@ -1174,6 +1193,7 @@ private struct RnnLayer {
     // 배치용 — 샘플마다 역전파에 필요한 값(지난 메모, 후보값, 게이트)을 남겨둔다.
     int _bcap;
     float[] hPrevB, cB, zB;
+    float[] dhCarry;      // BPTT: 다음(시간상 뒤) 스텝에서 흘러온 기울기
 
     this(int inSz_, int outSz_) {
         inSz = inSz_; outSz = outSz_;
@@ -1191,7 +1211,8 @@ private struct RnnLayer {
         //        -2    5/5    4/5    1/5
         //        -3    3/5    0/5    0/5
         // 바꾸려면 이 표를 다시 재고 나서 바꿀 것.
-        foreach (ref a; [&h, &hPrev, &cc, &c, &cz, &z, &ccH, &czH, &dcc, &dcz, &dhSink])
+        foreach (ref a; [&h, &hPrev, &cc, &c, &cz, &z, &ccH, &czH, &dcc, &dcz,
+                         &dhSink, &dhCarry])
             { *a = new float[outSz_]; (*a)[] = 0f; }
         dxTmp = new float[inSz_]; dxTmp[] = 0f;
     }
@@ -1269,9 +1290,11 @@ private struct RnnLayer {
         }
     }
 
-    // dY -> dX (누적). b 오름차순 고정 — 가중치 기울기 합산 순서가 고정돼야
-    // 직렬 경로와 비트 단위로 맞는다.
+    // dY -> dX (누적). _bptt 가 꺼져 있을 때만 쓰는 1스텝 절단 경로다.
+    // b 오름차순 고정 — 가중치 기울기 합산 순서가 고정돼야 직렬 경로와
+    // 비트 단위로 맞는다 (MYML_BPTT=0 동치 검증).
     void bwdBatch(const(float)[] X, const(float)[] dY, float[] dX, int B) {
+        if (_bptt) { _bwdBatchBptt(X, dY, dX, B); return; }
         foreach (b; 0..B) {
             auto x  = X[b*inSz .. (b+1)*inSz];
             auto hp = hPrevB[b*outSz .. (b+1)*outSz];
@@ -1291,6 +1314,40 @@ private struct RnnLayer {
             // 1스텝 절단 — 지난 메모로 가는 기울기는 버린다 (per-sample 과 동일)
             dhSink[] = 0f; gh.accum(hp, dcc, dhSink);
             dhSink[] = 0f; zh.accum(hp, dcz, dhSink);
+        }
+    }
+
+    // 묶음 전체를 하나의 사슬로 보고 시간을 거슬러 간다 (BPTT).
+    // b 를 내림차순으로 돌면서 h 로 가는 기울기를 dhCarry 에 이어 넘긴다.
+    //   h_b = (1-z_b)*h_{b-1} + z_b*c_b   이므로 h_{b-1} 로 가는 길이 셋이다:
+    //     ① 직접 통과:  d_b * (1-z_b)
+    //     ② 후보값 경유: gh 의 입력 기울기
+    //     ③ 게이트 경유: zh 의 입력 기울기
+    // 1스텝 절단은 ①을 버리고 ②③의 입력 기울기를 버리는 것이었다.
+    private void _bwdBatchBptt(const(float)[] X, const(float)[] dY, float[] dX, int B) {
+        dhCarry[] = 0f;
+        foreach_reverse (b; 0..B) {
+            auto x  = X[b*inSz .. (b+1)*inSz];
+            auto hp = hPrevB[b*outSz .. (b+1)*outSz];
+            auto cb = cB[b*outSz .. (b+1)*outSz];
+            auto zb = zB[b*outSz .. (b+1)*outSz];
+            foreach (i; 0..outSz) {
+                float d   = dY[b*outSz + i] + dhCarry[i];
+                float dz  = d * (cb[i] - hp[i]);
+                float dcv = d * zb[i];
+                dcc[i] = dcv * (1f - cb[i]*cb[i]);
+                dcz[i] = dz  * zb[i] * (1f - zb[i]);
+                dhCarry[i] = d * (1f - zb[i]);          // ① 직접 통과
+            }
+            dxTmp[] = 0f;
+            gx.accum(x, dcc, dxTmp);
+            zx.accum(x, dcz, dxTmp);
+            foreach (k; 0..inSz) dX[b*inSz + k] += dxTmp[k];
+            // ②③ — 지난 메모로 가는 기울기를 버리지 않고 모아서 넘긴다
+            dhSink[] = 0f;
+            gh.accum(hp, dcc, dhSink);
+            zh.accum(hp, dcz, dhSink);
+            foreach (i; 0..outSz) dhCarry[i] += dhSink[i];
         }
     }
 

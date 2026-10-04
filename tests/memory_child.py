@@ -6,7 +6,10 @@ Intermediate steps are trained with answer None, so they contribute no loss --
 they only advance the memo.
 
 argv: <layers-spec> <K> <seed> <rounds>
-  layers-spec is "plain" (no memory layer) or "mem" (with one)
+  layers-spec is "plain"  (no memory layer)
+                "mem"    (memory layer, sl() called one step at a time)
+                "bundle" (memory layer, the whole episode handed over as one
+                          bundle -- which is what lets BPTT run through it)
 """
 import os
 import random
@@ -26,22 +29,36 @@ from ml import make, memory          # noqa: E402
 SPEC, K, SEED, ROUNDS = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
 ANS = ["A", "B"]
 LAYERS = [2, 16] if SPEC == "plain" else [2, memory(16), 16]
+CUE = lambda c: [1.0, 0.0] if c == 0 else [0.0, 1.0]
 
 ai = make("m", LAYERS, [ANS], autosave=0, lr=0.02)
 
 
+def steps(cue):
+    """The episode as plain data: K+1 inputs, an answer only on the last one."""
+    xs = [CUE(cue)] + [[0.0, 0.0]] * K
+    ys = [None] * K + [[ANS[cue]]]
+    return xs, ys
+
+
 def episode(cue, learn):
-    ai.forget()
-    for t in range(K + 1):
-        x = ([1.0, 0.0] if cue == 0 else [0.0, 1.0]) if t == 0 else [0.0, 0.0]
-        if t < K:
-            # No answer: this step only moves the memo along.
-            ai.sl(x, [None]) if learn else ai.predict(x)
-        else:
-            if learn:
-                ai.sl(x, [ANS[cue]])
-                return None
-            return ai.predict(x)[0]
+    xs, ys = steps(cue)
+    with ai.round():
+        if learn:
+            if SPEC == "bundle":
+                # One update for the whole chain. The memo runs in order inside
+                # the layer, so the bundle IS the sequence -- and the backward
+                # pass can walk back down it.
+                ai.sl(xs, ys)
+            else:
+                # One update per step. There is no chain in a single call, so
+                # the gradient is truncated to one step no matter what.
+                for x, y in zip(xs, ys):
+                    ai.sl(x, y)
+            return None
+        for x in xs[:-1]:
+            ai.predict(x)
+        return ai.predict(xs[-1])[0]
 
 
 rnd = random.Random(SEED)
