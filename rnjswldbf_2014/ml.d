@@ -2674,24 +2674,33 @@ private extern(C) nothrow @nogc {
 private @trusted:
 
 string[] pyStrList(PyObject* lst) {
-    string[] r;
-    foreach (i; 0..PyList_Size(lst))
-        r ~= fromStringz(PyUnicode_AsUTF8(PyList_GetItem(lst, i))).idup;
+    auto n = PyList_Size(lst);
+    if (n <= 0) return null;
+    auto r = new string[n];
+    foreach (i; 0..n) r[i] = fromStringz(PyUnicode_AsUTF8(PyList_GetItem(lst, i))).idup;
     return r;
 }
 string[][] pyLals(PyObject* lals) {
-    string[][] r;
-    foreach (i; 0..PyList_Size(lals)) r ~= pyStrList(PyList_GetItem(lals, i));
+    auto n = PyList_Size(lals);
+    if (n <= 0) return null;
+    auto r = new string[][n];
+    foreach (i; 0..n) r[i] = pyStrList(PyList_GetItem(lals, i));
     return r;
 }
+// 길이를 먼저 물어보고 한 번에 잡는다. 예전엔 `~=` 로 늘려가서 입력 길이에
+// 로그 비례로 재할당이 났다 — 배치 1 호출마다 지나가는 자리라 그게 다 비용이었다.
 float[] pyFloatList(PyObject* lst) {
-    float[] r;
-    foreach (i; 0..PyList_Size(lst)) r ~= cast(float) PyFloat_AsDouble(PyList_GetItem(lst, i));
+    auto n = PyList_Size(lst);
+    if (n <= 0) return null;
+    auto r = new float[n];
+    foreach (i; 0..n) r[i] = cast(float) PyFloat_AsDouble(PyList_GetItem(lst, i));
     return r;
 }
 int[] pyIntList(PyObject* lst) {
-    int[] r;
-    foreach (i; 0..PyList_Size(lst)) r ~= cast(int) PyLong_AsLong(PyList_GetItem(lst, i));
+    auto n = PyList_Size(lst);
+    if (n <= 0) return null;
+    auto r = new int[n];
+    foreach (i; 0..n) r[i] = cast(int) PyLong_AsLong(PyList_GetItem(lst, i));
     return r;
 }
 PyObject* toPyList(string[] strs) {
