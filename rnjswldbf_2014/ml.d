@@ -1171,6 +1171,10 @@ private struct RnnLayer {
     float[] hPrev, cc, c, cz, z, ccH, czH;
     float[] dcc, dcz, dxTmp, dhSink;
 
+    // 배치용 — 샘플마다 역전파에 필요한 값(지난 메모, 후보값, 게이트)을 남겨둔다.
+    int _bcap;
+    float[] hPrevB, cB, zB;
+
     this(int inSz_, int outSz_) {
         inSz = inSz_; outSz = outSz_;
         gx = Linear(inSz_, outSz_); gh = Linear(outSz_, outSz_);
@@ -1229,6 +1233,65 @@ private struct RnnLayer {
         // 이게 "1스텝 절단" 이다 — 여기서 안 끊으면 과거 전체를 들고 있어야 한다.
         dhSink[] = 0f; gh.accum(hPrev, dcc, dhSink);
         dhSink[] = 0f; zh.accum(hPrev, dcz, dhSink);
+    }
+
+    private void _allocBatch(int B) {
+        if (B <= _bcap) return;
+        hPrevB = new float[B*outSz]; hPrevB[] = 0f;
+        cB     = new float[B*outSz]; cB[]     = 0f;
+        zB     = new float[B*outSz]; zB[]     = 0f;
+        _bcap = B;
+    }
+
+    // 배치여도 메모는 순서대로 이어져야 하므로 b 를 차례로 돈다.
+    // 묶음의 이득은 이 층 앞뒤가 받는다 — 거기는 샘플이 서로 독립이라 그대로
+    // 묶여서 돌고, 보통 계산량의 대부분이 그쪽이다.
+    //
+    // 중요: 도는 순서가 per-sample 경로와 같다 (b 오름차순으로 메모가 한 칸씩
+    // 나아간다). 그래서 묶음과 직렬이 같은 답을 낸다 — 이 라이브러리의
+    // MYML_NOBATCH 동치 불변조건을 깨지 않는다.
+    void fwdBatch(const(float)[] X, float[] Y, int B) {
+        _allocBatch(B);
+        foreach (b; 0..B) {
+            auto x  = X[b*inSz .. (b+1)*inSz];
+            auto hp = hPrevB[b*outSz .. (b+1)*outSz];
+            auto cb = cB[b*outSz .. (b+1)*outSz];
+            auto zb = zB[b*outSz .. (b+1)*outSz];
+            hp[] = h[];
+            gx.forward(x, cc);  gh.forward(hp, ccH);
+            zx.forward(x, cz);  zh.forward(hp, czH);
+            foreach (i; 0..outSz) {
+                cb[i] = tanh(cc[i] + ccH[i]);
+                zb[i] = _sig(cz[i] + czH[i]);
+                h[i]  = (1f - zb[i])*hp[i] + zb[i]*cb[i];
+                Y[b*outSz + i] = h[i];
+            }
+        }
+    }
+
+    // dY -> dX (누적). b 오름차순 고정 — 가중치 기울기 합산 순서가 고정돼야
+    // 직렬 경로와 비트 단위로 맞는다.
+    void bwdBatch(const(float)[] X, const(float)[] dY, float[] dX, int B) {
+        foreach (b; 0..B) {
+            auto x  = X[b*inSz .. (b+1)*inSz];
+            auto hp = hPrevB[b*outSz .. (b+1)*outSz];
+            auto cb = cB[b*outSz .. (b+1)*outSz];
+            auto zb = zB[b*outSz .. (b+1)*outSz];
+            foreach (i; 0..outSz) {
+                float d   = dY[b*outSz + i];
+                float dz  = d * (cb[i] - hp[i]);
+                float dcv = d * zb[i];
+                dcc[i] = dcv * (1f - cb[i]*cb[i]);
+                dcz[i] = dz  * zb[i] * (1f - zb[i]);
+            }
+            dxTmp[] = 0f;
+            gx.accum(x, dcc, dxTmp);
+            zx.accum(x, dcz, dxTmp);
+            foreach (k; 0..inSz) dX[b*inSz + k] += dxTmp[k];
+            // 1스텝 절단 — 지난 메모로 가는 기울기는 버린다 (per-sample 과 동일)
+            dhSink[] = 0f; gh.accum(hp, dcc, dhSink);
+            dhSink[] = 0f; zh.accum(hp, dcz, dhSink);
+        }
     }
 
     void zeroGrad() nothrow @nogc {
@@ -1476,9 +1539,6 @@ private class Network {
     ConvLayer[]  convs;
     Linear[]     heads;
     int          inputSz;
-
-    // rnn 이 하나라도 있으면 배치 경로를 쓸 수 없다 (메모가 순서대로 이어져야 해서).
-    bool hasRnn() const nothrow @nogc { return rnns.length > 0; }
 
     // 모든 메모를 비운다. 에피소드 경계에서 부른다.
     void forget() nothrow @nogc { foreach (ref r; rnns) r.forget(); }
@@ -1754,10 +1814,10 @@ private class Network {
                         logics[slot[i]].fwdBatch(inp, 다음, B);
                         break;
                     case 4:
-                        // 여기까지 왔으면 호출자가 rnn 망을 배치 경로로 보낸 것이다.
-                        // slMany/learnBatch 는 hasRnn() 으로 걸러서 직렬로 보낸다.
-                        throw new Exception("rnn 층은 배치 경로를 쓸 수 없습니다"
-                            ~ " (메모가 순서대로 이어져야 합니다)");
+                        // 이 층만 b 를 차례로 돈다 (메모가 이어져야 해서).
+                        // 앞뒤 층은 그대로 묶여서 돈다.
+                        rnns[slot[i]].fwdBatch(inp, 다음, B);
+                        break;
                     case 5:
                         convs[slot[i]].fwdBatch(inp, 다음, B);
                         break;
@@ -1829,7 +1889,9 @@ private class Network {
                     logics[slot[i]].bwdBatch(inp, dOut, dIn, B);
                     break;
                 case 4:
-                    throw new Exception("rnn 층은 배치 경로를 쓸 수 없습니다");
+                    dIn[] = 0f;          // bwdBatch 는 누적만 한다
+                    rnns[slot[i]].bwdBatch(inp, dOut, dIn, B);
+                    break;
                 case 5:
                     // col2im 이 더하기만 하므로 호출자가 먼저 비운다.
                     // tmp 로 _bDZ[i] 를 쓴다 (크기 B*_outSz[i] = B*items*outCh).
@@ -2205,8 +2267,7 @@ class BlackBoxAI {
         // 재사용할 게 없는 상태에선 그냥 손해다 (측정: [64,256,256] 에서
         // 0.94ms -> 0.85ms). 배치=1 온라인 학습이 이 라이브러리의 핵심 용도라
         // 그 경로를 제일 짧게 둔다.
-        // rnn 이 있으면 배치 경로를 쓸 수 없다 — 메모가 순서대로 이어져야 한다.
-        if (!_noBatch && !net.hasRnn && inputs.length > 1) {
+        if (!_noBatch && inputs.length > 1) {
             int B = cast(int) inputs.length;
             net._allocBatch(B);
             net.forwardBatch(inputs, B);
@@ -2526,7 +2587,7 @@ class BlackBoxAI {
 
         // ── 묶음 경로: 가중치 행을 배치 전체에 재사용 — Linear/Attn/Each 전부 지원 ──
         // MYML_NOBATCH 환경변수로 끌 수 있다 (per-sample 와 동치 검증용).
-        if (!_noBatch && !net.hasRnn) {
+        if (!_noBatch) {
             int B = cast(int) inputs.length;
             if (_gpuSlMany(inputs, ansVal, use, B)) return;
             net._allocBatch(B);
@@ -3567,23 +3628,23 @@ attn = _Attn()
 class _Each:
     """항목마다 따로 도는 층. 같은 가중치를 항목 수만큼 돌려쓴다.
 
-        each(64)   -> 항목 하나를 64칸으로
+        each(64)       -> 항목 하나를 64칸으로 (항목 수는 앞 층에서 물려받는다)
+        each(64, 8)    -> 항목 8개로 직접 지정 (맨 앞에 쓸 때)
 
     일반 층은 전체를 한 덩어리로 섞어서 항목 구분이 사라진다.
-    attn 사이에 이걸 끼우면 항목이 끝까지 유지된다.
-    앞에 tok 이나 attn 이 있어야 항목 수를 알 수 있다.
+    attn/conv 사이에 이걸 끼우면 항목이 끝까지 유지된다.
     """
-    __slots__ = ("width",)
+    __slots__ = ("width", "items")
 
-    def __init__(self, width=0):
-        self.width = int(width)
+    def __init__(self, width=0, items=0):
+        self.width, self.items = int(width), int(items)
 
-    def __call__(self, width):
+    def __call__(self, width, items=0):
         if width < 1: raise ValueError("each(폭) 은 1 이상이어야 합니다")
-        return _Each(width)
+        return _Each(width, items)
 
     def __repr__(self):
-        return f"each({self.width})"
+        return f"each({self.width}" + (f", {self.items})" if self.items else ")")
 
 each = _Each()
 
@@ -3735,7 +3796,7 @@ _NAN = float("nan")
 
 
 class BlackBoxAI:
-    def __init__(self, h, name, heads, vecs=None, autosave=1):
+    def __init__(self, h, name, heads, vecs=None, autosave=1, has_memory=False):
         self._h     = h
         self._name  = name
         self._heads = heads          # [(actions or None, cos:bool), ...]
@@ -3743,6 +3804,21 @@ class BlackBoxAI:
         self._vecs  = list(vecs) if vecs else [False]*len(heads)
         self._autosave = int(autosave)
         self._since    = 0           # 마지막으로 파일에 쓴 뒤 학습한 횟수
+        # memory 층을 썼는데 forget() 을 한 번도 안 부르면 판이 전부 이어져버린다.
+        # 오류도 안 나고 결과만 조용히 나빠지는 종류라 한 번 알려준다.
+        self._has_memory = bool(has_memory)
+        self._forgot     = False
+        self._warned     = False
+
+    def _메모경고(self):
+        if self._has_memory and not self._forgot and not self._warned:
+            self._warned = True
+            import warnings
+            warnings.warn(
+                f"[{self._name}] memory() 층이 있는데 forget() 을 한 번도 안 불렀습니다."
+                " 판(에피소드)이 바뀔 때 ai.forget() 을 부르지 않으면 지난 판의 기억을"
+                " 들고 새 판을 시작합니다 (오류는 안 나고 결과만 나빠집니다).",
+                RuntimeWarning, stacklevel=3)
 
     @property
     def autosave(self):     return self._autosave
@@ -3788,11 +3864,12 @@ class BlackBoxAI:
         return False
 
     def forget(self):
-        """memory() 층의 메모를 비운다. 에피소드가 바뀔 때 부른다.
+        """memory() 층의 메모를 비운다. 판(에피소드)이 바뀔 때 부른다.
 
         안 부르면 지난 판의 기억을 들고 새 판을 시작한다.
         memory() 층이 없으면 아무 일도 하지 않는다.
         """
+        self._forgot = True
         _ml_forget(self._h)
 
     def rules(self):
@@ -3828,9 +3905,14 @@ class BlackBoxAI:
         return out, units, raw
 
     def _legal_arg(self, legal):
-        """legal 은 항상 출력 개수만큼의 리스트. 안 거는 자리는 None."""
+        """legal 은 출력 개수만큼의 리스트. 안 거는 자리는 None.
+        출력이 하나면 액션 목록을 그냥 줘도 받는다 (legal=["왼쪽","정지"])."""
         if legal is None:
             return [[] for _ in range(self._n)]
+        # 문자열만 든 리스트 = 액션 목록 하나
+        if self._n == 1 and isinstance(legal, (list, tuple)) \
+                and legal and all(isinstance(x, str) for x in legal):
+            legal = [legal]
         if len(legal) != self._n:
             raise ValueError(f"legal 은 출력 개수({self._n})만큼 주세요. 안 걸 자리는 None")
         return [list(x) if x else [] for x in legal]
@@ -3842,11 +3924,21 @@ class BlackBoxAI:
         out, units, raw = self._decode(flat)
         return Step(inp, out, units, raw)
 
+    def _펼치기(self, v, 뭐):
+        """출력이 하나면 값 하나를 그냥 받는다. 여러 개면 개수만큼의 리스트여야 한다."""
+        if isinstance(v, (list, tuple)):
+            return list(v)
+        if self._n == 1:
+            return [v]
+        raise ValueError(
+            f"{뭐}는 출력 개수({self._n})만큼의 리스트로 주세요 "
+            f"(출력이 하나일 때만 값 하나로 줄 수 있습니다)")
+
     # ── 순수: 보상 붙이기 ──
     def reward(self, data, point):
-        """point 는 출력 개수만큼의 리스트. None 이면 그 출력은 학습에서 빠진다."""
-        if not isinstance(point, (list, tuple)):
-            raise ValueError(f"점수는 리스트로 주세요 (출력 {self._n}개)")
+        """point 는 출력 개수만큼의 리스트 (하나면 값 하나도 된다).
+        None 이면 그 출력은 학습에서 빠진다."""
+        point = self._펼치기(point, "점수")
         if len(point) != self._n:
             raise ValueError(f"점수 개수({len(point)})가 출력 개수({self._n})와 다릅니다")
         for i, pt in enumerate(point):
@@ -3876,6 +3968,7 @@ class BlackBoxAI:
             values.append([float(v) if c else 0.0
                            for v, (_, c) in zip(s._raw, self._heads)])
             points.append([_NAN if x is None else float(x) for x in s.point])
+        self._메모경고()
         _ml_learn(self._h, inputs, chosen, values, points)
         if self._파일에쓸까():
             _ml_save(self._h)
@@ -3887,8 +3980,7 @@ class BlackBoxAI:
         ansV = [0.0] * self._n
         use  = [0] * self._n
         if answer is not None:
-            if not isinstance(answer, (list, tuple)):
-                raise ValueError(f"정답은 리스트로 주세요 (출력 {self._n}개)")
+            answer = self._펼치기(answer, "정답")
             if len(answer) != self._n:
                 raise ValueError(f"정답 개수({len(answer)})가 출력 개수({self._n})와 다릅니다")
             for i, a in enumerate(answer):
@@ -3910,6 +4002,7 @@ class BlackBoxAI:
             ai.sl(입력, 정답)                 # 하나
             ai.sl([입력1, 입력2, ...], [정답1, 정답2, ...])   # 묶음
         """
+        self._메모경고()
         묶음 = bool(input_list) and isinstance(input_list[0], (list, tuple))
         if 묶음:
             if answer is None or len(answer) != len(input_list):
@@ -3966,23 +4059,41 @@ def _헤드해석(spec):
     raise ValueError(f"알 수 없는 출력 스펙: {spec!r}  (액션 리스트 또는 cos)")
 
 
-def _헤드스펙인가(x):
-    return isinstance(x, (_Cos, _Vec, list, tuple)) or (isinstance(x, str) and x.lower() == "cos")
+def _출력하나인가(x):
+    """x 가 "출력 스펙 하나" 인가, 아니면 "스펙들의 리스트" 인가.
 
-
-def make(model_name, layers, outputs, optimizer='adam', sigma=1.0, entropy=0.01,
-         autosave=1, lr=0.01, decay=0.0, temp=1.0):
+    리스트면 애매하다 — ["A","B"] 는 액션 목록 하나지만 [cos, "..."] 는 스펙 둘이다.
+    문자열만 들었으면 액션 목록 하나로 본다. 그게 아니면 스펙들의 리스트다.
+    (여기를 "리스트면 전부 스펙 하나" 로 뭉개면 [cos] 가 액션 목록으로 오해된다.)
     """
+    if isinstance(x, (_Cos, _Vec)):
+        return True
+    if isinstance(x, str):
+        return x.lower() == "cos"
+    if isinstance(x, (list, tuple)):
+        return bool(x) and all(isinstance(e, str) for e in x)
+    return False
+
+
+def make(model_name, layers, outputs, optimizer='adam', *,
+         lr=0.01, decay=0.0, temp=1.0, sigma=1.0, entropy=0.01, autosave=1):
+    """
+    외울 것은 앞의 셋뿐이다. 나머지는 키워드로만 받으므로 순서를 몰라도 되고,
+    만들 때 안 줘도 된다 — 전부 나중에 ai.lr = 0.02 처럼 바꿀 수 있다.
+
+    (주의: 이 파이썬 코드는 D 의 백틱 문자열 안에 들어있다. 백틱을 쓰면 문자열이
+     거기서 끝나버려서 빌드가 깨진다 — 주석에도 쓰지 말 것.)
+
     model_name : 모델 이름 (가중치 파일명)
     layers     : [입력수, 은닉...]   출력은 outputs 에서 정해진다
-                 은닉 자리에 attn(조각수) 를 넣으면 어텐션 층이 된다
-                 each(폭) 은 항목마다 따로 도는 층 (항목 구분을 유지한다)
-                 예) [38, 128, attn(8), each(32), 128]
-    outputs    : 항상 리스트. 하나여도 감싼다.
-                   [["A","B"]]         고르기 하나
-                   [cos]               숫자 하나
+                 은닉 자리에 넣을 수 있는 것: 정수(일반 층), attn, each, conv,
+                 memory, logic.  예) [38, 128, attn(8), each(32), 128]
+    outputs    : 출력 하나면 그냥 줘도 되고 리스트로 감싸도 된다.
+                   ["A","B"]           고르기 하나 (= [["A","B"]])
+                   cos                 숫자 하나 (= [cos])
                    [["A","B"], cos]    두 개
-                 반환·보상·정답·legal 도 전부 출력 개수만큼의 리스트다.
+                 출력이 여러 개면 반환·보상·정답·legal 도 그 개수만큼의 리스트다
+                 (하나일 때는 그냥 값으로 줘도 받는다).
     sigma      : cos 가 값을 얼마나 넓게 탐험할지 (기본 1.0)
     entropy    : 고르는 쪽이 한 답으로 굳는 것을 막는 힘 (기본 0.01)
     autosave   : save(scored) 가 몇 번에 한 번 파일까지 쓸지 (기본 1 = 매번)
@@ -4043,23 +4154,32 @@ def make(model_name, layers, outputs, optimizer='adam', sigma=1.0, entropy=0.01,
             폭 = L.gates
             항목수 = 0                       # 게이트는 항목 구분을 유지하지 않는다
         elif isinstance(L, _Each):
-            if 항목수 < 1:
+            it = L.items if L.items else 항목수
+            if it < 1:
                 raise ValueError(
-                    f"{i}번째 층 each: 앞에 tok 이나 attn 이 있어야 항목 수를 압니다")
-            if 폭 % 항목수:
+                    f"{i}번째 층 each: 항목 수를 알 수 없습니다. 앞에 attn/conv 가 "
+                    f"없으면 each(폭, 항목수) 처럼 직접 주세요 "
+                    f"(입력폭 {폭} 만 보고는 항목이 몇 개인지 알 수 없습니다)")
+            if 폭 % it:
                 raise ValueError(
-                    f"{i}번째 층 each: 폭 {폭} 이 항목 {항목수} 로 나뉘지 않습니다")
-            lay_kind.append(2); lay_a.append(항목수); lay_b.append(L.width); lay_c.append(0)
-            폭 = 항목수 * L.width
+                    f"{i}번째 층 each: 폭 {폭} 이 항목 {it} 로 나뉘지 않습니다")
+            lay_kind.append(2); lay_a.append(it); lay_b.append(L.width); lay_c.append(0)
+            폭 = it * L.width
+            항목수 = it                      # 항목 구조를 유지한다
         else:
             폭 = int(L)
             항목수 = 0                       # 일반 층은 항목 구분을 없앤다
             lay_kind.append(0); lay_a.append(폭); lay_b.append(0); lay_c.append(0)
 
-    # outputs 는 항상 [출력1, 출력2, ...]. 하나여도 감싼다.
-    if not isinstance(outputs, (list, tuple)) or not outputs:
-        raise ValueError('outputs 는 리스트로 주세요. 하나여도 [["A","B"]] 처럼 감쌉니다')
-    specs = list(outputs)
+    # 출력이 하나면 감싸지 않아도 받는다 (cos / vec(n) / ["A","B"]).
+    if _출력하나인가(outputs):
+        specs = [outputs]
+    elif isinstance(outputs, (list, tuple)) and outputs:
+        specs = list(outputs)
+    else:
+        raise ValueError(
+            'outputs 가 비었습니다. cos / ["A","B"] / vec(n) 중 하나거나,'
+            ' 여러 개면 그것들의 리스트로 주세요')
 
     heads, al_arg, cos_arg, sizes, vecs = [], [], [], [], []
     for spec in specs:
@@ -4074,7 +4194,7 @@ def make(model_name, layers, outputs, optimizer='adam', sigma=1.0, entropy=0.01,
                  sizes, al_arg, cos_arg,
                  optimizer, float(sigma), float(entropy),
                  float(lr), float(decay), float(temp))
-    return BlackBoxAI(h, model_name, heads, vecs, autosave)
+    return BlackBoxAI(h, model_name, heads, vecs, autosave, 4 in lay_kind)
 
 
 class Jepa:

@@ -47,6 +47,14 @@ def topo_layers(topo):
         return [4, ml.conv(3, 3, 4), ml.conv(2, 2), 8]
     if topo == "convmix":                     # conv keeps the item structure
         return [4, ml.conv(4, 3, 4), ml.each(6), ml.attn(4), 8]
+    # memory carries state across calls, so its batched path walks samples in
+    # order while the layers around it stay batched. Batched and serial must
+    # still land in the same place -- that equivalence is the whole reason the
+    # batched path is allowed to exist for a recurrent layer.
+    if topo == "memory":
+        return [4, ml.memory(6), 8]
+    if topo == "memorymix":
+        return [4, 8, ml.memory(6), ml.logic(5), 8]
     raise ValueError(f"unknown topology {topo!r}")
 
 

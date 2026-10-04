@@ -51,7 +51,7 @@ SCRATCH = os.path.join(TESTS, "_scratch")
 MODULE_DIR = os.path.join(SCRATCH, "_module")
 
 TOPOLOGIES = ["linear", "each", "attn", "mixed", "logic", "logic2", "logicmix",
-              "conv", "conv2", "convmix"]
+              "conv", "conv2", "convmix", "memory", "memorymix"]
 
 CONFIGS = [
     ("threads1", {"MYML_THREADS": "1"}),

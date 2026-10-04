@@ -85,9 +85,13 @@ check("K=2: memory solves it every time, plain cannot",
       solved2 == 3 and plain2 < 70,
       f"memory {solved2}/3 trials >90%, plain {plain2:.0f}%")
 
+# K=4 lands around 80% per trial (8/10, measured twice). Asserting 3-of-5 would
+# fail ~6% of runs on luck alone, so the bar is 2-of-5: still impossible for a
+# memoryless network (which never gets off chance at any K), while not turning
+# a known-flaky property into a flaky test.
 solved4 = sum(1 for s in range(5) if accuracy("mem", 4, s, 4000) > 90)
-check("K=4: memory solves it most of the time (~80%), plain cannot",
-      solved4 >= 3, f"memory {solved4}/5 trials >90%")
+check("K=4: memory solves it (~80% of trials), plain never does",
+      solved4 >= 2, f"memory {solved4}/5 trials >90%")
 
 print("\n[reach] where one-step truncation runs out")
 # Not a bug -- a measured limit. If this starts passing, the truncation was

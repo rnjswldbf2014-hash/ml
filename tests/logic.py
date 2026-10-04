@@ -90,6 +90,7 @@ os.makedirs(WORK)
 sys.path.insert(0, MODULE_DIR)
 os.chdir(WORK)
 
+import ml                        # noqa: E402
 from ml import make, logic, cos   # noqa: E402
 
 
@@ -125,40 +126,48 @@ print("\n[round trip] random input wiring and gate weights persist")
 wipe()
 LAYERS = [6, 12, logic(10), logic(10), 8]
 ai = make("lg_rt", LAYERS, [cos], autosave=0)
-# Varied rows and targets. With only a handful of distinct input values and a
-# cyclic target, two stacked logic layers settle on constant gates and the whole
-# network answers the same number for every input -- which makes the round-trip
-# comparison below pass without testing anything. The probe-spread check guards
-# against that, so keep the training data rich enough to avoid it.
 rnd = random.Random(5)
 rows = [[rnd.gauss(0, 1) for _ in range(6)] for _ in range(24)]
 targets = [[sum(r[:3]) * 0.2] for r in rows]
-for _ in range(120):
+for _ in range(40):
     ai.sl(rows, targets)
 
-# Several probes, not one. A single probe can land somewhere the wiring does
-# not matter: if every ReLU feeding the logic layer is dead for that input,
-# all its inputs are sigmoid(0) = 0.5 and any wiring gives the same answer.
-# That is exactly what made an earlier version of this check pass against a
-# build that deliberately did not persist the wiring.
+# Comparing predict() across inputs is the obvious way to check that the wiring
+# survived -- and it does not work here, for a reason worth writing down:
+#
+# The 16 gates pair up into complements (gate k and gate 15-k always sum to 1),
+# so a uniform softmax over them averages to exactly 0.5 for *any* a and b. Gate
+# weights start at zero, so a freshly built logic layer outputs a constant 0.5
+# no matter what it is fed, and everything downstream of it is constant too.
+# Training breaks that symmetry, but train much and the gates settle on
+# constants again and the network goes flat a second time. Either way the output
+# can stop depending on the input, which would make an output comparison pass
+# without testing anything. (An earlier version of this check did exactly that
+# against a build that deliberately dropped the wiring.)
+#
+# So the round trip is checked against state instead of behaviour: rules()
+# covers the logic layers (wiring + gate weights), export_weights() covers the
+# ordinary Linear layers, and predict() equality is kept as a cheap necessary
+# condition rather than the main evidence.
 probes = [[0.2, -0.4, 0.1, 0.5, -0.3, 0.0],
           [-0.7, 0.9, -0.2, 0.3, 0.8, -0.5],
           [1.2, 0.4, -1.1, -0.6, 0.2, 0.7],
-          [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
           [-1.5, -1.2, 0.6, 1.4, -0.9, 1.1]]
 before_out = [ai.predict(p)[0] for p in probes]
 before_rules = ai.rules()
-# A probe set that produces the same answer everywhere proves nothing about
-# the wiring, so make sure it does not.
-check("probe set actually distinguishes outputs", len(set(before_out)) > 1,
-      f"{before_out}")
+before_w = ml._ml_export_weights(ai._h)
 ai.save()
 
 ai2 = make("lg_rt", LAYERS, [cos], autosave=0)
 after_out = [ai2.predict(p)[0] for p in probes]
+after_w = ml._ml_export_weights(ai2._h)
+check("rules() identical after reload (wiring + gate weights)",
+      ai2.rules() == before_rules)
+check("Linear weights identical after reload",
+      all(before_w[k] == after_w[k] for k in before_w if k.endswith(".weight")),
+      f"{sorted(k for k in before_w if k.endswith('.weight'))}")
 check("predict() identical after reload", after_out == before_out,
       f"{before_out} vs {after_out}")
-check("rules() identical after reload", ai2.rules() == before_rules)
 check("rules() returns one list per logic layer", len(before_rules) == 2,
       f"got {len(before_rules)}")
 check("each list has one entry per gate",
