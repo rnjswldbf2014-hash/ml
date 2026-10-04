@@ -38,6 +38,15 @@ def topo_layers(topo):
         return [4, ml.logic(8), ml.logic(8), 8]
     if topo == "logicmix":
         return [4, ml.attn(4), ml.each(8), ml.logic(12), 8]
+    # conv has two code paths written separately (per-sample fwd/bwd and
+    # fwdBatch/bwdBatch, each with its own im2col/col2im loop). Them agreeing
+    # bit-for-bit is the main correctness check on that index math.
+    if topo == "conv":
+        return [4, ml.conv(5, 3, 4), 8]
+    if topo == "conv2":                       # stacked, and an even window
+        return [4, ml.conv(3, 3, 4), ml.conv(2, 2), 8]
+    if topo == "convmix":                     # conv keeps the item structure
+        return [4, ml.conv(4, 3, 4), ml.each(6), ml.attn(4), 8]
     raise ValueError(f"unknown topology {topo!r}")
 
 

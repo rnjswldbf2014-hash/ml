@@ -205,6 +205,26 @@ def set_file_ver(p, v):
         f.write(struct.pack("<I", v))
 
 
+def downgrade_to_v11(p, nlay):
+    """Rewrite a ver-12 file as a genuine ver-11 one.
+
+    Stamping the version number alone is not enough any more: ver 12 widened
+    each layer spec from three words to four (conv needs channels, window and
+    item count), so a ver-11 reader expects a shorter header. Leaving the extra
+    words in place desynchronises the whole stream and every weight after it
+    comes out as garbage -- which is exactly how this check first failed.
+    """
+    with open(p, "rb") as f:
+        blob = f.read()
+    head = 4 * 5                       # magic, ver, opt, inputSz, nLay
+    specs = blob[head:head + nlay * 16]
+    kept = b"".join(specs[i * 16:i * 16 + 12] for i in range(nlay))
+    out = blob[:4] + struct.pack("<I", 11) + blob[8:head] + kept \
+        + blob[head + nlay * 16:]
+    with open(p, "wb") as f:
+        f.write(out)
+
+
 wipe()
 vr = make("vr", VLAY, [cos], autosave=0)
 rows = [[0.1 * k for k in range(6)]] * 4
@@ -213,16 +233,17 @@ for _ in range(10):
 vprobe = [0.2, -0.4, 0.1, 0.5, -0.3, 0.0]
 vbefore = vr.predict(vprobe)[0]
 vr.save()
-check("save() writes the current version (11)", file_ver(VPTH) == 11, f"got {file_ver(VPTH)}")
+check("save() writes the current version (12)", file_ver(VPTH) == 12, f"got {file_ver(VPTH)}")
 
-# ver 9 has the same layout for a network with no logic layer, so stamping the
-# version back to 9 makes a faithful "old file".
-set_file_ver(VPTH, 9)
+# Turn it into a real ver-11 file (narrower layer specs), not just a restamped one.
+downgrade_to_v11(VPTH, len(VLAY) - 1)
+check("the downgraded file says ver 11", file_ver(VPTH) == 11, f"got {file_ver(VPTH)}")
 vr2 = make("vr", VLAY, [cos], autosave=0)
-check("ver 9 file still loads", vr2.predict(vprobe)[0] == vbefore,
+check("an older-version file still loads, weights intact",
+      vr2.predict(vprobe)[0] == vbefore,
       f"{vbefore} vs {vr2.predict(vprobe)[0]}")
 vr2.save()
-check("saving a ver 9 file upgrades it to the current version", file_ver(VPTH) == 11,
+check("saving an older file upgrades it to the current version", file_ver(VPTH) == 12,
       f"got {file_ver(VPTH)}")
 
 # A file from a newer version cannot be parsed, but it must not be destroyed.

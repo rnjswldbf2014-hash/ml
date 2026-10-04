@@ -1242,6 +1242,142 @@ private struct RnnLayer {
 }
 
 // ─────────────────────────────────────────────
+// ConvLayer — 창을 미끄러뜨리며 같은 무늬를 찾는 층 (1차원 합성곱)
+// ─────────────────────────────────────────────
+// 입력을 "항목 items 개 × 채널 inCh 개" 로 보고, 창(win) 하나를 항목 축으로 쭉
+// 미끄러뜨리면서 같은 가중치를 돌려 쓴다. "왼쪽 끝의 무늬" 와 "오른쪽 끝의 무늬" 를
+// 따로 배우지 않고 **무늬 찾는 법 하나**를 배워서 전체에 적용하는 것이 요점이다.
+// 그래서 가중치가 훨씬 적고 위치가 바뀌어도 통한다.
+//
+// 길이는 유지한다 (출력도 항목 items 개). 양끝은 0 으로 메운다 — 그래야 attn/each
+// 처럼 항목 구조를 지키는 층들과 섞어 쓸 수 있다.
+//
+// 구현은 im2col + Linear 이다. 창 안의 값들을 한 줄로 늘어놓은 행렬을 만들면
+// 합성곱이 그냥 행렬곱이 되고, 그러면 Linear 를 그대로 재사용할 수 있다
+// (SIMD dot/saxpy, Adam 상태, 가중치 감쇠, 저장/불러오기가 전부 공짜로 따라온다).
+// EachLayer 가 Linear.batchForward 를 재사용하는 것과 같은 수법이다.
+private struct ConvLayer {
+    int items, inCh, outCh, win, pad;
+    Linear lin;              // (inCh*win) -> outCh
+
+    float[] col, pre;        // per-sample: [items*inCh*win], [items*outCh]
+    int _bcap;
+    float[] colB, preB;      // 배치용
+
+    int inSize()  const nothrow @nogc { return items * inCh; }
+    int outSize() const nothrow @nogc { return items * outCh; }
+    int K()       const nothrow @nogc { return inCh * win; }
+
+    this(int items_, int inCh_, int outCh_, int win_) {
+        items = items_; inCh = inCh_; outCh = outCh_; win = win_;
+        pad = (win_ - 1) / 2;          // 창이 짝수면 왼쪽을 한 칸 덜 메운다
+        lin = Linear(inCh_ * win_, outCh_);
+        col = new float[items_ * inCh_ * win_]; col[] = 0f;
+        pre = new float[items_ * outCh_];       pre[] = 0f;
+    }
+
+    private void _allocBatch(int B) {
+        if (B <= _bcap) return;
+        colB = new float[B * items * K]; colB[] = 0f;
+        preB = new float[B * items * outCh]; preB[] = 0f;
+        _bcap = B;
+    }
+
+    // 창 안의 값들을 한 줄로 늘어놓는다. 범위를 벗어나면 0.
+    // c[i*K + ic*win + d] = x[(i+d-pad)*inCh + ic]
+    private void _im2col(const(float)[] x, float[] c, int bOff, int cOff) nothrow {
+        int k = K;
+        _parChunkNT(items, (int lo, int hi) nothrow {
+            foreach (i; lo .. hi) {
+                auto dst = c[cOff + i*k .. cOff + (i+1)*k];
+                foreach (d; 0..win) {
+                    int p = i + d - pad;
+                    if (p < 0 || p >= items)
+                        foreach (ic; 0..inCh) dst[ic*win + d] = 0f;
+                    else
+                        foreach (ic; 0..inCh) dst[ic*win + d] = x[bOff + p*inCh + ic];
+                }
+            }
+        });
+    }
+
+    // im2col 의 역. 모으는 쪽으로 쓴다 — 입력 위치 p 마다 "그 값을 가져다 쓴 창들"
+    // 을 훑어서 합친다. 흩뿌리는 쪽으로 쓰면 이웃한 창이 같은 입력 칸에 동시에
+    // 써서 레이스가 난다 (그리고 합산 순서가 흔들려 결정성도 깨진다).
+    private void _col2im(const(float)[] dc, float[] dx, int cOff, int bOff) nothrow {
+        int k = K;
+        _parChunkNT(items, (int lo, int hi) nothrow {
+            foreach (p; lo .. hi) {
+                foreach (ic; 0..inCh) {
+                    float s = 0f;
+                    foreach (d; 0..win) {
+                        int i = p - d + pad;      // 이 입력을 쓴 출력 위치
+                        if (i >= 0 && i < items) s += dc[cOff + i*k + ic*win + d];
+                    }
+                    dx[bOff + p*inCh + ic] += s;
+                }
+            }
+        });
+    }
+
+    void fwd(const(float)[] x, float[] y) {
+        _im2col(x, col, 0, 0);
+        lin.batchForward(col, pre, items);
+        _parChunk(items, (int lo, int hi) {            // ReLU 는 안에서
+            foreach (i; lo .. hi) foreach (oc; 0..outCh) {
+                float v = pre[i*outCh + oc];
+                y[i*outCh + oc] = v < 0f ? 0f : v;
+            }
+        });
+    }
+
+    // tmp 는 [items*outCh] 이상 (호출자 스크래치)
+    void bwd(const(float)[] x, const(float)[] dy, float[] dx, float[] tmp) {
+        _parChunk(items, (int lo, int hi) {
+            foreach (i; lo .. hi) foreach (oc; 0..outCh) {
+                int c = i*outCh + oc;
+                tmp[c] = pre[c] > 0f ? dy[c] : 0f;
+            }
+        });
+        // col 버퍼를 dCol 로 재사용한다 — 여기서부터 col 의 내용은 더 필요 없다.
+        lin.batchAccum(col, tmp[0 .. items*outCh], col, items);
+        _col2im(col, dx, 0, 0);
+    }
+
+    // 항목뿐 아니라 샘플도 전부 같은 가중치를 쓰는 독립 창이라 count=B*items 로
+    // 한 번에 돌린다 (EachLayer 와 같은 이유). 단 im2col 은 샘플 경계를 넘지
+    // 않아야 하므로 샘플마다 따로 만든다 — 넘으면 앞 샘플의 끝을 읽어버린다.
+    void fwdBatch(const(float)[] X, float[] Y, int B) {
+        _allocBatch(B);
+        foreach (b; 0..B) _im2col(X, colB, b*items*inCh, b*items*K);
+        int count = B * items;
+        lin.batchForward(colB, preB, count);
+        _parChunk(count, (int lo, int hi) {
+            foreach (c; lo .. hi) foreach (oc; 0..outCh) {
+                float v = preB[c*outCh + oc];
+                Y[c*outCh + oc] = v < 0f ? 0f : v;
+            }
+        });
+    }
+
+    // dX 에 누적한다 (호출자가 먼저 비운다). tmp 는 [B*items*outCh] 이상.
+    void bwdBatch(const(float)[] X, const(float)[] dY, float[] dX, float[] tmp, int B) {
+        int count = B * items;
+        _parChunk(count, (int lo, int hi) {
+            foreach (c; lo .. hi) foreach (oc; 0..outCh) {
+                int o = c*outCh + oc;
+                tmp[o] = preB[o] > 0f ? dY[o] : 0f;
+            }
+        });
+        lin.batchAccum(colB, tmp[0 .. count*outCh], colB, count);
+        foreach (b; 0..B) _col2im(colB, dX, b*items*K, b*items*inCh);
+    }
+
+    void zeroGrad() nothrow @nogc { lin.zeroGrad(); }
+    void step(Opt o, float lr, float decay = 0f) nothrow { lin.step(o, lr, decay); }
+}
+
+// ─────────────────────────────────────────────
 // VICReg — "다 같은 값으로 뭉개지는 것"(collapse) 막기
 // ─────────────────────────────────────────────
 // jepa 처럼 "요약끼리 비교" 하는 학습은 요약기가 잔머리를 굴릴 수 있다: 입력이 뭐든
@@ -1337,6 +1473,7 @@ private class Network {
     EachLayer[]  eachs;
     LogicLayer[] logics;
     RnnLayer[]   rnns;
+    ConvLayer[]  convs;
     Linear[]     heads;
     int          inputSz;
 
@@ -1365,10 +1502,11 @@ private class Network {
 
     int layerCount() const nothrow @nogc { return cast(int) kinds.length; }
 
-    // specKind[i]: 0=Linear(specA=출력폭), 1=Attn(specA=조각수, specB=헤드수),
-    //              2=Each(specA=항목수, specB=항목당 출력폭), 3=Logic(specA=게이트 수)
+    // specKind[i]: 0=Linear(A=출력폭), 1=Attn(A=조각수, B=헤드수),
+    //              2=Each(A=항목수, B=항목당 출력폭), 3=Logic(A=게이트 수),
+    //              4=Rnn(A=메모 칸 수), 5=Conv(A=출력채널, B=창, C=항목수)
     this(int inputSz_, const(ubyte)[] specKind, const(int)[] specA, const(int)[] specB,
-         int[] headSizes) {
+         const(int)[] specC, int[] headSizes) {
         inputSz = inputSz_;
         int prev = inputSz;
         foreach (i; 0..specKind.length) {
@@ -1381,6 +1519,14 @@ private class Network {
                 attns ~= AttnLayer(prev, specA[i], specB[i]);
                 kinds ~= 1; slot ~= cast(int)(attns.length - 1);
                 _inSz ~= prev; _outSz ~= prev;      // 폭 유지
+            } else if (specKind[i] == 5) {
+                // Conv: specA=출력채널, specB=창, specC=항목수.
+                // 입력채널은 들어온 폭에서 나눠서 구한다 (prev = 항목수 * 입력채널).
+                int it = specC[i], oc = specA[i], wn = specB[i];
+                convs ~= ConvLayer(it, prev / it, oc, wn);
+                kinds ~= 5; slot ~= cast(int)(convs.length - 1);
+                _inSz ~= prev; _outSz ~= it * oc;
+                prev = it * oc;
             } else if (specKind[i] == 4) {
                 // Rnn: specA=메모 칸 수 (= 출력 폭)
                 rnns ~= RnnLayer(prev, specA[i]);
@@ -1413,8 +1559,9 @@ private class Network {
         auto kk = new ubyte[hiddenSizes.length];
         auto aa = new int[hiddenSizes.length];
         auto bb = new int[hiddenSizes.length];
-        foreach (i, sz; hiddenSizes) { kk[i] = 0; aa[i] = sz; bb[i] = 0; }
-        this(inputSz_, kk, aa, bb, headSizes);
+        auto cc = new int[hiddenSizes.length];
+        foreach (i, sz; hiddenSizes) { kk[i] = 0; aa[i] = sz; bb[i] = 0; cc[i] = 0; }
+        this(inputSz_, kk, aa, bb, cc, headSizes);
     }
 
     private void _allocScratch() {
@@ -1470,6 +1617,12 @@ private class Network {
                         foreach (k; 0..oS) _inp[i+1][k] = _pre[i][k];
                     else
                         foreach (k; 0..oS) _hout[k] = _pre[i][k];
+                } else if (kinds[i] == 5) {
+                    convs[slot[i]].fwd(_inp[i], _pre[i]);   // ReLU 는 안에서
+                    if (i + 1 < n)
+                        foreach (k; 0..oS) _inp[i+1][k] = _pre[i][k];
+                    else
+                        foreach (k; 0..oS) _hout[k] = _pre[i][k];
                 } else if (kinds[i] == 4) {
                     // 여기서 메모가 한 스텝 나아간다 (tanh 출력이라 ReLU 안 건다)
                     rnns[slot[i]].fwd(_inp[i], _pre[i]);
@@ -1514,6 +1667,9 @@ private class Network {
             } else if (kinds[i] == 4) {
                 _dB[0..iS] = 0f;
                 rnns[slot[i]].bwd(_inp[i], _dA[0..oS], _dB[0..iS]);
+            } else if (kinds[i] == 5) {
+                _dB[0..iS] = 0f;
+                convs[slot[i]].bwd(_inp[i], _dA[0..oS], _dB[0..iS], _dC);
             } else {
                 _dB[0..iS] = 0f;
                 eachs[slot[i]].bwd(_inp[i], _dA[0..oS], _dB[0..iS], _dC);
@@ -1602,6 +1758,9 @@ private class Network {
                         // slMany/learnBatch 는 hasRnn() 으로 걸러서 직렬로 보낸다.
                         throw new Exception("rnn 층은 배치 경로를 쓸 수 없습니다"
                             ~ " (메모가 순서대로 이어져야 합니다)");
+                    case 5:
+                        convs[slot[i]].fwdBatch(inp, 다음, B);
+                        break;
                 }
             }
         }
@@ -1671,6 +1830,12 @@ private class Network {
                     break;
                 case 4:
                     throw new Exception("rnn 층은 배치 경로를 쓸 수 없습니다");
+                case 5:
+                    // col2im 이 더하기만 하므로 호출자가 먼저 비운다.
+                    // tmp 로 _bDZ[i] 를 쓴다 (크기 B*_outSz[i] = B*items*outCh).
+                    dIn[] = 0f;
+                    convs[slot[i]].bwdBatch(inp, dOut, dIn, _bDZ[i], B);
+                    break;
             }
         }
     }
@@ -1681,6 +1846,7 @@ private class Network {
         foreach (ref e; eachs) e.zeroGrad();
         foreach (ref g; logics) g.zeroGrad();
         foreach (ref r; rnns)  r.zeroGrad();
+        foreach (ref v; convs) v.zeroGrad();
         foreach (ref h; heads) h.zeroGrad();
     }
 
@@ -1696,6 +1862,7 @@ private class Network {
         foreach (ref e; eachs) e.step(opt, lr, decay);
         foreach (ref g; logics) g.step(opt, lr);
         foreach (ref r; rnns)  r.step(opt, lr, decay);
+        foreach (ref v; convs) v.step(opt, lr, decay);
         foreach (ref h; heads) h.step(opt, lr, decay);
     }
 }
@@ -1764,7 +1931,8 @@ class BlackBoxAI {
     int[]      outSizes;      // 헤드별 출력 개수
     int[]      hiddenSizes;   // Linear 층 폭 (호환용)
     ubyte[]    layKind;       // 0=Linear, 1=Attn
-    int[]      layA, layB;    // Linear: A=폭 / Attn: A=조각수, B=헤드수
+    int[]      layA, layB, layC;  // Linear: A=폭 / Attn: A=조각수,B=헤드수 /
+                                  // Conv: A=출력채널,B=창,C=항목수
     float      lr = 0.01f;
     float      cosSigma = 1.0f;   // cos 헤드 탐험 폭
     float      entropy  = 0.01f;  // 이산 헤드 엔트로피 보너스
@@ -1834,14 +2002,14 @@ class BlackBoxAI {
 
     int nHeads() const nothrow @nogc { return cast(int) outSizes.length; }
 
-    this(string name, int inputSz, ubyte[] lk, int[] la, int[] lb, int[] heads,
+    this(string name, int inputSz, ubyte[] lk, int[] la, int[] lb, int[] lc, int[] heads,
          string[][] actions, bool[] cos,
          Opt opt = Opt.adam, float sigma = 1.0f, float ent = 0.01f,
          float lr_ = 0.01f, float decay_ = 0.0f, float temp_ = 1.0f) {
         this.name = name; this.opt = opt;
         cosSigma = sigma; entropy = ent;
         lr = lr_; decay = decay_; temp = temp_;
-        layKind = lk.dup; layA = la.dup; layB = lb.dup;
+        layKind = lk.dup; layA = la.dup; layB = lb.dup; layC = lc.dup;
         hiddenSizes = [];
         foreach (i; 0..lk.length) if (lk[i] == 0) hiddenSizes ~= la[i];
         outSizes    = heads.dup;
@@ -1857,6 +2025,8 @@ class BlackBoxAI {
                 else if (layKind[i] == 1) r ~= "attn(" ~ to!string(layA[i]) ~ "," ~ to!string(layB[i]) ~ ")";
                 else if (layKind[i] == 3) r ~= "logic(" ~ to!string(layA[i]) ~ ")";
                 else if (layKind[i] == 4) r ~= "memory(" ~ to!string(layA[i]) ~ ")";
+                else if (layKind[i] == 5) r ~= "conv(" ~ to!string(layA[i]) ~ ","
+                                             ~ to!string(layB[i]) ~ "/" ~ to!string(layC[i]) ~ ")";
                 else                      r ~= "each(" ~ to!string(layB[i]) ~ ")";
             }
             return r ~ "]";
@@ -1869,11 +2039,12 @@ class BlackBoxAI {
                          && (outSizes.length == heads.length)
                          && (layKind.length == lk.length);
                 if (same) foreach (i; 0..lk.length)
-                    if (layKind[i] != lk[i] || layA[i] != la[i] || layB[i] != lb[i]) { same = false; break; }
+                    if (layKind[i] != lk[i] || layA[i] != la[i] || layB[i] != lb[i]
+                        || layC[i] != lc[i]) { same = false; break; }
                 if (same) foreach (i, sz; outSizes) if (sz != heads[i]) { same = false; break; }
                 if (!same) {
                     string 저장된 = 층설명();
-                    layKind = lk.dup; layA = la.dup; layB = lb.dup;
+                    layKind = lk.dup; layA = la.dup; layB = lb.dup; layC = lc.dup;
                     hiddenSizes = [];
                     foreach (i; 0..lk.length) if (lk[i] == 0) hiddenSizes ~= la[i];
                     알림(" [%s] 저장된 구조 %s 가 요청한 %s 와 다릅니다. 새로 만듭니다.",
@@ -1917,7 +2088,7 @@ class BlackBoxAI {
             }
         }
         if (!ready) {
-            net = new Network(inputSz, layKind, layA, layB, outSizes);
+            net = new Network(inputSz, layKind, layA, layB, layC, outSizes);
             알림(" [%s] 새로 생성되었습니다. %s->%s", name, 층설명(), outSizes);
             ready = true;
         }
@@ -2451,14 +2622,16 @@ class BlackBoxAI {
         auto f = File(file, "wb");
         void wu(uint v)  { f.rawWrite((&v)[0..1]); }
         void wf(float v) { f.rawWrite((&v)[0..1]); }
-        // ver 10 = 로직 층(kind 3), ver 11 = 기억 층(kind 4). 구조는 9 와 같지만,
-        // 새 kind 가 든 파일을 옛 바이너리가 읽으면 Each 로 오해해서 조용히 깨진다
-        // — 그래서 kind 를 늘릴 때마다 버전을 올린다. 9~11 은 전부 읽는다.
-        wu(0xBEEFCAFE); wu(11); wu(cast(uint)opt);
+        // ver 10 = 로직(kind 3), ver 11 = 기억(kind 4), ver 12 = 합성곱(kind 5).
+        // 새 kind 가 든 파일을 옛 바이너리가 읽으면 Each 로 오해해서 조용히 깨지므로
+        // kind 를 늘릴 때마다 올린다. ver 12 부터는 층 스펙이 두 칸에서 세 칸으로
+        // 늘었다 (conv 가 출력채널·창·항목수 셋을 쓴다). 9~12 는 전부 읽는다.
+        wu(0xBEEFCAFE); wu(12); wu(cast(uint)opt);
         wu(cast(uint)net.inputSz);
         wu(cast(uint)layKind.length);
         foreach (i; 0..layKind.length) {
             wu(cast(uint)layKind[i]); wu(cast(uint)layA[i]); wu(cast(uint)layB[i]);
+            wu(cast(uint)layC[i]);     // ver 12 부터 (conv 가 세 번째 값을 쓴다)
         }
         wu(cast(uint)nHeads);
         foreach (h; 0..nHeads) {
@@ -2503,6 +2676,8 @@ class BlackBoxAI {
                 // 라는 현재 상태다. 불러오면 빈 메모로 시작한다.
                 auto r = &net.rnns[net.slot[i]];
                 wl(r.gx); wl(r.gh); wl(r.zx); wl(r.zh);
+            } else if (net.kinds[i] == 5) {
+                wl(net.convs[net.slot[i]].lin);
             } else {
                 wl(net.eachs[net.slot[i]].lin);
             }
@@ -2517,15 +2692,19 @@ class BlackBoxAI {
         if (ru() != 0xBEEFCAFE) throw new Exception("magic mismatch");
         uint ver = ru();
         if (ver < 9) throw new Exception("예전 포맷입니다. change() 로 변환하세요");
-        if (ver > 11) throw new Exception("더 새 버전에서 저장한 파일입니다 (ver "
+        if (ver > 12) throw new Exception("더 새 버전에서 저장한 파일입니다 (ver "
                                         ~ to!string(ver) ~ ")");
         opt = cast(Opt)ru();
         int inputSz = ru();
         int nLay = ru();
         layKind = new ubyte[nLay]; layA = new int[nLay]; layB = new int[nLay];
+        layC = new int[nLay];
         hiddenSizes = [];
         foreach (i; 0..nLay) {
             layKind[i] = cast(ubyte)ru(); layA[i] = ru(); layB[i] = ru();
+            // ver 12 에서 세 번째 값이 생겼다. 그 전 파일엔 없으므로 읽지 않는다
+            // (읽으면 바이트 흐름이 어긋나 뒤가 전부 깨진다).
+            layC[i] = (ver >= 12) ? cast(int)ru() : 0;
             if (layKind[i] == 0) hiddenSizes ~= layA[i];
         }
         int nL = ru();
@@ -2536,7 +2715,7 @@ class BlackBoxAI {
             int nA = ru(); actionLists[i] = new string[nA];
             foreach (j; 0..nA) { auto buf = new ubyte[ru()]; f.rawRead(buf); actionLists[i][j] = cast(string)buf.dup; }
         }
-        net = new Network(inputSz, layKind, layA, layB, outSizes);
+        net = new Network(inputSz, layKind, layA, layB, layC, outSizes);
         void rl_(ref Linear l) {
             foreach (ref row; l.w)  foreach (ref v; row) v = rf();
             foreach (ref v; l.b)    v = rf();
@@ -2567,6 +2746,8 @@ class BlackBoxAI {
             } else if (net.kinds[i] == 4) {
                 auto r = &net.rnns[net.slot[i]];
                 rl_(r.gx); rl_(r.gh); rl_(r.zx); rl_(r.zh);
+            } else if (net.kinds[i] == 5) {
+                rl_(net.convs[net.slot[i]].lin);
             } else {
                 rl_(net.eachs[net.slot[i]].lin);
             }
@@ -2957,9 +3138,10 @@ PyObject* py_ml_make(PyObject* self, PyObject* args) {
     try {
         PyObject* nm; int inputSz; PyObject* hid; PyObject* heads;
         PyObject* acts; PyObject* coss; PyObject* opt;
-        PyObject* lk; PyObject* lb2; double sigma, ent, lr, decay, temp;
-        if (!PyArg_ParseTuple(args, "OiOOOOOOOddddd", &nm, &inputSz, &lk, &hid, &lb2,
-                              &heads, &acts, &coss, &opt, &sigma, &ent,
+        PyObject* lk; PyObject* lb2; PyObject* lc2;
+        double sigma, ent, lr, decay, temp;
+        if (!PyArg_ParseTuple(args, "OiOOOOOOOOddddd", &nm, &inputSz, &lk, &hid, &lb2,
+                              &lc2, &heads, &acts, &coss, &opt, &sigma, &ent,
                               &lr, &decay, &temp))
             return null;
         string name   = fromStringz(PyUnicode_AsUTF8(nm)).idup;
@@ -2967,6 +3149,7 @@ PyObject* py_ml_make(PyObject* self, PyObject* args) {
         int[] kindsI  = pyIntList(lk);
         int[] la      = pyIntList(hid);
         int[] lbv     = pyIntList(lb2);
+        int[] lcv     = pyIntList(lc2);
         auto  lkb     = new ubyte[kindsI.length];
         foreach (i, v; kindsI) lkb[i] = cast(ubyte) v;
         int[] hsz     = pyIntList(heads);
@@ -2974,7 +3157,7 @@ PyObject* py_ml_make(PyObject* self, PyObject* args) {
         int[] cosI    = pyIntList(coss);
         auto cosB = new bool[cosI.length];
         foreach (i, v; cosI) cosB[i] = v != 0;
-        auto ai = new BlackBoxAI(name, inputSz, lkb, la, lbv, hsz, al, cosB, parseOpt(optStr),
+        auto ai = new BlackBoxAI(name, inputSz, lkb, la, lbv, lcv, hsz, al, cosB, parseOpt(optStr),
                                  cast(float)sigma, cast(float)ent,
                                  cast(float)lr, cast(float)decay, cast(float)temp);
         GC.addRoot(cast(void*) ai);
@@ -3051,9 +3234,6 @@ PyObject* py_ml_gpu_info(PyObject* self, PyObject* args) {
     } catch (Throwable t) { setPyError("my_ml: _ml_gpu_info", t); return null; }
 }
 
-// 로직 층이 배운 회로를 글로. 층별 리스트의 리스트를 돌려준다.
-// 학습 중에 바꿀 수 있어야 하는 값들 (학습률 스케줄, 탐험 식히기 등).
-// 하나에 몰아넣는다 — 값마다 함수를 만들면 추가할 때마다 메서드 표가 늘어난다.
 // 기억(rnn) 층의 메모를 비운다. 에피소드 경계에서 부른다.
 PyObject* py_ml_forget(PyObject* self, PyObject* args) {
     try {
@@ -3065,6 +3245,8 @@ PyObject* py_ml_forget(PyObject* self, PyObject* args) {
     } catch (Throwable t) { setPyError("my_ml: _ml_forget", t); return null; }
 }
 
+// 학습 중에 바꿀 수 있어야 하는 값들 (학습률 스케줄, 탐험 식히기 등).
+// 하나에 몰아넣는다 — 값마다 함수를 만들면 추가할 때마다 메서드 표가 늘어난다.
 PyObject* py_ml_tune(PyObject* self, PyObject* args) {
     try {
         PyObject* cap; PyObject* nameObj; PyObject* valObj;
@@ -3092,6 +3274,7 @@ PyObject* py_ml_tune(PyObject* self, PyObject* args) {
     } catch (Throwable t) { setPyError("my_ml: _ml_tune", t); return null; }
 }
 
+// 로직 층이 배운 회로를 글로. 층별 리스트의 리스트를 돌려준다.
 PyObject* py_ml_logic_rules(PyObject* self, PyObject* args) {
     try {
         PyObject* cap;
@@ -3464,6 +3647,36 @@ class _Memory:
 memory = _Memory()
 
 
+class _Conv:
+    """창을 미끄러뜨리며 같은 무늬를 찾는 층 (1차원 합성곱).
+
+        conv(16, 3)        -> 출력채널 16, 창 3 (항목 수는 앞 층에서 물려받는다)
+        conv(16, 3, 20)    -> 항목 20개로 직접 지정 (맨 앞 층일 때)
+
+    입력을 "항목 n개 × 채널 c개" 로 보고, 창 하나를 항목 축으로 쭉 미끄러뜨린다.
+    "왼쪽 끝의 무늬" 와 "오른쪽 끝의 무늬" 를 따로 배우지 않고 무늬 찾는 법 하나를
+    배워서 전체에 적용한다. 그래서 가중치가 훨씬 적고 위치가 바뀌어도 통한다.
+
+    길이는 유지한다 (출력도 항목 n개). 양끝은 0 으로 메운다.
+    맨 앞에 쓸 때는 항목 수를 직접 줘야 한다 — 입력폭만 보고는 "항목 20 × 채널 3"
+    인지 "항목 3 × 채널 20" 인지 알 수 없다.
+    """
+    __slots__ = ("ch", "win", "items")
+
+    def __init__(self, ch=0, win=0, items=0):
+        self.ch, self.win, self.items = int(ch), int(win), int(items)
+
+    def __call__(self, ch, win, items=0):
+        if ch < 1:  raise ValueError("conv(채널, ...) 의 채널은 1 이상이어야 합니다")
+        if win < 1: raise ValueError("conv(..., 창) 의 창은 1 이상이어야 합니다")
+        return _Conv(ch, win, items)
+
+    def __repr__(self):
+        return f"conv({self.ch}, {self.win}" + (f", {self.items})" if self.items else ")")
+
+conv = _Conv()
+
+
 class _Vec:
     """숫자 여러 개를 한 덩어리로 내는 출력.
 
@@ -3790,9 +4003,9 @@ def make(model_name, layers, outputs, optimizer='adam', sigma=1.0, entropy=0.01,
     if len(layers) < 1:
         raise ValueError("layers 는 [입력수, 은닉...] 형태입니다")
     inputSz = int(layers[0])
-    lay_kind, lay_a, lay_b = [], [], []
+    lay_kind, lay_a, lay_b, lay_c = [], [], [], []
     폭 = inputSz
-    항목수 = 0        # attn 을 만나야 항목 구조가 생긴다
+    항목수 = 0        # attn 이나 conv(..., 항목수) 를 만나야 항목 구조가 생긴다
     for i, L in enumerate(layers[1:], 1):
         if isinstance(L, _Attn):
             if 폭 % L.items:
@@ -3802,15 +4015,31 @@ def make(model_name, layers, outputs, optimizer='adam', sigma=1.0, entropy=0.01,
             if 조각폭 % L.heads:
                 raise ValueError(
                     f"{i}번째 층 attn: 조각폭 {조각폭} 이 헤드 {L.heads} 로 나뉘지 않습니다")
-            lay_kind.append(1); lay_a.append(L.items); lay_b.append(L.heads)
+            lay_kind.append(1); lay_a.append(L.items); lay_b.append(L.heads); lay_c.append(0)
             항목수 = L.items
             # 폭 그대로
+        elif isinstance(L, _Conv):
+            it = L.items if L.items else 항목수
+            if it < 1:
+                raise ValueError(
+                    f"{i}번째 층 conv: 항목 수를 알 수 없습니다. 맨 앞에 쓸 때는 "
+                    f"conv(채널, 창, 항목수) 처럼 직접 주세요 "
+                    f"(입력폭 {폭} 만 보고는 '항목 n × 채널 c' 를 알 수 없습니다)")
+            if 폭 % it:
+                raise ValueError(
+                    f"{i}번째 층 conv: 폭 {폭} 이 항목 {it} 로 나뉘지 않습니다")
+            if L.win > it:
+                raise ValueError(
+                    f"{i}번째 층 conv: 창 {L.win} 이 항목 수 {it} 보다 큽니다")
+            lay_kind.append(5); lay_a.append(L.ch); lay_b.append(L.win); lay_c.append(it)
+            폭 = it * L.ch
+            항목수 = it                      # 길이를 유지하므로 항목 구조도 유지된다
         elif isinstance(L, _Memory):
-            lay_kind.append(4); lay_a.append(L.cells); lay_b.append(0)
+            lay_kind.append(4); lay_a.append(L.cells); lay_b.append(0); lay_c.append(0)
             폭 = L.cells
             항목수 = 0                       # 메모는 항목 구분을 유지하지 않는다
         elif isinstance(L, _Logic):
-            lay_kind.append(3); lay_a.append(L.gates); lay_b.append(0)
+            lay_kind.append(3); lay_a.append(L.gates); lay_b.append(0); lay_c.append(0)
             폭 = L.gates
             항목수 = 0                       # 게이트는 항목 구분을 유지하지 않는다
         elif isinstance(L, _Each):
@@ -3820,12 +4049,12 @@ def make(model_name, layers, outputs, optimizer='adam', sigma=1.0, entropy=0.01,
             if 폭 % 항목수:
                 raise ValueError(
                     f"{i}번째 층 each: 폭 {폭} 이 항목 {항목수} 로 나뉘지 않습니다")
-            lay_kind.append(2); lay_a.append(항목수); lay_b.append(L.width)
+            lay_kind.append(2); lay_a.append(항목수); lay_b.append(L.width); lay_c.append(0)
             폭 = 항목수 * L.width
         else:
             폭 = int(L)
             항목수 = 0                       # 일반 층은 항목 구분을 없앤다
-            lay_kind.append(0); lay_a.append(폭); lay_b.append(0)
+            lay_kind.append(0); lay_a.append(폭); lay_b.append(0); lay_c.append(0)
 
     # outputs 는 항상 [출력1, 출력2, ...]. 하나여도 감싼다.
     if not isinstance(outputs, (list, tuple)) or not outputs:
@@ -3841,7 +4070,8 @@ def make(model_name, layers, outputs, optimizer='adam', sigma=1.0, entropy=0.01,
         sizes.append(n)
         vecs.append(isinstance(spec, _Vec))
 
-    h = _ml_make(model_name, inputSz, lay_kind, lay_a, lay_b, sizes, al_arg, cos_arg,
+    h = _ml_make(model_name, inputSz, lay_kind, lay_a, lay_b, lay_c,
+                 sizes, al_arg, cos_arg,
                  optimizer, float(sigma), float(entropy),
                  float(lr), float(decay), float(temp))
     return BlackBoxAI(h, model_name, heads, vecs, autosave)
