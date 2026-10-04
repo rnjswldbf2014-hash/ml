@@ -17,9 +17,11 @@ back:
   - memory() works with bundled training now (it used to refuse), and the
     bundled result matches the one-at-a-time result -- regression.py's
     "memory" and "memorymix" topologies hold that line.
-  - "with ai.round():" clears the memo on entry. The library cannot know where
-    an episode begins -- only the caller can -- so wrapping it is the
-    declaration. Same effect as forget(), minus the place to forget it.
+  - "with ai.round():" clears the memo at both ends, so the indentation is the
+    episode. The library cannot know where an episode begins or ends -- only
+    the caller can -- so wrapping it is the declaration. Clearing on the way
+    out matters as much as on the way in: otherwise a call made after the
+    block silently continues the round that just finished.
   - jepa("name", inputs) builds the encoder and predictor itself, so the
     shape arithmetic that used to be the caller's job (predictor input =
     summary + actions, vec on both ends) cannot be got wrong. jepa(enc, pred)
@@ -208,17 +210,43 @@ except Exception as e:
 check("memory() can be a jepa encoder now", jepa_ok)
 
 # ── round(): the episode boundary, as a shape in the code ───────────────
-print("\n[round] with ai.round() is forget(), where it cannot be forgotten")
+print("\n[round] the indentation is the episode -- both ends clear the memo")
 wipe()
 rr = make("rr", [2, memory(8), 8], cos, autosave=0)
+
+
+def seq():
+    return [rr.predict([1.0, 0.0])[0], rr.predict([0.0, 0.0])[0]]
+
+
 with rr.round():
-    first = [rr.predict([1.0, 0.0])[0], rr.predict([0.0, 0.0])[0]]
+    first = seq()
 with rr.round():
-    again = [rr.predict([1.0, 0.0])[0], rr.predict([0.0, 0.0])[0]]
-leaked = [rr.predict([1.0, 0.0])[0], rr.predict([0.0, 0.0])[0]]
-check("entering round() replays the sequence identically", first == again,
+    again = seq()
+check("entering a round replays the sequence identically", first == again,
       f"{first} vs {again}")
-check("not entering one lets the previous round leak in", again != leaked)
+
+with rr.round():
+    stepped = [rr.predict([1.0, 0.0])[0], rr.predict([1.0, 0.0])[0]]
+check("inside one round the memo keeps advancing", stepped[0] != stepped[1],
+      f"{stepped}")
+
+# Leaving clears as well. Without that, this call would continue the round
+# that just ended instead of starting clean, so it pins the exit side down.
+with rr.round():
+    seq()
+after = seq()
+check("leaving a round clears too, so nothing leaks out of it", after == first,
+      f"{after} vs {first}")
+
+try:
+    with rr.round():
+        seq()
+        raise RuntimeError("boom")
+except RuntimeError:
+    pass
+check("a round that blew up still cleared on the way out", seq() == first)
+
 with warnings.catch_warnings(record=True) as got4:
     warnings.simplefilter("always")
     rr.sl(x[:2], 0.5)

@@ -3796,14 +3796,19 @@ _NAN = float("nan")
 
 
 class _판:
-    """with ai.round(): 이 들어올 때 forget() 을 부른다.
+    """with ai.round(): 의 양쪽 끝에서 forget() 을 부른다.
 
-    판의 시작이 코드 모양으로 드러나서, 부르는 걸 잊을 자리가 없어진다.
+    들여쓰기가 시작되는 곳이 판의 시작, 끝나는 곳이 판의 끝이다. 판의 경계가
+    코드 모양 그 자체가 되어서, 부르는 걸 잊을 자리가 없어진다.
+
+    나갈 때도 비우는 이유: 들어올 때만 비우면 블록을 나간 뒤에 메모가 남아서,
+    판 밖에서 부르는 predict() 같은 것이 지난 판의 기억을 들고 돈다.
+    예외로 빠져나가도 비운다 — 중간에 터진 판이 다음 판에 섞이면 더 나쁘다.
     """
     __slots__ = ("_ai",)
     def __init__(self, ai):            self._ai = ai
     def __enter__(self):               self._ai.forget(); return self._ai
-    def __exit__(self, *_):            return False
+    def __exit__(self, *_):            self._ai.forget(); return False
 
 
 class BlackBoxAI:
@@ -3884,17 +3889,19 @@ class BlackBoxAI:
         _ml_forget(self._h)
 
     def round(self):
-        """판(에피소드) 하나를 감싼다. 들어갈 때 forget() 을 부른다.
+        """판(에피소드) 하나를 감싼다. 양쪽 끝에서 memory() 의 메모를 비운다.
 
             for 판 in range(1000):
-                with ai.round():
+                with ai.round():        # <- 여기가 판의 시작
                     while 안끝났으면:
                         step = ai.rl(관측)
                         ...
                     ai.save(점수들)
+                                        # <- 여기가 판의 끝 (여기서도 비운다)
 
-        forget() 을 직접 불러도 똑같다 — 이건 "판이 어디서 시작하는지" 를
-        코드 모양으로 드러내서 빠뜨릴 자리를 없앤 것이다.
+        들여쓰기가 곧 판의 범위다. forget() 을 직접 불러도 되지만, 그쪽은
+        "어디서 부를지" 를 매번 정해야 하고 이쪽은 정할 게 없다.
+        memory() 층이 없으면 아무 일도 하지 않는다.
         """
         return _판(self)
 
