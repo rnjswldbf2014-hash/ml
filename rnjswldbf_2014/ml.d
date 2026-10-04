@@ -3795,6 +3795,17 @@ class Scored:
 _NAN = float("nan")
 
 
+class _판:
+    """with ai.round(): 이 들어올 때 forget() 을 부른다.
+
+    판의 시작이 코드 모양으로 드러나서, 부르는 걸 잊을 자리가 없어진다.
+    """
+    __slots__ = ("_ai",)
+    def __init__(self, ai):            self._ai = ai
+    def __enter__(self):               self._ai.forget(); return self._ai
+    def __exit__(self, *_):            return False
+
+
 class BlackBoxAI:
     def __init__(self, h, name, heads, vecs=None, autosave=1, has_memory=False):
         self._h     = h
@@ -3871,6 +3882,21 @@ class BlackBoxAI:
         """
         self._forgot = True
         _ml_forget(self._h)
+
+    def round(self):
+        """판(에피소드) 하나를 감싼다. 들어갈 때 forget() 을 부른다.
+
+            for 판 in range(1000):
+                with ai.round():
+                    while 안끝났으면:
+                        step = ai.rl(관측)
+                        ...
+                    ai.save(점수들)
+
+        forget() 을 직접 불러도 똑같다 — 이건 "판이 어디서 시작하는지" 를
+        코드 모양으로 드러내서 빠뜨릴 자리를 없앤 것이다.
+        """
+        return _판(self)
 
     def rules(self):
         """로직 층이 배운 논리식을 글로 읽는다. 층이 여러 개면 리스트의 리스트.
@@ -4201,10 +4227,12 @@ class Jepa:
     """요약기 + 예측기 한 쌍.
 
     원본을 통째로 맞추는 대신 "요약"만 맞춘다.
-      train(x들, y들)  : x 의 요약으로 y 의 요약을 맞추도록 학습. 손실을 돌려준다.
-      encode(x)        : x -> 요약 (숫자 리스트)
-      imagine(x, 행동) : x (+행동) -> 다음 요약 예측
-      save()           : 요약기와 예측기 둘 다 저장
+      train(x들, y들, 행동들) : x 의 요약으로 y 의 요약을 맞추도록 학습. 손실 반환.
+      encode(x)              : x -> 요약 (숫자 리스트)
+      imagine(x, 행동)       : x (+행동) -> 다음 요약 예측 (한 걸음)
+      roll(요약, 행동)       : 요약 -> 다음 요약 (여러 걸음 이어 붙일 때)
+      save()                 : 요약기와 예측기 둘 다 저장
+      encoder / predictor    : 안에 든 모델. 일반 학습을 같이 시킬 때 쓴다.
     """
     __slots__ = ("_h", "_enc", "_pred", "_d", "_a")
 
@@ -4243,8 +4271,32 @@ class Jepa:
         return _jepa_encode(self._h, [float(v) for v in x])
 
     def imagine(self, x, action=None):
+        """관측 -> 다음 요약 예측. encode 한 뒤 roll 한 것과 같다."""
         a = None if action is None else [float(v) for v in action]
         return _jepa_imagine(self._h, [float(v) for v in x], a)
+
+    def roll(self, summary, action=None):
+        """요약 -> 다음 요약. 상상을 여러 걸음 이어 붙일 때 쓴다.
+
+            s = w.encode(관측)
+            for 행동 in 계획:
+                s = w.roll(s, 행동)      # 머릿속으로만 굴린다
+
+        imagine() 은 관측을 받으므로 한 걸음밖에 못 간다. 두 걸음부터는
+        나온 요약을 그대로 다시 넣어야 하는데 그게 이것이다.
+        """
+        if len(summary) != self._d:
+            raise ValueError(f"요약은 숫자 {self._d}개입니다 (받은 것: {len(summary)}개)")
+        x = [float(v) for v in summary]
+        if self._a > 0:
+            if action is None:
+                raise ValueError(f"이 예측기는 행동 {self._a}개를 같이 받습니다")
+            if len(action) != self._a:
+                raise ValueError(f"행동은 숫자 {self._a}개입니다 (받은 것: {len(action)}개)")
+            x += [float(v) for v in action]
+        elif action:
+            raise ValueError("이 예측기는 행동을 받지 않습니다")
+        return self._pred.embed(x, 0)
 
     def save(self):
         _jepa_save(self._h)
@@ -4253,38 +4305,71 @@ class Jepa:
         return f"Jepa(summary={self._d}, actions={self._a})"
 
 
-def jepa(encoder, predictor, var=25.0, cov=1.0, target=1.0):
-    """요약기와 예측기를 묶어서 jepa 학습기를 만든다.
+def jepa(name_or_encoder, inputs_or_predictor=None, *,
+         summary=32, actions=0, hidden=128, outputs=None,
+         var=25.0, cov=1.0, target=1.0, **knobs):
+    """jepa 학습기를 만든다. 부르는 법이 두 가지다.
 
-        enc  = make("enc",  [입력수, 128], [vec(32)])          # 요약기
-        pred = make("pred", [32 + 행동수, 128], [vec(32)])      # 예측기
+    ① 이름과 입력수만 준다 — 요약기·예측기를 알아서 만든다. 보통 이쪽.
+
+        w = jepa("world", 24)                       # 행동 없음 (표현학습)
+        w = jepa("world", 24, actions=2)            # 행동 2개 (월드모델)
+        w = jepa("world", 24, summary=16, hidden=256, actions=2)
+
+    ② 모델 두 개를 직접 만들어 묶는다 — 요약기에 attn/conv/memory 를 넣거나
+       출력을 더 붙이고 싶을 때.
+
+        enc  = make("enc",  [24, 128], [vec(32)])
+        pred = make("pred", [32 + 2, 128], [vec(32)])
         w = jepa(enc, pred)
-        w.train(지금들, 다음들, 행동들)
 
-    예측기의 입력수 - 요약 크기 = 행동 입력 개수로 자동 계산된다.
-    같으면 행동 없는 형태(그냥 자기지도학습)가 된다.
+    어느 쪽이든 쓰는 법은 같다.
 
-    요약기에 출력을 더 붙여서 섞어 쓸 수 있다. 첫 출력만 vec 이면 된다.
+        w.train(지금들, 다음들, 행동들)   # 학습. 손실을 돌려준다
+        w.encode(관측)                    # 관측 -> 요약
+        w.imagine(관측, 행동)             # 관측 -> 다음 요약
+        w.roll(요약, 행동)                # 요약 -> 다음 요약 (여러 걸음 이어 붙이기)
+        w.save()                          # 둘 다 저장
 
-        enc = make("enc", [입력수, 128], [vec(32), ["왼쪽","오른쪽"]])
-        w = jepa(enc, pred)
-        w.train(...)          # 요약을 다듬는다 (첫 출력)
-        enc.sl(관측들, [[None, "왼쪽"], ...])   # 행동을 가르친다 (둘째 출력)
+    outputs 로 요약기에 출력을 더 붙이면 jepa 와 일반 학습이 몸통을 같이 쓴다.
 
-    같은 신경망 몸통을 공유하므로, jepa 로 배운 요약이 행동 쪽에도 그대로 도움이
-    된다. vec 자리는 sl()/reward() 에서 None 으로 비우고 predict() 에서도 None 이
-    나온다 — 그 값은 embed(입력, 번호) 로 꺼낸다.
+        w = jepa("world", 24, actions=2, outputs=[["왼쪽","오른쪽"]])
+        w.train(지금들, 다음들, 행동들)                 # 요약을 다듬는다 (라벨 없음)
+        w.encoder.sl(관측들, [[None, "왼쪽"], ...])     # 행동을 가르친다
+
+    요약 자리는 sl()/reward() 에서 None 으로 비우고 predict() 에서도 None 이
+    나온다 — 그 값은 w.encode() 나 encoder.embed(입력, 0) 으로 꺼낸다.
 
     var / cov : 요약이 "다 같은 값으로 뭉개지는 것"을 막는 힘.
                 var 는 값이 실제로 변하게, cov 는 칸끼리 딴 정보를 담게 민다.
                 0 으로 두면 꺼지는데, 그러면 거의 확실히 뭉개진다.
     target    : 각 칸이 목표로 하는 값의 퍼짐 정도 (표준편차).
+    그 밖의 키워드(lr, decay, autosave ...)는 두 모델에 그대로 넘어간다.
     """
-    if not isinstance(encoder, BlackBoxAI) or not isinstance(predictor, BlackBoxAI):
-        raise ValueError("jepa(요약기, 예측기) 는 make() 로 만든 모델 두 개를 받습니다")
-    for 이름, m in (("요약기", encoder), ("예측기", predictor)):
-        if not m._vecs[0]:
-            raise ValueError(f"{이름} 의 첫 출력이 vec 이어야 합니다 (지금: {m._heads[0][0] or 'cos'})")
+    if isinstance(name_or_encoder, str):
+        # ① 이름 + 입력수 -> 두 모델을 만든다
+        name, body = name_or_encoder, inputs_or_predictor
+        if body is None:
+            raise ValueError('jepa("이름", 입력수) — 입력수를 같이 주세요')
+        요약, 행동, 은닉 = int(summary), int(actions), int(hidden)
+        if 요약 < 1:  raise ValueError("summary 는 1 이상이어야 합니다")
+        if 행동 < 0:  raise ValueError("actions 는 0 이상이어야 합니다")
+        if isinstance(body, (list, tuple)):
+            enc_layers = list(body)        # [입력수, 은닉...] 를 직접 준 경우
+        else:
+            enc_layers = [int(body), 은닉]
+        enc_outs = [vec(요약)] + list(outputs or [])
+        encoder   = make(f"{name}_enc",  enc_layers, enc_outs, **knobs)
+        predictor = make(f"{name}_pred", [요약 + 행동, 은닉], [vec(요약)], **knobs)
+    else:
+        encoder, predictor = name_or_encoder, inputs_or_predictor
+        if outputs is not None:
+            raise ValueError("outputs 는 ① 쪽에서만 씁니다 — ② 는 make() 에 직접 주세요")
+        if not isinstance(encoder, BlackBoxAI) or not isinstance(predictor, BlackBoxAI):
+            raise ValueError('jepa 는 jepa("이름", 입력수) 또는 jepa(요약기, 예측기) 로 부릅니다')
+        for 이름, m in (("요약기", encoder), ("예측기", predictor)):
+            if not m._vecs[0]:
+                raise ValueError(f"{이름} 의 첫 출력이 vec 이어야 합니다 (지금: {m._heads[0][0] or 'cos'})")
     h = _jepa_make(encoder._h, predictor._h, float(var), float(cov), float(target))
     return Jepa(h, encoder, predictor)
 

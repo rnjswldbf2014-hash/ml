@@ -17,6 +17,16 @@ back:
   - memory() works with bundled training now (it used to refuse), and the
     bundled result matches the one-at-a-time result -- regression.py's
     "memory" and "memorymix" topologies hold that line.
+  - "with ai.round():" clears the memo on entry. The library cannot know where
+    an episode begins -- only the caller can -- so wrapping it is the
+    declaration. Same effect as forget(), minus the place to forget it.
+  - jepa("name", inputs) builds the encoder and predictor itself, so the
+    shape arithmetic that used to be the caller's job (predictor input =
+    summary + actions, vec on both ends) cannot be got wrong. jepa(enc, pred)
+    still takes two hand-made models.
+  - w.roll(summary, action) continues an imagined rollout. imagine() takes an
+    observation, so it only ever goes one step; main.py used to reach into
+    predictor.embed() to get the second one.
 
 Usage: python tests/api.py     (exit 0 = pass)
 """
@@ -196,6 +206,70 @@ except Exception as e:
     jepa_ok = False
     print(f"      raised: {e}")
 check("memory() can be a jepa encoder now", jepa_ok)
+
+# ── round(): the episode boundary, as a shape in the code ───────────────
+print("\n[round] with ai.round() is forget(), where it cannot be forgotten")
+wipe()
+rr = make("rr", [2, memory(8), 8], cos, autosave=0)
+with rr.round():
+    first = [rr.predict([1.0, 0.0])[0], rr.predict([0.0, 0.0])[0]]
+with rr.round():
+    again = [rr.predict([1.0, 0.0])[0], rr.predict([0.0, 0.0])[0]]
+leaked = [rr.predict([1.0, 0.0])[0], rr.predict([0.0, 0.0])[0]]
+check("entering round() replays the sequence identically", first == again,
+      f"{first} vs {again}")
+check("not entering one lets the previous round leak in", again != leaked)
+with warnings.catch_warnings(record=True) as got4:
+    warnings.simplefilter("always")
+    rr.sl(x[:2], 0.5)
+check("round() counts as having cleared, so no warning", len(got4) == 0,
+      f"{[str(w_.message)[:40] for w_ in got4]}")
+wipe()
+plainr = make("pr", [2, 8], cos, autosave=0)
+with plainr.round():
+    pass
+check("round() on a model without memory() is harmless", True)
+
+# ── jepa: a name and an input count is enough ───────────────────────────
+print("\n[jepa] two ways to call it, same object out")
+wipe()
+obs = [[0.1 * k, 0.2, -0.1, 0.3] for k in range(8)]
+nxt = [[0.2, 0.1 * k, 0.3, -0.1] for k in range(8)]
+acts = [[1.0, 0.0]] * 8
+w = ml.jepa("wd", 4, summary=6, actions=2, hidden=16, autosave=0)
+check("jepa(name, inputs) builds both models", w.summary == 6 and w.actions == 2,
+      f"{w!r}")
+w.train(obs, nxt, acts)
+s = w.encode(obs[0])
+check("encode() gives summary-many numbers", len(s) == 6, f"{len(s)}")
+one = w.imagine(obs[0], [1.0, 0.0])
+rolled = w.roll(w.encode(obs[0]), [1.0, 0.0])
+check("imagine(x, a) == roll(encode(x), a)",
+      max(abs(p - q) for p, q in zip(one, rolled)) == 0.0)
+check("roll() chains (that is the point of it)",
+      len(w.roll(rolled, [0.0, 1.0])) == 6)
+check("roll() refuses a wrong-length summary",
+      blocked(lambda: w.roll([0.0, 0.0], [1.0, 0.0])))
+check("roll() refuses a missing action", blocked(lambda: w.roll(s)))
+wipe()
+w0 = ml.jepa("wd0", 4, summary=6, hidden=16, autosave=0)
+check("actions defaults to 0 (plain self-supervised)", w0.actions == 0)
+w0.train(obs, nxt)
+check("roll() takes no action when there are none", len(w0.roll(w0.encode(obs[0]))) == 6)
+wipe()
+wm = ml.jepa("wdm", 4, summary=6, actions=2, hidden=16,
+             outputs=[ACTS], autosave=0)
+wm.train(obs, nxt, acts)
+wm.encoder.sl(obs, [[None, "A"]] * 8)
+check("outputs= attaches extra heads to the encoder body",
+      wm.encoder.heads == 2 and wm.encoder.predict(obs[0])[0] is None,
+      f"{wm.encoder.predict(obs[0])}")
+check('jepa("name") without an input count is refused',
+      blocked(lambda: ml.jepa("nope")))
+check("outputs= is refused on the explicit two-model form",
+      blocked(lambda: ml.jepa(enc, prd, outputs=[ACTS])))
+check("var/cov/target are keyword-only",
+      blocked(lambda: ml.jepa(enc, prd, 25.0)))
 
 os.chdir(ROOT)
 shutil.rmtree(WORK, ignore_errors=True)
