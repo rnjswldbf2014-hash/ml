@@ -787,6 +787,19 @@ private struct AttnLayer {
         foreach (a; [x1,q,k,v,att,ao,po,mu,rstd,dq,dk,dv,datt,dao,dx1,xh,dotBuf]) a[] = 0f;
     }
 
+    // 벡터화 메모 — 안쪽 루프 네 개를 _saxpy 로 바꿨다 (결과는 비트 동일: 고정된 i 에서
+    // 더해지는 순서가 s 순서 그대로다). 실측 (입력폭 512, 묶음 32, [512,attn(S),each(16)]):
+    //     S          8      16      32      64     128
+    //   예전      2.51    2.37    3.15    3.89    7.46 ms
+    //   saxpy     2.28    2.16    2.68    3.10    6.22 ms
+    // S=4 는 차이가 없고(투영이 지배), S=256 은 hw=2 라 효과가 없다. 측정 변동 자체도
+    // 줄었다 (S=64 에서 4.93/3.89 -> 3.29/3.30).
+    //
+    // **점수 내적(QK^T)과 datt 내적은 _dot 으로 바꾸지 말 것.** 재봤더니 전 구간에서
+    // 더 느렸다 (S=8 2.15->2.55, S=128 6.22->6.66). 내적 길이가 hw(2~128)로 짧은데
+    // _dot 은 함수 포인터라 인라인이 안 돼서 호출 비용이 이득을 먹는다. 그 자리는
+    // 스칼라 루프가 맞다 — 컴파일러가 hw 를 알고 인라인·언롤한다.
+    //
     // y = x + 어텐션(LayerNorm(x))
     // 항목(t)별로 q/k/v/ao/po 를 서로 겹치지 않게 쓰므로 t (또는 h*items+t) 기준
     // 병렬화가 안전하다. forward() 는 가중치를 읽기만 해서 항목끼리 공유해도 된다.
@@ -819,12 +832,14 @@ private struct AttnLayer {
                 }
                 float inv = 1f / sum;
                 foreach (s; 0..items) att[h*items*items + t*items + s] *= inv;
-                foreach (i; 0..hw) {
-                    float acc = 0f;
-                    foreach (s; 0..items)
-                        acc += att[h*items*items + t*items + s] * v[s*w + h*hw + i];
-                    ao[t*w + h*hw + i] = acc;
-                }
+                // i 를 바깥, s 를 안쪽으로 돌면 v 접근이 w 간격으로 뜀뛰어서
+                // 벡터화가 안 된다. 뒤집으면 i 가 연속이라 saxpy 가 된다.
+                // 고정된 i 에서 더해지는 순서는 s 순서 그대로라 결과는 비트 동일.
+                auto aoS = ao[t*w + h*hw .. t*w + h*hw + hw];
+                aoS[] = 0f;
+                foreach (s; 0..items)
+                    _saxpy(aoS, v[s*w + h*hw .. s*w + h*hw + hw],
+                           att[h*items*items + t*items + s]);
             }
         });
         _parChunk(items, (int tlo, int thi) {
@@ -869,7 +884,8 @@ private struct AttnLayer {
                 foreach (s; 0..items) {
                     float a = att[h*items*items + t*items + s];
                     float ds = a * (datt[h*items*items + t*items + s] - dot) * scale;
-                    foreach (i; 0..hw) dq[t*w + h*hw + i] += ds * k[s*w + h*hw + i];
+                    _saxpy(dq[t*w + h*hw .. t*w + h*hw + hw],
+                           k[s*w + h*hw .. s*w + h*hw + hw], ds);
                 }
             }
         });
@@ -881,10 +897,12 @@ private struct AttnLayer {
             foreach (s; slo .. shi) {
                 foreach (h; 0..heads) foreach (t; 0..items) {
                     float a = att[h*items*items + t*items + s];
-                    foreach (i; 0..hw) dv[s*w + h*hw + i] += a * dao[t*w + h*hw + i];
+                    _saxpy(dv[s*w + h*hw .. s*w + h*hw + hw],
+                           dao[t*w + h*hw .. t*w + h*hw + hw], a);
                     float dot = dotBuf[h*items + t];
                     float ds = a * (datt[h*items*items + t*items + s] - dot) * scale;
-                    foreach (i; 0..hw) dk[s*w + h*hw + i] += ds * q[t*w + h*hw + i];
+                    _saxpy(dk[s*w + h*hw .. s*w + h*hw + hw],
+                           q[t*w + h*hw .. t*w + h*hw + hw], ds);
                 }
             }
         });
@@ -933,12 +951,11 @@ private struct AttnLayer {
                 }
                 float inv = 1f / sum;
                 foreach (s; 0..items) attB[aoff + h*items*items + t*items + s] *= inv;
-                foreach (i; 0..hw) {
-                    float acc = 0f;
-                    foreach (s; 0..items)
-                        acc += attB[aoff + h*items*items + t*items + s] * vB[off+s*w+h*hw+i];
-                    aoB[off + t*w + h*hw + i] = acc;
-                }
+                auto aoS = aoB[off + t*w + h*hw .. off + t*w + h*hw + hw];
+                aoS[] = 0f;
+                foreach (s; 0..items)
+                    _saxpy(aoS, vB[off+s*w+h*hw .. off+s*w+h*hw+hw],
+                           attB[aoff + h*items*items + t*items + s]);
             }
         });
         wo.batchForward(aoB, poB, BT);
@@ -980,7 +997,8 @@ private struct AttnLayer {
                 foreach (s; 0..items) {
                     float a = attB[aoff + h*items*items + t*items + s];
                     float ds = a * (dattB[aoff + h*items*items + t*items + s] - dot) * scale;
-                    foreach (i; 0..hw) dqB[off+t*w+h*hw+i] += ds * kB[off+s*w+h*hw+i];
+                    _saxpy(dqB[off+t*w+h*hw .. off+t*w+h*hw+hw],
+                           kB[off+s*w+h*hw .. off+s*w+h*hw+hw], ds);
                 }
             }
         });
@@ -992,10 +1010,12 @@ private struct AttnLayer {
                 int off = b*dim; int aoff = b*heads*items*items;
                 foreach (h; 0..heads) foreach (t; 0..items) {
                     float a = attB[aoff + h*items*items + t*items + s];
-                    foreach (i; 0..hw) dvB[off+s*w+h*hw+i] += a * daoB[off+t*w+h*hw+i];
+                    _saxpy(dvB[off+s*w+h*hw .. off+s*w+h*hw+hw],
+                           daoB[off+t*w+h*hw .. off+t*w+h*hw+hw], a);
                     float dot = dotBufB[b*heads*items + h*items + t];
                     float ds = a * (dattB[aoff + h*items*items + t*items + s] - dot) * scale;
-                    foreach (i; 0..hw) dkB[off+s*w+h*hw+i] += ds * qB[off+t*w+h*hw+i];
+                    _saxpy(dkB[off+s*w+h*hw .. off+s*w+h*hw+hw],
+                           qB[off+t*w+h*hw .. off+t*w+h*hw+hw], ds);
                 }
             }
         });
