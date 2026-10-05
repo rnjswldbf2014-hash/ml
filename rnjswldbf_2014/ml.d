@@ -85,11 +85,36 @@ shared static this() {
     try { defaultPoolThreads(cast(size_t)(_nThreads > 0 ? _nThreads - 1 : 0)); } catch (Exception e) {}
 }
 
+// 병렬화 문턱값 — 일이 이보다 작으면 스레드를 띄우는 비용이 일보다 크다.
+//
+// 예전엔 **행 개수만** 봤다 (n < 2*T). 행 하나가 얼마나 무거운지는 안 봤다는
+// 뜻인데, 가중치 갱신이 벡터화돼서 10배 싸진 뒤로 그게 손해로 바뀌었다.
+// 실측 (배치 1, [입력,은닉...] 한 장 학습, 12스레드 vs 1스레드):
+//
+//     가중치 행렬   1스레드    12스레드
+//        2,048      0.0087     0.0311   <- 3.6배 손해
+//       16,384      0.0396     0.0782   <- 2.0배 손해
+//       65,536      0.1862     0.2332
+//      262,144      1.2692     0.7705   <- 여기서 뒤집힌다
+//    1,048,576      4.6884     4.2656
+//
+// 그래서 131,072 로 잡았다 (65,536 과 262,144 사이). 묶음으로 학습할 때는
+// 일이 B 배라 어느 크기든 문턱값을 넘는다 (실측 B=64 에서 3~5배 이득).
+//
+// 문턱값은 **결과를 바꾸지 않는다** — 조각들이 겹치지 않는 출력을 담당하므로
+// 병렬이든 직렬이든 합산 순서가 같다. regression.py 가 그걸 지킨다.
+enum long PAR_MIN_WORK = 131_072;
+
 // [0,n) 을 _nThreads 조각으로 나눠 병렬 실행. 각 조각은 겹치지 않는 출력을 담당한다
 // (합산 순서가 보존되므로 직렬과 비트 단위로 동일하다).
+// work = 이 루프가 건드리는 원소 수. 안 주면 "충분히 크다" 로 본다.
 void _parChunk(int n, scope void delegate(int lo, int hi) body) {
+    _parChunk(n, long.max, body);
+}
+
+void _parChunk(int n, long work, scope void delegate(int lo, int hi) body) {
     int T = _nThreads;
-    if (T <= 1 || n < 2 * T) { body(0, n); return; }
+    if (T <= 1 || n < 2 * T || work < PAR_MIN_WORK) { body(0, n); return; }
     int per = (n + T - 1) / T;
     foreach (t; taskPool.parallel(iota(T), 1)) {
         int lo = cast(int)t * per; int hi = lo + per;
@@ -102,7 +127,11 @@ void _parChunk(int n, scope void delegate(int lo, int hi) body) {
 // (그리고 Task 할당 때문에 @nogc 도 아니라서), 병렬 실행 중 예외가 나면
 // 그 청크는 포기하지 않고 직렬로 다시 돌려 결과를 보존한다.
 void _parChunkNT(int n, scope void delegate(int lo, int hi) nothrow body) nothrow {
-    try { _parChunk(n, body); } catch (Throwable) { body(0, n); }
+    try { _parChunk(n, long.max, body); } catch (Throwable) { body(0, n); }
+}
+
+void _parChunkNT(int n, long work, scope void delegate(int lo, int hi) nothrow body) nothrow {
+    try { _parChunk(n, work, body); } catch (Throwable) { body(0, n); }
 }
 
 private Random rng;
@@ -141,11 +170,101 @@ private __gshared SaxpyFn _saxpy;
                     private void saxpy_base (float[] d, const(float)[] s, float sc) pure nothrow @nogc
 { foreach (i; 0..d.length) d[i] += sc*s[i]; }
 
+// ── 옵티마이저 커널 (행 하나씩) ──────────────────────────────────────
+// 요점은 식이 아니라 **행 슬라이스를 미리 뽑아서 넘긴다**는 것이다. 내부 루프
+// 안에서 w[j][k] 처럼 간접참조하면 LLVM 이 w/m/v/grad 의 행들이 겹치지 않는다는
+// 걸 증명할 수 없어서 벡터화를 포기한다. 실측 (가중치 65,536개, 1스레드, Adam):
+//
+//     지금처럼 w[j][k]              368 us
+//     @target("avx2,fma") 만 붙임   309 us   <- 1.09배. 거의 효과 없다
+//     행을 루프 밖으로 빼기          70 us   <- 5.3배. 여기가 거의 전부다
+//     + @target("avx2,fma")          34 us   <- 뺀 뒤에야 AVX2 가 먹는다
+//
+// 식은 한 글자도 바꾸지 않았다 — 나눗셈을 미리 계산한 역수로 바꾸면 29us 까지
+// 가지만(16% 더) 결과값이 미세하게 달라진다. 곱해서 10.7배면 충분하다.
+//
+// 이 기계(znver3 = Zen 3+)는 AVX-512 를 지원하지 않는다 (LLVM 이 -avx512f 로
+// 보고한다). AVX2 가 상한이다. SSE4.1 변종은 두지 않았다 — 호이스트만 하면
+// 기본 타깃(SSE2)도 4개씩 묶어서 70us 를 내므로 중간 단계가 의미가 없다.
+private enum float OB1=0.9f, OB2=0.999f, OEPS=1e-8f, ORHO=0.99f;
+
+private enum string ADAM_ROW = q{
+    foreach (k; 0 .. w.length) {
+        float g = gw[k];
+        float mm = OB1*m[k] + (1-OB1)*g;      m[k] = mm;
+        float vv = OB2*v[k] + (1-OB2)*g*g;    v[k] = vv;
+        w[k] -= lr * (mm/bc1) / (sqrt(vv/bc2) + OEPS);
+    }
+};
+private enum string RMS_ROW = q{
+    foreach (k; 0 .. w.length) {
+        float g = gw[k];
+        float vv = ORHO*v[k] + (1-ORHO)*g*g;  v[k] = vv;
+        w[k] -= lr * g / (sqrt(vv) + OEPS);
+    }
+};
+private enum string ADAGRAD_ROW = q{
+    foreach (k; 0 .. w.length) {
+        float g = gw[k];
+        float vv = v[k] + g*g;                v[k] = vv;
+        w[k] -= lr * g / (sqrt(vv) + OEPS);
+    }
+};
+private enum string SGD_ROW = q{
+    foreach (k; 0 .. w.length) w[k] -= lr * gw[k];
+};
+
+private alias AdamFn = void function(float[] w, float[] m, float[] v,
+                                     const(float)[] gw, float lr, float bc1, float bc2) nothrow @nogc;
+private alias VFn    = void function(float[] w, float[] v,
+                                     const(float)[] gw, float lr) nothrow @nogc;
+private alias SgdFn  = void function(float[] w, const(float)[] gw, float lr) nothrow @nogc;
+
+@target("avx2,fma") private void adamRow_avx2(float[] w, float[] m, float[] v,
+    const(float)[] gw, float lr, float bc1, float bc2) nothrow @nogc { mixin(ADAM_ROW); }
+                    private void adamRow_base(float[] w, float[] m, float[] v,
+    const(float)[] gw, float lr, float bc1, float bc2) nothrow @nogc { mixin(ADAM_ROW); }
+
+@target("avx2,fma") private void rmsRow_avx2(float[] w, float[] v,
+    const(float)[] gw, float lr) nothrow @nogc { mixin(RMS_ROW); }
+                    private void rmsRow_base(float[] w, float[] v,
+    const(float)[] gw, float lr) nothrow @nogc { mixin(RMS_ROW); }
+
+@target("avx2,fma") private void adagradRow_avx2(float[] w, float[] v,
+    const(float)[] gw, float lr) nothrow @nogc { mixin(ADAGRAD_ROW); }
+                    private void adagradRow_base(float[] w, float[] v,
+    const(float)[] gw, float lr) nothrow @nogc { mixin(ADAGRAD_ROW); }
+
+@target("avx2,fma") private void sgdRow_avx2(float[] w, const(float)[] gw, float lr)
+    nothrow @nogc { mixin(SGD_ROW); }
+                    private void sgdRow_base(float[] w, const(float)[] gw, float lr)
+    nothrow @nogc { mixin(SGD_ROW); }
+
+@target("avx2,fma") private void scaleRow_avx2(float[] w, float sc) nothrow @nogc
+{ foreach (k; 0 .. w.length) w[k] *= sc; }
+                    private void scaleRow_base(float[] w, float sc) nothrow @nogc
+{ foreach (k; 0 .. w.length) w[k] *= sc; }
+
+private __gshared AdamFn _adamRow;
+private __gshared VFn    _rmsRow, _adagradRow;
+private __gshared SgdFn  _sgdRow;
+private __gshared void function(float[], float) nothrow @nogc _scaleRow;
+
 shared static this() {
     import cpu = core.cpuid;
     if (cpu.avx2)       { _dot = &dot_avx2;  _saxpy = &saxpy_avx2;  }
     else if (cpu.sse42) { _dot = &dot_sse41; _saxpy = &saxpy_sse41; }
     else                { _dot = &dot_base;  _saxpy = &saxpy_base;  }
+
+    if (cpu.avx2) {
+        _adamRow = &adamRow_avx2; _rmsRow = &rmsRow_avx2;
+        _adagradRow = &adagradRow_avx2; _sgdRow = &sgdRow_avx2;
+        _scaleRow = &scaleRow_avx2;
+    } else {
+        _adamRow = &adamRow_base; _rmsRow = &rmsRow_base;
+        _adagradRow = &adagradRow_base; _sgdRow = &sgdRow_base;
+        _scaleRow = &scaleRow_base;
+    }
 }
 
 // ─────────────────────────────────────────────
@@ -213,20 +332,20 @@ private struct Linear {
     }
 
     // decay = 가중치 감쇠. 0 이면 아무 일도 안 한다 (기본).
+    //
+    // 가중치 루프는 **행마다 커널을 부른다** (위의 _adamRow 등). 행 슬라이스를
+    // 미리 뽑아서 넘기는 게 요점이다 — 예전엔 여기서 w[j][k] 로 직접 훑었고
+    // 그게 벡터화를 막아서 Adam 갱신이 10.7배 느렸다. 식은 그대로라 결과값은
+    // 비트 단위로 같다. 편향(b)은 outSz 개뿐이라 그대로 둔다.
     void step(Opt opt, float lr, float decay = 0f) nothrow {
         enum float B1=0.9f, B2=0.999f, EPS=1e-8f, RHO=0.99f;
         final switch (opt) {
             case Opt.adam:
                 t++;
                 float bc1 = 1f - B1^^t, bc2 = 1f - B2^^t;
-                _parChunkNT(outSz, (int jlo, int jhi) nothrow {
+                _parChunkNT(outSz, cast(long) outSz * inSz, (int jlo, int jhi) nothrow {
                     foreach (j; jlo .. jhi) {
-                        foreach (k; 0..inSz) {
-                            float g = gradW[j][k];
-                            mW[j][k] = B1*mW[j][k] + (1-B1)*g;
-                            vW[j][k] = B2*vW[j][k] + (1-B2)*g*g;
-                            w[j][k] -= lr * (mW[j][k]/bc1) / (sqrt(vW[j][k]/bc2) + EPS);
-                        }
+                        _adamRow(w[j], mW[j], vW[j], gradW[j], lr, bc1, bc2);
                         float gb = gradB[j];
                         mB[j] = B1*mB[j] + (1-B1)*gb; vB[j] = B2*vB[j] + (1-B2)*gb*gb;
                         b[j] -= lr * (mB[j]/bc1) / (sqrt(vB[j]/bc2) + EPS);
@@ -234,21 +353,17 @@ private struct Linear {
                 });
                 break;
             case Opt.sgd:
-                _parChunkNT(outSz, (int jlo, int jhi) nothrow {
+                _parChunkNT(outSz, cast(long) outSz * inSz, (int jlo, int jhi) nothrow {
                     foreach (j; jlo .. jhi) {
-                        foreach (k; 0..inSz) w[j][k] -= lr * gradW[j][k];
+                        _sgdRow(w[j], gradW[j], lr);
                         b[j] -= lr * gradB[j];
                     }
                 });
                 break;
             case Opt.rmsprop:
-                _parChunkNT(outSz, (int jlo, int jhi) nothrow {
+                _parChunkNT(outSz, cast(long) outSz * inSz, (int jlo, int jhi) nothrow {
                     foreach (j; jlo .. jhi) {
-                        foreach (k; 0..inSz) {
-                            float g = gradW[j][k];
-                            vW[j][k] = RHO*vW[j][k] + (1-RHO)*g*g;
-                            w[j][k] -= lr * g / (sqrt(vW[j][k]) + EPS);
-                        }
+                        _rmsRow(w[j], vW[j], gradW[j], lr);
                         float gb = gradB[j];
                         vB[j] = RHO*vB[j] + (1-RHO)*gb*gb;
                         b[j] -= lr * gb / (sqrt(vB[j]) + EPS);
@@ -256,13 +371,9 @@ private struct Linear {
                 });
                 break;
             case Opt.adagrad:
-                _parChunkNT(outSz, (int jlo, int jhi) nothrow {
+                _parChunkNT(outSz, cast(long) outSz * inSz, (int jlo, int jhi) nothrow {
                     foreach (j; jlo .. jhi) {
-                        foreach (k; 0..inSz) {
-                            float g = gradW[j][k];
-                            vW[j][k] += g*g;
-                            w[j][k] -= lr * g / (sqrt(vW[j][k]) + EPS);
-                        }
+                        _adagradRow(w[j], vW[j], gradW[j], lr);
                         float gb = gradB[j];
                         vB[j] += gb*gb;
                         b[j] -= lr * gb / (sqrt(vB[j]) + EPS);
@@ -279,8 +390,8 @@ private struct Linear {
         // 당기면 맞춰야 할 값을 못 맞춘다 (관례도 그렇다).
         if (decay != 0f) {
             immutable float keep = 1f - lr * decay;
-            _parChunkNT(outSz, (int jlo, int jhi) nothrow {
-                foreach (j; jlo .. jhi) foreach (k; 0..inSz) w[j][k] *= keep;
+            _parChunkNT(outSz, cast(long) outSz * inSz, (int jlo, int jhi) nothrow {
+                foreach (j; jlo .. jhi) _scaleRow(w[j], keep);
             });
         }
     }
