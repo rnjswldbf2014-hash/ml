@@ -28,6 +28,10 @@ What this pins down:
   4. BPTT is on by default and only the bundled path can do it: B=1 must be
      bit-identical with MYML_BPTT either way, and a real bundle must differ.
      That second one is what catches BPTT silently not running.
+  5. rl() + save() replays the collected steps, and replays them from the memo
+     the first of them actually saw -- not from wherever collecting left it.
+     Probed with lr=0, where the memo after learning must land exactly where
+     collecting left it.
 
 The batched path is NOT compared against the serial path here -- the serial
 path interleaves forward and backward per sample, so the rest of the chain does
@@ -132,6 +136,8 @@ sys.path.insert(0, MODULE_DIR)
 os.chdir(WORK)
 from ml import make, memory, cos      # noqa: E402
 
+ACTS = ["A", "B"]
+
 ai = make("fg", [2, memory(8), 8], [cos], autosave=0)
 ai.forget()
 a = [ai.predict([1.0, 0.0])[0], ai.predict([0.0, 0.0])[0]]
@@ -147,7 +153,7 @@ plain = make("fg_plain", [2, 8], [cos], autosave=0)
 plain.forget()           # must be a no-op, not an error
 check("forget() on a model without memory() is harmless", True)
 
-print("\n[batch] a memory network must not take the batched path")
+print("\n[batch] bundled training is allowed (it used to be refused)")
 rows = [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6], [0.7, 0.8]]
 tgts = [[0.1], [0.2], [0.3], [0.4]]
 try:
@@ -210,6 +216,68 @@ check("B=1 (one sl() per step): BPTT changes nothing, bit for bit",
 check("a real bundle: BPTT changes the answer, so it is actually running",
       results[("bundle", True)] != results[("bundle", False)])
 shutil.rmtree(BWORK, ignore_errors=True)
+
+# ── rl() + save() replays the episode, and must replay it from the right memo ─
+# Collecting with rl() already pushed the memo to the end of the episode, but
+# learning re-runs those same steps, so it has to start from the memo the FIRST
+# of them saw. The layer keeps that separately (hSnap) instead of reading the
+# live memo, which was the bug: learning restarted from the end of the episode
+# and quietly learned the wrong thing.
+#
+# The probe: with lr=0 the weights cannot move, so "the memo after save()" must
+# equal "the memo with no save() at all". Any mismatch is the replay leaving
+# the memo somewhere else. The third case shows the check is not vacuous.
+print("\n[rl+memory] learning replays the episode from the right memo")
+RWORK = os.path.join(SCRATCH, "_rlmem")
+shutil.rmtree(RWORK, ignore_errors=True)
+os.makedirs(RWORK)
+os.chdir(RWORK)
+
+ROWS = [[0.3, -0.2], [0.1, 0.4], [-0.2, 0.3], [0.5, 0.1]]
+PROBE = [0.0, 0.1]
+PTH, SNAPSHOT = "rm_ml_memory.pth", "snapshot.bin"
+
+seed_model = make("rm", [2, memory(4), 6], ACTS, lr=0.0)
+seed_model.forget()
+seed_model.save(seed_model.reward(seed_model.rl(ROWS[0]), 1.0))   # persists PTH
+shutil.copyfile(PTH, SNAPSHOT)
+del seed_model
+
+
+def from_snapshot():
+    """Every variant starts from the SAME weights -- a fresh make() would
+    randomise them, and then nothing below would mean anything."""
+    shutil.copyfile(SNAPSHOT, PTH)
+    m = make("rm", [2, memory(4), 6], ACTS, autosave=0, lr=0.0)
+    m.forget()
+    return m
+
+
+def memo_after(how):
+    m = from_snapshot()
+    if how == "collect":                      # rl() only, no learning
+        [m.rl(r) for r in ROWS]
+    elif how == "bundle":                     # collect, then learn in one go
+        m.save([m.reward(s, 1.0) for s in [m.rl(r) for r in ROWS]])
+    elif how == "online":                     # collect and learn step by step
+        for r in ROWS:
+            m.save(m.reward(m.rl(r), 1.0))
+    elif how == "partial":                    # learn only a prefix (off-contract)
+        scored = [m.reward(s, 1.0) for s in [m.rl(r) for r in ROWS]]
+        m.save(scored[:2])
+    return [round(v, 8) for v in m.embed(PROBE, 0)]
+
+
+base = memo_after("collect")
+check("learning a whole episode leaves the memo where collecting left it",
+      memo_after("bundle") == base, f"{memo_after('bundle')} vs {base}")
+check("so does learning it one step at a time",
+      memo_after("online") == base, f"{memo_after('online')} vs {base}")
+check("and the probe can fail (learning a prefix moves it elsewhere)",
+      memo_after("partial") != base)
+
+os.chdir(ROOT)
+shutil.rmtree(RWORK, ignore_errors=True)
 
 print("\n" + ("ALL MEMORY CHECKS PASS" if ok else "MEMORY CHECKS FAILED"))
 sys.exit(0 if ok else 1)

@@ -1187,6 +1187,7 @@ private struct RnnLayer {
     Linear zx, zh;        // 게이트: 입력 쪽 / 메모 쪽
 
     float[] h;            // 메모장. 호출 사이에 남는다 (학습된 값이 아니라 현재 상태)
+    float[] hSnap;        // "다시 돌릴 때 출발할 메모". 아래 설명 참고.
     float[] hPrev, cc, c, cz, z, ccH, czH;
     float[] dcc, dcz, dxTmp, dhSink;
 
@@ -1211,8 +1212,8 @@ private struct RnnLayer {
         //        -2    5/5    4/5    1/5
         //        -3    3/5    0/5    0/5
         // 바꾸려면 이 표를 다시 재고 나서 바꿀 것.
-        foreach (ref a; [&h, &hPrev, &cc, &c, &cz, &z, &ccH, &czH, &dcc, &dcz,
-                         &dhSink, &dhCarry])
+        foreach (ref a; [&h, &hSnap, &hPrev, &cc, &c, &cz, &z, &ccH, &czH,
+                         &dcc, &dcz, &dhSink, &dhCarry])
             { *a = new float[outSz_]; (*a)[] = 0f; }
         dxTmp = new float[inSz_]; dxTmp[] = 0f;
     }
@@ -1221,8 +1222,27 @@ private struct RnnLayer {
         return 1f / (1f + exp(-v));
     }
 
-    // 메모를 비운다. 에피소드가 바뀔 때 부른다.
-    void forget() nothrow @nogc { h[] = 0f; }
+    // 메모를 비운다. 에피소드가 바뀔 때 부른다. 재생 출발점도 같이 비운다 —
+    // 판이 처음부터 시작하면 다시 돌릴 때도 처음부터 출발해야 한다.
+    void forget() nothrow @nogc { h[] = 0f; hSnap[] = 0f; }
+
+    // ── 재생 출발점 (hSnap) ──────────────────────────────────────────
+    // rl() 로 모아서 save() 로 학습하는 경로는 학습할 때 그 스텝들을 **다시**
+    // 순전파한다. 그때 출발 메모가 "수집할 때 그 첫 스텝이 보던 메모" 여야 한다.
+    // 그런데 수집이 이미 메모를 끝까지 밀어놨으므로 h 는 쓸 수 없다.
+    //
+    // 그래서 "아직 학습 안 한 가장 오래된 스텝이 보던 메모" 를 따로 들고 있는다.
+    // 갱신 시점은 두 곳뿐이다: forget() 과 학습이 끝난 직후. rl()/predict() 는
+    // h 만 밀고 hSnap 은 건드리지 않는다 — 그게 이 버퍼의 요점이다.
+    //
+    // 이러면 두 패턴이 다 맞는다:
+    //   판 끝에 한 번 저장:  forget→snap=0, rl×N(h→N), save(0 에서 재생→N, snap=N)
+    //   한 스텝씩 저장:      forget→snap=0, rl(h→m1), save(0 에서 재생→m1, snap=m1),
+    //                        rl(h→m2), save(m1 에서 재생→m2, snap=m2)  ...
+    // 어느 쪽이든 재생이 끝난 h 가 수집이 남긴 h 와 같아진다 (가중치 갱신은
+    // 순전파 뒤에 일어나므로 같은 가중치로 같은 입력을 돈다).
+    void snapshotMemo() nothrow @nogc { hSnap[] = h[]; }
+    void restoreMemo()  nothrow @nogc { h[] = hSnap[]; }
 
     void fwd(const(float)[] x, float[] y) {
         hPrev[] = h[];
@@ -1599,6 +1619,9 @@ private class Network {
 
     // 모든 메모를 비운다. 에피소드 경계에서 부른다.
     void forget() nothrow @nogc { foreach (ref r; rnns) r.forget(); }
+    bool hasMemo() const nothrow @nogc { return rnns.length > 0; }
+    void snapshotMemo() nothrow @nogc { foreach (ref r; rnns) r.snapshotMemo(); }
+    void restoreMemo()  nothrow @nogc { foreach (ref r; rnns) r.restoreMemo(); }
 
     int[]     _inSz, _outSz;
     float[][] _inp, _pre;
@@ -2312,6 +2335,10 @@ class BlackBoxAI {
     void learnBatch(float[][] inputs, int[][] chosen, float[][] values, float[][] scores) {
         if (inputs.length == 0) return;
         net.zeroGrad();
+        // memory 층이 있으면 이 스텝들을 **다시** 순전파하게 되는데, 수집할 때
+        // rl() 들이 메모를 이미 끝까지 밀어놨다. 그 첫 스텝이 보던 메모로
+        // 되돌려놓고 재생한다 (RnnLayer.hSnap 주석 참고).
+        if (net.hasMemo()) net.restoreMemo();
         // 배치 크기로 나눠 평균 기울기를 쓴다.
         // (합산만 하면 배치가 커질수록 갱신 폭이 커져 발산한다)
         immutable float inv = 1.0f / cast(float) inputs.length;
@@ -2364,6 +2391,8 @@ class BlackBoxAI {
             }
             net.backwardBatch(B);
             net.step(opt, lr, decay);
+            // 재생이 끝난 메모가 다음 재생의 출발점이 된다
+            if (net.hasMemo()) net.snapshotMemo();
             return;
         }
 
@@ -2404,6 +2433,7 @@ class BlackBoxAI {
             net.backward();
         }
         net.step(opt, lr, decay);
+        if (net.hasMemo()) net.snapshotMemo();
     }
 
     // ── 지도학습 1스텝 (헤드별 정답; 이산은 인덱스, cos 는 목표값) ──
@@ -2436,6 +2466,7 @@ class BlackBoxAI {
         }
         net.backward();
         net.step(opt, lr, decay);
+        if (net.hasMemo()) net.snapshotMemo();
     }
 
     // GPU 로 넘길 만한 크기인지 판단. 이 라이브러리는 배치=1 온라인 학습이 핵심
@@ -2672,6 +2703,8 @@ class BlackBoxAI {
             }
             net.backwardBatch(B);
             net.step(opt, lr, decay);
+            // 재생이 끝난 메모가 다음 재생의 출발점이 된다
+            if (net.hasMemo()) net.snapshotMemo();
             return;
         }
 
@@ -2704,6 +2737,7 @@ class BlackBoxAI {
         }
 
         net.step(opt, lr, decay);
+        if (net.hasMemo()) net.snapshotMemo();
     }
 
     // ── jepa 용 진입점 ────────────────────────────────────────────────
