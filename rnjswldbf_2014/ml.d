@@ -731,6 +731,20 @@ private struct AttnLayer {
     int heads;      // 어텐션 헤드
     int hw;         // 헤드 하나의 폭 = w/heads
 
+    // flash = 플래시 어텐션. 가중치와 계산 결과는 스탠다드와 같고 **계산 방식만**
+    // 다르다 (S×S 점수 행렬을 만들지 않는다). 그래서 두 모드가 같은 가중치를
+    // 공유할 수 있고, tests/attnflash.py 가 같은 파일을 양쪽으로 읽어 결과를 비교한다.
+    //
+    //   순전파: s 를 FBS 개씩 블록으로 돌면서 러닝 최댓값 m 과 러닝 합 l 을 들고 간다.
+    //           블록마다 최댓값이 올라가면 지금까지의 누적을 exp(m_old - m_new) 로
+    //           되스케일한다 (온라인 softmax). 끝에 l 로 나누고 logsumexp 를 남긴다.
+    //   역전파: 점수를 **다시 계산한다** (저장하지 않았으므로). softmax 야코비안에
+    //           필요한 D_t = Σ_s p_s·(dO·v_s) 는 Σ_s p_s v_s = O 이므로
+    //           **D_t = dO_t·O_t** 로 한 번의 내적으로 구해진다 — 이것 덕분에
+    //           S×S 를 다시 만들지 않아도 된다.
+    bool flash;
+    enum int FBS = 32;     // s 블록 크기. 쓰는 메모리가 H·S·S -> H·S·FBS 가 된다
+
     LN     ln;
     Linear wq, wk, wv, wo;
 
@@ -749,6 +763,8 @@ private struct AttnLayer {
     // 공유하지 않는다 (예전엔 LN 내부에서 공유·재할당하다가 두 경로 예측 결과가
     // 미세하게 갈라지는 문제가 있었다).
     int _bcap;
+    float[] lse, fsc;          // 플래시 전용: [H*S], [H*S*FBS]
+    float[] lseB, fscB;
     float[] x1B, qB, kB, vB, attB, aoB, poB;
     float[] muB, rstdB;
     float[] dqB, dkB, dvB, dattB, daoB, dx1B, dotBufB;
@@ -757,34 +773,46 @@ private struct AttnLayer {
     void _allocBatch(int B) {
         if (B <= _bcap) return;
         x1B = new float[B*dim]; qB = new float[B*dim]; kB = new float[B*dim]; vB = new float[B*dim];
-        attB = new float[B*heads*items*items];
         aoB = new float[B*dim]; poB = new float[B*dim];
         muB = new float[B*items]; rstdB = new float[B*items];
         dqB = new float[B*dim]; dkB = new float[B*dim]; dvB = new float[B*dim];
-        dattB = new float[B*heads*items*items];
         daoB = new float[B*dim]; dx1B = new float[B*dim];
         dotBufB = new float[B*heads*items];
         xhB = new float[B*dim];   // T*D = (B*items)*w = B*(items*w) = B*dim
-        foreach (a; [x1B,qB,kB,vB,attB,aoB,poB,muB,rstdB,dqB,dkB,dvB,dattB,daoB,dx1B,dotBufB,xhB])
+        foreach (a; [x1B,qB,kB,vB,aoB,poB,muB,rstdB,dqB,dkB,dvB,daoB,dx1B,dotBufB,xhB])
             a[] = 0f;
+        if (flash) {
+            lseB = new float[B*heads*items];      lseB[] = 0f;
+            fscB = new float[B*heads*items*FBS];  fscB[] = 0f;
+        } else {
+            attB  = new float[B*heads*items*items]; attB[]  = 0f;
+            dattB = new float[B*heads*items*items]; dattB[] = 0f;
+        }
         _bcap = B;
     }
 
-    this(int dim_, int items_, int heads_) {
+    this(int dim_, int items_, int heads_, bool flash_ = false) {
         dim = dim_; items = items_; w = dim_ / items_; heads = heads_; hw = w / heads_;
+        flash = flash_;
         ln = LN(w);
         wq = Linear(w, w); wk = Linear(w, w); wv = Linear(w, w); wo = Linear(w, w);
 
         x1 = new float[dim]; q = new float[dim]; k = new float[dim]; v = new float[dim];
-        att = new float[heads*items*items];
         ao = new float[dim]; po = new float[dim];
         mu = new float[items]; rstd = new float[items];
         dq = new float[dim]; dk = new float[dim]; dv = new float[dim];
-        datt = new float[heads*items*items];
         dao = new float[dim]; dx1 = new float[dim];
         xh = new float[dim];   // T*D = items*w = dim
         dotBuf = new float[heads*items];
-        foreach (a; [x1,q,k,v,att,ao,po,mu,rstd,dq,dk,dv,datt,dao,dx1,xh,dotBuf]) a[] = 0f;
+        foreach (a; [x1,q,k,v,ao,po,mu,rstd,dq,dk,dv,dao,dx1,xh,dotBuf]) a[] = 0f;
+        if (flash) {
+            // S×S 를 안 만든다 — 질의마다 logsumexp 하나와 블록 점수 FBS 개뿐이다.
+            lse = new float[heads*items];        lse[] = 0f;
+            fsc = new float[heads*items*FBS];    fsc[] = 0f;
+        } else {
+            att  = new float[heads*items*items]; att[]  = 0f;
+            datt = new float[heads*items*items]; datt[] = 0f;
+        }
     }
 
     // 벡터화 메모 — 안쪽 루프 네 개를 _saxpy 로 바꿨다 (결과는 비트 동일: 고정된 i 에서
@@ -813,6 +841,8 @@ private struct AttnLayer {
             }
         });
         float scale = 1f / sqrt(cast(float) hw);
+        if (flash) _fwdFlash(scale);
+        else
         _parChunk(heads * items, (int lo, int hi) {
             foreach (ht; lo .. hi) {
                 int h = ht / items, t = ht % items;
@@ -860,6 +890,8 @@ private struct AttnLayer {
 
         float scale = 1f / sqrt(cast(float) hw);
 
+        if (flash) _bwdFlash(scale);
+        else {
         // 1단계: datt[h,t,s] 계산 + dot[h,t] 스칼라를 dotBuf 에 캐시 (dq/dk/dv 는 아직 안 건드림)
         _parChunk(heads * items, (int lo, int hi) {
             foreach (ht; lo .. hi) {
@@ -907,6 +939,8 @@ private struct AttnLayer {
             }
         });
 
+        }
+
         dx1[] = 0f;
         wq.batchAccum(x1, dq, dx1, items, true, false);
         wk.batchAccum(x1, dk, dx1, items, true, false);
@@ -928,6 +962,8 @@ private struct AttnLayer {
         wv.batchForward(x1B, vB, BT);
 
         float scale = 1f / sqrt(cast(float) hw);
+        if (flash) _fwdFlashBatch(scale, B);
+        else
         _parChunk(B * heads * items, (int lo, int hi) {
             foreach (bht; lo .. hi) {
                 int b = bht / (heads*items);
@@ -969,6 +1005,8 @@ private struct AttnLayer {
 
         float scale = 1f / sqrt(cast(float) hw);
 
+        if (flash) _bwdFlashBatch(scale, B);
+        else {
         _parChunk(B * heads * items, (int lo, int hi) {
             foreach (bht; lo .. hi) {
                 int b = bht / (heads*items);
@@ -1020,12 +1058,206 @@ private struct AttnLayer {
             }
         });
 
+        }
+
         dx1B[0 .. B*dim] = 0f;
         wq.batchAccum(x1B, dqB, dx1B, BT, true, false);
         wk.batchAccum(x1B, dkB, dx1B, BT, true, false);
         wv.batchAccum(x1B, dvB, dx1B, BT, true, false);
         ln.bwd(X, dx1B, dX, muB, rstdB, xhB, BT);
         foreach (c; 0 .. B*dim) dX[c] += dY[c];           // 잔차 통과분
+    }
+
+    // ── 플래시 어텐션 커널 ────────────────────────────────────────────
+    // 스탠다드와 수학적으로 같은 함수를 계산한다. 다른 점은 S×S 점수 행렬을
+    // **만들지 않는다**는 것뿐이다. 그래서 결과는 비트 단위로 같지 않고(합산·정규화
+    // 순서가 다르다) 1e-5 수준으로 같다 — tests/attnflash.py 가 그걸 확인한다.
+
+    // 순전파: s 를 FBS 개씩 돌면서 러닝 최댓값 m, 러닝 합 l, 누적 출력을 들고 간다.
+    // 블록 최댓값이 지금까지의 m 을 넘으면 누적분을 exp(m_old - m_new) 로 되스케일한다.
+    private void _fwdFlash(float scale) {
+        _parChunk(heads * items, (int lo, int hi) {
+            foreach (ht; lo .. hi) {
+                int h = ht / items, t = ht % items;
+                int qo = t*w + h*hw;
+                auto acc = ao[qo .. qo + hw];
+                auto sc  = fsc[ht*FBS .. ht*FBS + FBS];
+                acc[] = 0f;
+                float m = -1e30f, l = 0f;
+                for (int s0 = 0; s0 < items; s0 += FBS) {
+                    int n = items - s0; if (n > FBS) n = FBS;
+                    float bm = -1e30f;
+                    foreach (j; 0..n) {
+                        int ko = (s0+j)*w + h*hw;
+                        float d = 0f;
+                        foreach (i; 0..hw) d += q[qo+i] * k[ko+i];
+                        d *= scale;
+                        sc[j] = d;
+                        if (d > bm) bm = d;
+                    }
+                    float mn = m > bm ? m : bm;
+                    float corr = exp(m - mn);     // 첫 블록에서는 m=-1e30 -> 0
+                    l *= corr;
+                    if (corr != 1f) foreach (i; 0..hw) acc[i] *= corr;
+                    foreach (j; 0..n) {
+                        float pr = exp(sc[j] - mn);
+                        l += pr;
+                        int ko = (s0+j)*w + h*hw;
+                        _saxpy(acc, v[ko .. ko + hw], pr);
+                    }
+                    m = mn;
+                }
+                float inv = 1f / l;
+                foreach (i; 0..hw) acc[i] *= inv;
+                lse[ht] = m + log(l);
+            }
+        });
+    }
+
+    // 역전파: 점수를 다시 계산한다 (저장하지 않았다). softmax 야코비안의
+    // D_t = Σ_s p_s·(dO_t·v_s) 는 Σ_s p_s v_s = O_t 라서 **D_t = dO_t·O_t** 다 —
+    // 한 번의 내적으로 끝나고, 그래서 S×S 를 되살릴 필요가 없다.
+    //
+    // 단계를 나누는 이유는 스탠다드 경로와 같다: dk/dv 는 모든 t 에서 누적되므로
+    // t 기준으로 병렬화하면 레이스가 난다. 1단계는 t 기준(dq, D), 2단계는 s 기준
+    // (dk, dv)이고 안쪽을 h-먼저-t 순서로 돌아 합산 순서를 스탠다드와 맞춘다.
+    private void _bwdFlash(float scale) {
+        dq[] = 0f;
+        _parChunk(heads * items, (int lo, int hi) {
+            foreach (ht; lo .. hi) {
+                int h = ht / items, t = ht % items;
+                int qo = t*w + h*hw;
+                auto daoS = dao[qo .. qo + hw];
+                float D = 0f;
+                foreach (i; 0..hw) D += daoS[i] * ao[qo + i];
+                dotBuf[ht] = D;
+                float L = lse[ht];
+                auto dqS = dq[qo .. qo + hw];
+                foreach (sx; 0..items) {
+                    int ko = sx*w + h*hw;
+                    float d = 0f;
+                    foreach (i; 0..hw) d += q[qo+i] * k[ko+i];
+                    float pr = exp(d*scale - L);
+                    float dP = 0f;
+                    foreach (i; 0..hw) dP += daoS[i] * v[ko+i];
+                    float ds = pr * (dP - D) * scale;
+                    _saxpy(dqS, k[ko .. ko + hw], ds);
+                }
+            }
+        });
+
+        dk[] = 0f; dv[] = 0f;
+        _parChunk(items, (int slo, int shi) {
+            foreach (sx; slo .. shi) {
+                foreach (h; 0..heads) foreach (t; 0..items) {
+                    int ht = h*items + t;
+                    int qo = t*w + h*hw, ko = sx*w + h*hw;
+                    float d = 0f;
+                    foreach (i; 0..hw) d += q[qo+i] * k[ko+i];
+                    float pr = exp(d*scale - lse[ht]);
+                    auto daoS = dao[qo .. qo + hw];
+                    _saxpy(dv[ko .. ko + hw], daoS, pr);
+                    float dP = 0f;
+                    foreach (i; 0..hw) dP += daoS[i] * v[ko+i];
+                    float ds = pr * (dP - dotBuf[ht]) * scale;
+                    _saxpy(dk[ko .. ko + hw], q[qo .. qo + hw], ds);
+                }
+            }
+        });
+    }
+
+    // 배치판 — 위와 같고 샘플 차원 b 를 하나 더 얹는다. 어텐션은 같은 샘플의
+    // 항목끼리만 섞이므로 b 는 그냥 독립 반복이다.
+    private void _fwdFlashBatch(float scale, int B) {
+        _parChunk(B * heads * items, (int lo, int hi) {
+            foreach (bht; lo .. hi) {
+                int b = bht / (heads*items);
+                int rem = bht % (heads*items);
+                int h = rem / items, t = rem % items;
+                int off = b*dim;
+                int qo = off + t*w + h*hw;
+                auto acc = aoB[qo .. qo + hw];
+                auto sc  = fscB[bht*FBS .. bht*FBS + FBS];
+                acc[] = 0f;
+                float m = -1e30f, l = 0f;
+                for (int s0 = 0; s0 < items; s0 += FBS) {
+                    int n = items - s0; if (n > FBS) n = FBS;
+                    float bm = -1e30f;
+                    foreach (j; 0..n) {
+                        int ko = off + (s0+j)*w + h*hw;
+                        float d = 0f;
+                        foreach (i; 0..hw) d += qB[qo+i] * kB[ko+i];
+                        d *= scale;
+                        sc[j] = d;
+                        if (d > bm) bm = d;
+                    }
+                    float mn = m > bm ? m : bm;
+                    float corr = exp(m - mn);
+                    l *= corr;
+                    if (corr != 1f) foreach (i; 0..hw) acc[i] *= corr;
+                    foreach (j; 0..n) {
+                        float pr = exp(sc[j] - mn);
+                        l += pr;
+                        int ko = off + (s0+j)*w + h*hw;
+                        _saxpy(acc, vB[ko .. ko + hw], pr);
+                    }
+                    m = mn;
+                }
+                float inv = 1f / l;
+                foreach (i; 0..hw) acc[i] *= inv;
+                lseB[bht] = m + log(l);
+            }
+        });
+    }
+
+    private void _bwdFlashBatch(float scale, int B) {
+        dqB[0 .. B*dim] = 0f;
+        _parChunk(B * heads * items, (int lo, int hi) {
+            foreach (bht; lo .. hi) {
+                int b = bht / (heads*items);
+                int rem = bht % (heads*items);
+                int h = rem / items, t = rem % items;
+                int off = b*dim;
+                int qo = off + t*w + h*hw;
+                auto daoS = daoB[qo .. qo + hw];
+                float D = 0f;
+                foreach (i; 0..hw) D += daoS[i] * aoB[qo + i];
+                dotBufB[bht] = D;
+                float L = lseB[bht];
+                auto dqS = dqB[qo .. qo + hw];
+                foreach (sx; 0..items) {
+                    int ko = off + sx*w + h*hw;
+                    float d = 0f;
+                    foreach (i; 0..hw) d += qB[qo+i] * kB[ko+i];
+                    float pr = exp(d*scale - L);
+                    float dP = 0f;
+                    foreach (i; 0..hw) dP += daoS[i] * vB[ko+i];
+                    float ds = pr * (dP - D) * scale;
+                    _saxpy(dqS, kB[ko .. ko + hw], ds);
+                }
+            }
+        });
+
+        dkB[0 .. B*dim] = 0f; dvB[0 .. B*dim] = 0f;
+        _parChunk(B * items, (int lo, int hi) {
+            foreach (bs; lo .. hi) {
+                int b = bs / items, sx = bs % items;
+                int off = b*dim;
+                foreach (h; 0..heads) foreach (t; 0..items) {
+                    int bht = b*heads*items + h*items + t;
+                    int qo = off + t*w + h*hw, ko = off + sx*w + h*hw;
+                    float d = 0f;
+                    foreach (i; 0..hw) d += qB[qo+i] * kB[ko+i];
+                    float pr = exp(d*scale - lseB[bht]);
+                    auto daoS = daoB[qo .. qo + hw];
+                    _saxpy(dvB[ko .. ko + hw], daoS, pr);
+                    float dP = 0f;
+                    foreach (i; 0..hw) dP += daoS[i] * vB[ko+i];
+                    float ds = pr * (dP - dotBufB[bht]) * scale;
+                    _saxpy(dkB[ko .. ko + hw], qB[qo .. qo + hw], ds);
+                }
+            }
+        });
     }
 
     void zeroGrad() nothrow @nogc {
@@ -1838,7 +2070,11 @@ private class Network {
                 _inSz ~= prev; _outSz ~= specA[i];
                 prev = specA[i];
             } else if (specKind[i] == 1) {
-                attns ~= AttnLayer(prev, specA[i], specB[i]);
+                // specC=1 이면 플래시 어텐션. 가중치 구조가 완전히 같아서 새 kind 를
+                // 만들 필요가 없고, 그래서 **파일 포맷 버전도 안 올렸다** — 옛
+                // 바이너리가 이 파일을 읽으면 C 를 무시하고 스탠다드로 돌 뿐이고
+                // 결과는 같다 (느리기만 하다). logic/conv 때와 달리 조용히 깨지지 않는다.
+                attns ~= AttnLayer(prev, specA[i], specB[i], specC[i] == 1);
                 kinds ~= 1; slot ~= cast(int)(attns.length - 1);
                 _inSz ~= prev; _outSz ~= prev;      // 폭 유지
             } else if (specKind[i] == 5) {
@@ -2346,7 +2582,8 @@ class BlackBoxAI {
             foreach (i; 0..layKind.length) {
                 if (i) r ~= ", ";
                 if      (layKind[i] == 0) r ~= to!string(layA[i]);
-                else if (layKind[i] == 1) r ~= "attn(" ~ to!string(layA[i]) ~ "," ~ to!string(layB[i]) ~ ")";
+                else if (layKind[i] == 1) r ~= (layC[i] == 1 ? "fattn(" : "attn(")
+                                             ~ to!string(layA[i]) ~ "," ~ to!string(layB[i]) ~ ")";
                 else if (layKind[i] == 3) r ~= "logic(" ~ to!string(layA[i]) ~ ")";
                 else if (layKind[i] == 4) r ~= "memory(" ~ to!string(layA[i]) ~ ")";
                 else if (layKind[i] == 5) r ~= "conv(" ~ to!string(layA[i]) ~ ","
@@ -3914,6 +4151,29 @@ class _Attn:
 attn = _Attn()
 
 
+class _Fattn:
+    """플래시 어텐션 층 표시. attn 과 **같은 함수를 계산하고 가중치도 같다** —
+    계산 방식만 다르다 (조각끼리의 점수 행렬을 만들지 않는다).
+
+        fattn(8)      -> 폭을 8조각으로 나눠 서로 참조 (헤드 1)
+        fattn(8, 2)   -> 조각 8, 헤드 2
+
+    조각 수가 많을 때만 이득이다. 적으면 attn 이 더 빠르다 (README 의 표 참고).
+    """
+    __slots__ = ("items", "heads")
+
+    def __init__(self, items=4, heads=1):
+        self.items, self.heads = int(items), int(heads)
+
+    def __call__(self, items, heads=1):
+        return _Fattn(items, heads)
+
+    def __repr__(self):
+        return f"fattn({self.items}, {self.heads})"
+
+fattn = _Fattn()
+
+
 class _Each:
     """항목마다 따로 도는 층. 같은 가중치를 항목 수만큼 돌려쓴다.
 
@@ -4440,15 +4700,19 @@ def make(model_name, layers, outputs, optimizer='adam', *,
     폭 = inputSz
     항목수 = 0        # attn 이나 conv(..., 항목수) 를 만나야 항목 구조가 생긴다
     for i, L in enumerate(layers[1:], 1):
-        if isinstance(L, _Attn):
+        if isinstance(L, (_Attn, _Fattn)):
+            이름 = "fattn" if isinstance(L, _Fattn) else "attn"
             if 폭 % L.items:
                 raise ValueError(
-                    f"{i}번째 층 attn({L.items}): 폭 {폭} 이 조각 {L.items} 로 나뉘지 않습니다")
+                    f"{i}번째 층 {이름}({L.items}): 폭 {폭} 이 조각 {L.items} 로 나뉘지 않습니다")
             조각폭 = 폭 // L.items
             if 조각폭 % L.heads:
                 raise ValueError(
-                    f"{i}번째 층 attn: 조각폭 {조각폭} 이 헤드 {L.heads} 로 나뉘지 않습니다")
-            lay_kind.append(1); lay_a.append(L.items); lay_b.append(L.heads); lay_c.append(0)
+                    f"{i}번째 층 {이름}: 조각폭 {조각폭} 이 헤드 {L.heads} 로 나뉘지 않습니다")
+            # kind 는 둘 다 1 이고 세 번째 칸이 플래시 여부다 — 가중치 구조가 같아서
+            # 새 kind 를 만들 이유가 없다 (파일 포맷 버전도 그대로 12).
+            lay_kind.append(1); lay_a.append(L.items); lay_b.append(L.heads)
+            lay_c.append(1 if isinstance(L, _Fattn) else 0)
             항목수 = L.items
             # 폭 그대로
         elif isinstance(L, _Conv):

@@ -72,7 +72,7 @@ sys.path.insert(0, MODULE_DIR)
 os.chdir(WORK)
 
 import ml                                                   # noqa: E402
-from ml import make, cos, vec, attn, each, conv, memory      # noqa: E402
+from ml import make, cos, vec, attn, fattn, each, conv, memory   # noqa: E402
 
 ACTS = ["A", "B"]
 
@@ -142,6 +142,12 @@ print("\n[items] each() and conv() take their own item count")
 wipe()
 check("each(width, items) works with nothing in front",
       not blocked(lambda: make("e1", [12, each(5, 4)], cos, autosave=0)))
+wipe()
+check("fattn(items, heads) parses like attn",
+      not blocked(lambda: make("fa", [12, fattn(4, 1), each(5)], cos, autosave=0)))
+wipe()
+check("fattn rejects a width that does not divide", 
+      blocked(lambda: make("fb", [12, fattn(5)], cos, autosave=0)))
 wipe()
 check("each(width) after attn still inherits",
       not blocked(lambda: make("e2", [12, attn(4), each(5)], cos, autosave=0)))

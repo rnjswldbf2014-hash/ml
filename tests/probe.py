@@ -55,6 +55,17 @@ def topo_layers(topo):
         return [4, ml.memory(6), 8]
     if topo == "memorymix":
         return [4, 8, ml.memory(6), ml.logic(5), 8]
+    # fattn computes the same function as attn by a different route (online
+    # softmax over blocks, no S*S matrix, scores recomputed in the backward
+    # pass). It has its own per-sample and batched implementations, so them
+    # agreeing bit-for-bit is the check on the block/rescale bookkeeping.
+    # Whether it agrees with attn is a separate question -- tests/attnflash.py.
+    if topo == "fattn":
+        return [4, ml.fattn(4), 8]
+    if topo == "fattn2":                      # more items than one block (FBS=32)
+        return [72, ml.fattn(36), 8]
+    if topo == "fattnmix":
+        return [4, ml.fattn(4), ml.each(8), ml.fattn(4), ml.each(4), 8]
     raise ValueError(f"unknown topology {topo!r}")
 
 
