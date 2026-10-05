@@ -163,7 +163,12 @@ private __gshared SaxpyFn _saxpy;
                     private float dot_base (const(float)[] a, const(float)[] b) pure nothrow @nogc
 { float s = 0f; foreach (i; 0..a.length) s += a[i]*b[i]; return s; }
 
+@target("avx512f") private float dot_avx512(const(float)[] a, const(float)[] b) pure nothrow @nogc
+{ float s = 0f; foreach (i; 0..a.length) s += a[i]*b[i]; return s; }
+
 @target("avx2,fma") private void saxpy_avx2 (float[] d, const(float)[] s, float sc) pure nothrow @nogc
+{ foreach (i; 0..d.length) d[i] += sc*s[i]; }
+@target("avx512f") private void saxpy_avx512(float[] d, const(float)[] s, float sc) pure nothrow @nogc
 { foreach (i; 0..d.length) d[i] += sc*s[i]; }
 @target("sse4.1")   private void saxpy_sse41(float[] d, const(float)[] s, float sc) pure nothrow @nogc
 { foreach (i; 0..d.length) d[i] += sc*s[i]; }
@@ -222,29 +227,40 @@ private alias SgdFn  = void function(float[] w, const(float)[] gw, float lr) not
 
 @target("avx2,fma") private void adamRow_avx2(float[] w, float[] m, float[] v,
     const(float)[] gw, float lr, float bc1, float bc2) nothrow @nogc { mixin(ADAM_ROW); }
+@target("avx512f")  private void adamRow_avx512(float[] w, float[] m, float[] v,
+    const(float)[] gw, float lr, float bc1, float bc2) nothrow @nogc { mixin(ADAM_ROW); }
                     private void adamRow_base(float[] w, float[] m, float[] v,
     const(float)[] gw, float lr, float bc1, float bc2) nothrow @nogc { mixin(ADAM_ROW); }
 
 @target("avx2,fma") private void rmsRow_avx2(float[] w, float[] v,
+    const(float)[] gw, float lr) nothrow @nogc { mixin(RMS_ROW); }
+@target("avx512f")  private void rmsRow_avx512(float[] w, float[] v,
     const(float)[] gw, float lr) nothrow @nogc { mixin(RMS_ROW); }
                     private void rmsRow_base(float[] w, float[] v,
     const(float)[] gw, float lr) nothrow @nogc { mixin(RMS_ROW); }
 
 @target("avx2,fma") private void adagradRow_avx2(float[] w, float[] v,
     const(float)[] gw, float lr) nothrow @nogc { mixin(ADAGRAD_ROW); }
+@target("avx512f")  private void adagradRow_avx512(float[] w, float[] v,
+    const(float)[] gw, float lr) nothrow @nogc { mixin(ADAGRAD_ROW); }
                     private void adagradRow_base(float[] w, float[] v,
     const(float)[] gw, float lr) nothrow @nogc { mixin(ADAGRAD_ROW); }
 
 @target("avx2,fma") private void sgdRow_avx2(float[] w, const(float)[] gw, float lr)
+    nothrow @nogc { mixin(SGD_ROW); }
+@target("avx512f")  private void sgdRow_avx512(float[] w, const(float)[] gw, float lr)
     nothrow @nogc { mixin(SGD_ROW); }
                     private void sgdRow_base(float[] w, const(float)[] gw, float lr)
     nothrow @nogc { mixin(SGD_ROW); }
 
 @target("avx2,fma") private void scaleRow_avx2(float[] w, float sc) nothrow @nogc
 { foreach (k; 0 .. w.length) w[k] *= sc; }
+@target("avx512f")  private void scaleRow_avx512(float[] w, float sc) nothrow @nogc
+{ foreach (k; 0 .. w.length) w[k] *= sc; }
                     private void scaleRow_base(float[] w, float sc) nothrow @nogc
 { foreach (k; 0 .. w.length) w[k] *= sc; }
 
+private __gshared string _simd = "base";   // 실제로 고른 SIMD 수준
 private __gshared AdamFn _adamRow;
 private __gshared VFn    _rmsRow, _adagradRow;
 private __gshared SgdFn  _sgdRow;
@@ -252,18 +268,53 @@ private __gshared void function(float[], float) nothrow @nogc _scaleRow;
 
 shared static this() {
     import cpu = core.cpuid;
-    if (cpu.avx2)       { _dot = &dot_avx2;  _saxpy = &saxpy_avx2;  }
-    else if (cpu.sse42) { _dot = &dot_sse41; _saxpy = &saxpy_sse41; }
-    else                { _dot = &dot_base;  _saxpy = &saxpy_base;  }
+    // ── SIMD 수준 선택 ───────────────────────────────────────────────
+    // MYML_SIMD 로 내려서 쓸 수 있다 (base|sse|avx2|avx512). 올려 쓰는 건 막는다 —
+    // 하드웨어가 없는데 강제하면 바로 폴트다.
+    //
+    // **avx512 는 반드시 cpu.avx2 와 함께 확인한다.** core.cpuid 의 avx512f 는
+    // CPUID 비트만 보고 **OS 가 ZMM 상태를 켰는지(XCR0)는 안 본다** — avx2 쪽은
+    // 보는데 avx512f 쪽은 빠져 있다. 비트만 믿고 ZMM 을 쓰면 OS 가 안 켜준
+    // 환경에서 #UD 로 죽는다. avx2 가 켜져 있으면 XCR0 의 SSE/YMM 이 켜진 것이고,
+    // 실제 시스템에서 ZMM 상태는 그것들과 같이 켜진다. 완벽한 보장은 아니라서
+    // MYML_SIMD=avx2 로 내릴 길을 같이 열어뒀다.
+    immutable bool okAvx512 = cpu.avx2 && cpu.avx512f;
+    immutable bool okAvx2   = cpu.avx2;
+    immutable bool okSse    = cpu.sse42;
 
-    if (cpu.avx2) {
-        _adamRow = &adamRow_avx2; _rmsRow = &rmsRow_avx2;
-        _adagradRow = &adagradRow_avx2; _sgdRow = &sgdRow_avx2;
-        _scaleRow = &scaleRow_avx2;
-    } else {
-        _adamRow = &adamRow_base; _rmsRow = &rmsRow_base;
-        _adagradRow = &adagradRow_base; _sgdRow = &sgdRow_base;
-        _scaleRow = &scaleRow_base;
+    string want;
+    try { want = environment.get("MYML_SIMD", ""); } catch (Exception e) { want = ""; }
+    if      (want == "base")                  { _simd = "base"; }
+    else if (want == "sse"    && okSse)       { _simd = "sse"; }
+    else if (want == "avx2"   && okAvx2)      { _simd = "avx2"; }
+    else if (want == "avx512" && okAvx512)    { _simd = "avx512"; }
+    else if (okAvx512)                        { _simd = "avx512"; }
+    else if (okAvx2)                          { _simd = "avx2"; }
+    else if (okSse)                           { _simd = "sse"; }
+    else                                      { _simd = "base"; }
+
+    switch (_simd) {
+        case "avx512":
+            _dot = &dot_avx512; _saxpy = &saxpy_avx512;
+            _adamRow = &adamRow_avx512; _rmsRow = &rmsRow_avx512;
+            _adagradRow = &adagradRow_avx512; _sgdRow = &sgdRow_avx512;
+            _scaleRow = &scaleRow_avx512;
+            break;
+        case "avx2":
+            _dot = &dot_avx2; _saxpy = &saxpy_avx2;
+            _adamRow = &adamRow_avx2; _rmsRow = &rmsRow_avx2;
+            _adagradRow = &adagradRow_avx2; _sgdRow = &sgdRow_avx2;
+            _scaleRow = &scaleRow_avx2;
+            break;
+        case "sse":
+            _dot = &dot_sse41; _saxpy = &saxpy_sse41;
+            goto default;          // 옵티마이저 커널은 sse 변종을 두지 않았다
+        default:
+            if (_dot is null)  { _dot = &dot_base; _saxpy = &saxpy_base; }
+            _adamRow = &adamRow_base; _rmsRow = &rmsRow_base;
+            _adagradRow = &adagradRow_base; _sgdRow = &sgdRow_base;
+            _scaleRow = &scaleRow_base;
+            break;
     }
 }
 
@@ -3497,6 +3548,22 @@ PyObject* py_ml_gpu_info(PyObject* self, PyObject* args) {
     } catch (Throwable t) { setPyError("my_ml: _ml_gpu_info", t); return null; }
 }
 
+// 어떤 SIMD 수준으로 돌고 있는지. avx512 경로는 실하드웨어에서 검증한 적이
+// 없으므로 (개발 기계가 Zen 3+ 라 지원을 안 한다) 쓰는 쪽이 확인할 수단을 둔다.
+PyObject* py_ml_cpu_info(PyObject* self, PyObject* args) {
+    try {
+        import cpu = core.cpuid;
+        auto d = PyDict_New();
+        void put(string k, PyObject* v) { PyDict_SetItemString(d, toStringz(k), v); Py_DecRef(v); }
+        put("simd",    PyUnicode_FromString(toStringz(_simd)));
+        put("threads", PyLong_FromLong(_nThreads));
+        put("avx2",    PyLong_FromLong(cpu.avx2 ? 1 : 0));
+        put("avx512",  PyLong_FromLong((cpu.avx2 && cpu.avx512f) ? 1 : 0));
+        put("cores",   PyLong_FromLong(cast(long) totalCPUs));
+        return d;
+    } catch (Throwable t) { setPyError("my_ml: _ml_cpu_info", t); return null; }
+}
+
 // 기억(rnn) 층의 메모를 비운다. 에피소드 경계에서 부른다.
 PyObject* py_ml_forget(PyObject* self, PyObject* args) {
     try {
@@ -4598,6 +4665,25 @@ def change(model_name):
     return True
 
 
+def cpu_info():
+    """어떤 SIMD 수준으로 돌고 있는지.
+
+        {'simd': 'avx2',      # 실제로 고른 것: base | sse | avx2 | avx512
+         'avx2': 1,           # 이 CPU 가 쓸 수 있는지
+         'avx512': 0,
+         'threads': 12,       # MYML_THREADS (기본: 전체 코어)
+         'cores': 12}
+
+    MYML_SIMD 로 **낮춰서** 쓸 수 있습니다 (base|sse|avx2|avx512). 없는 걸 올려서
+    강제하는 건 막혀 있습니다 — 하드웨어가 없는데 쓰면 그 자리에서 죽습니다.
+
+    avx512 경로는 만들어는 뒀지만 **실제 AVX-512 하드웨어에서 돌려본 적이
+    없습니다** (개발 기계가 Zen 3+ 라 지원하지 않습니다). 해당 CPU 를 가지고
+    계시면 "python tests/simd.py" 로 결과가 같은지 확인해주세요.
+    """
+    return _ml_cpu_info()
+
+
 def gpu_info():
     """GPU 를 실제로 쓰고 있는지 확인한다.
 
@@ -4628,7 +4714,7 @@ builtins.gpu_info   = gpu_info
 // ─────────────────────────────────────────────
 // Module init
 // ─────────────────────────────────────────────
-private __gshared PyMethodDef[25] _methods;
+private __gshared PyMethodDef[26] _methods;
 private __gshared PyModuleDef     _moddef;
 
 extern(C) export PyObject* PyInit_ml() nothrow @trusted {
@@ -4657,7 +4743,8 @@ extern(C) export PyObject* PyInit_ml() nothrow @trusted {
         _methods[21] = PyMethodDef("_ml_logic_rules",    &py_ml_logic_rules,     METH_VARARGS, null);
         _methods[22] = PyMethodDef("_ml_tune",           &py_ml_tune,            METH_VARARGS, null);
         _methods[23] = PyMethodDef("_ml_forget",         &py_ml_forget,          METH_VARARGS, null);
-        _methods[24] = PyMethodDef(null, null, 0, null);
+        _methods[24] = PyMethodDef("_ml_cpu_info",       &py_ml_cpu_info,        METH_VARARGS, null);
+        _methods[25] = PyMethodDef(null, null, 0, null);
 
         _moddef.m_base.ob_base.ob_refcnt = 1;
         _moddef.m_name    = "my_ml";

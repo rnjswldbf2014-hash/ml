@@ -35,13 +35,17 @@ Remove-Item rnjswldbf_2014\ml.obj, rnjswldbf_2014\ml.lib, rnjswldbf_2014\ml.exp,
   `memory.py` (기억이 없으면 못 푸는 문제로 검증 + 도달 거리 실측),
   `conv.py` (학습·왕복·모양 거부. 수용 영역은 왜 여기서 못 보는지도 적어둠),
   `api.py` (호출 규약 — 위치 인자 4개, 안 감싸도 되는 출력, 항목수, forget 경고,
-  round(), jepa 두 가지 호출 형태)
+  round(), jepa 두 가지 호출 형태),
+  `simd.py` (SIMD 수준끼리 같은 답을 내는지 + MYML_SIMD — **AVX-512 기계에서
+  돌리면 그 경로까지 검증된다**)
 
 ## 환경변수
 
 - `MYML_THREADS` — CPU 스레드 수 (기본: 전체 코어)
 - `MYML_NOBATCH=1` — 배치 경로 끄고 per-sample 직렬 경로로 (동치 검증용)
 - `MYML_BPTT=0` — memory 층의 BPTT 끄고 1스텝 절단으로 (기본은 켜짐. 동치 검증용)
+- `MYML_SIMD` — `base|sse|avx2|avx512`. **내려 쓰는 것만 된다** (기본: 쓸 수 있는
+  가장 높은 것). `cpu_info()` 로 확인
 - `MYML_GPU` — **기본 `0`(끔)**. `1`=강제, `auto`=문턱값 넘는 큰 배치만
 - `MYML_GPU_MIN_FLOPS`, `MYML_GPU_MIN_B` — auto 모드 문턱값 (기본 5e7, 64)
 
@@ -106,9 +110,34 @@ GPU/CPU 를 번갈아 학습시킨 뒤 **저장된 가중치와 `predict()` 둘 
 
 ## 성능 — 건드릴 때 알아야 할 두 가지
 
-AVX-512 는 **쓰지 않는다.** 개발 기계가 `znver3`(Zen 3+, Ryzen 5 7535HS)인데 LLVM 이
-`-avx512f` 로 보고한다 — 하드웨어가 지원을 안 한다. AVX2+FMA 가 상한이다.
-(`ldc2 -mcpu=native -output-ll` 로 확인하면 `target-features` 에 다 나온다.)
+**SIMD 수준은 런타임에 고른다** — `base`(스칼라/SSE2) / `sse`(SSE4.1) /
+`avx2`(AVX2+FMA) / `avx512`(AVX-512F). `cpu_info()` 로 뭘 골랐는지 확인하고,
+`MYML_SIMD` 로 **내려서** 쓸 수 있다 (올려 쓰는 건 막는다 — 없는 걸 강제하면
+그 자리에서 죽는다. 모르는 값은 무시하고 기본 선택으로 간다).
+
+**⚠ AVX-512 경로는 실하드웨어에서 한 번도 돌려본 적이 없다.** 개발 기계가
+`znver3`(Zen 3+, Ryzen 5 7535HS)이고 LLVM 이 `-avx512f` 로 보고한다 — 지원을
+안 한다 (`ldc2 -mcpu=native -output-ll` 로 `target-features` 를 보면 다 나온다).
+대신 받쳐두는 것 세 가지:
+
+1. **같은 mixin 문자열에서 생성된다** (`ADAM_ROW` 등). `@target` 속성만 다르다 —
+   그래서 산수가 변종끼리 어긋날 수가 없다. 새 커널을 추가할 때도 이 규칙을 지킬 것.
+2. 생성된 코드가 **실제로 512비트를 쓰는지 확인했다** (`ldc2 -output-s` 후
+   `adamRow_avx512`: zmm 33개 / ymm 0개, `adamRow_avx2`: zmm 0개 / ymm 30개).
+3. **`tests/simd.py`** — 이 기계에서 쓸 수 있는 모든 수준을 같은 가중치에서 돌려
+   비교한다. AVX-512 가 있는 기계에서 돌리면 그 경로까지 자동으로 포함된다.
+   빠져 있던 검증이 그것이고, 해당 CPU 를 가진 사람이 할 수 있는 일이다.
+
+비트 동일이 아니라 **허용오차(1e-5)로** 비교한다. 옵티마이저 커널은 원소별이라
+벡터 폭이 결과를 바꿀 수가 없지만, `dot` 은 **리덕션**이라 폭이 넓어지면 합산
+순서가 바뀐다. (그래서 서로 다른 CPU 끼리 비트 동일은 애초에 약속한 적이 없다 —
+비트 동일을 약속한 건 `MYML_THREADS` 쪽이고 `regression.py` 가 지킨다.)
+
+**`core.cpuid.avx512f` 를 그냥 믿으면 안 된다.** druntime 이 `_avx2` 는 XCR0 의
+SSE/YMM 상태까지 보는데(`xfeatures & avx_mask`) `_avx512f` 는 **CPUID 비트만**
+본다 — OS 가 ZMM 상태를 안 켠 환경에서 `#UD` 로 죽는다. 그래서 선택 조건이
+`cpu.avx2 && cpu.avx512f` 다. 완벽한 보장은 아니고(XCR0 의 opmask/ZMM 비트를
+직접 읽지는 않는다), 그래서 `MYML_SIMD=avx2` 로 내릴 길을 같이 열어뒀다.
 
 **① `float[][]` 를 내부 루프에서 간접참조하면 벡터화가 막힌다.** 가장 크게 물린
 곳이 옵티마이저였다. `w[j][k]` 로 훑으면 LLVM 이 w/m/v/grad 의 행이 겹치지 않는다는
