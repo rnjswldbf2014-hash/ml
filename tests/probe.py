@@ -66,6 +66,16 @@ def topo_layers(topo):
         return [72, ml.fattn(36), 8]
     if topo == "fattnmix":
         return [4, ml.fattn(4), ml.each(8), ml.fattn(4), ml.each(4), 8]
+    # lattn is a different function (no softmax), so the only oracle here is
+    # itself: per-sample and batched paths call the same per-head kernel, and
+    # must agree bit-for-bit. lattn2 has 2 heads and more items than head width,
+    # which is the regime it is meant for.
+    if topo == "lattn":
+        return [4, ml.lattn(4), 8]
+    if topo == "lattn2":
+        return [48, ml.lattn(12, 2), 8]
+    if topo == "lattnmix":
+        return [8, ml.lattn(4, 2), ml.each(6), ml.attn(4), ml.each(4), 8]
     raise ValueError(f"unknown topology {topo!r}")
 
 

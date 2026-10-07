@@ -242,7 +242,10 @@ for _ in range(10):
 vprobe = [0.2, -0.4, 0.1, 0.5, -0.3, 0.0]
 vbefore = vr.predict(vprobe)[0]
 vr.save()
-check("save() writes the current version (12)", file_ver(VPTH) == 12, f"got {file_ver(VPTH)}")
+# One place to change on the next format bump (12 -> 13 was lattn).
+CURRENT_VER = 13
+check(f"save() writes the current version ({CURRENT_VER})", file_ver(VPTH) == CURRENT_VER,
+      f"got {file_ver(VPTH)}")
 
 # Turn it into a real ver-11 file (narrower layer specs), not just a restamped one.
 downgrade_to_v11(VPTH, len(VLAY) - 1)
@@ -252,7 +255,7 @@ check("an older-version file still loads, weights intact",
       vr2.predict(vprobe)[0] == vbefore,
       f"{vbefore} vs {vr2.predict(vprobe)[0]}")
 vr2.save()
-check("saving an older file upgrades it to the current version", file_ver(VPTH) == 12,
+check("saving an older file upgrades it to the current version", file_ver(VPTH) == CURRENT_VER,
       f"got {file_ver(VPTH)}")
 
 # A file from a newer version cannot be parsed, but it must not be destroyed.

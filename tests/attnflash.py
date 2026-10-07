@@ -96,7 +96,7 @@ def set_flash_flag(path, layer, value):
         raw = bytearray(fh.read())
     head = struct.unpack_from("<5I", raw, 0)
     assert head[0] == 0xBEEFCAFE, f"magic {head[0]:#x}"
-    assert head[1] == 12, f"unexpected version {head[1]}"
+    assert head[1] >= 12, f"unexpected version {head[1]}"   # layC exists from 12 on
     off = 4 * (5 + 4 * layer + 3)
     was = struct.unpack_from("<I", raw, off)[0]
     kind = struct.unpack_from("<I", raw, 4 * (5 + 4 * layer))[0]

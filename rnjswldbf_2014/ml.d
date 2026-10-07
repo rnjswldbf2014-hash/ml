@@ -745,6 +745,28 @@ private struct AttnLayer {
     bool flash;
     enum int FBS = 32;     // s 블록 크기. 쓰는 메모리가 H·S·S -> H·S·FBS 가 된다
 
+    // linear = 리니어 어텐션 (Katharopoulos et al. 2020). **flash 와 달리 다른
+    // 함수다** — softmax 를 버리고 양수 특징맵 φ(x) = elu(x)+1 을 쓴다.
+    //
+    //     스탠다드:  o_t = Σ_s softmax_s(q_t·k_s) v_s           O(S²·d)
+    //     리니어:    o_t = φ(q_t)ᵀ KV / (φ(q_t)·Z)               O(S·d²)
+    //                KV = Σ_s φ(k_s) v_sᵀ,  Z = Σ_s φ(k_s)
+    //
+    // KV 와 Z 가 t 와 무관하다는 게 핵심이다 — 한 번 만들어두고 모든 질의가 같이
+    // 쓴다. 그래서 S×S 가 아예 안 생기고 계산량이 S 에 선형이다. 대신 hw² 에
+    // 비례하므로 **조각 수 S 가 헤드 폭 hw 보다 클 때만** 이득이다.
+    //
+    // 같은 함수가 아니므로 attn 과 가중치를 바꿔 끼울 수 없고, 파일에 이 표시가
+    // 들어가면 옛 바이너리는 그걸 모르고 softmax 로 **조용히 다른 답**을 낸다.
+    // 그래서 이것 때문에 파일 포맷을 ver 13 으로 올렸다 (flash 는 같은 함수라
+    // 안 올렸다 — 그 차이다).
+    bool linear;
+    enum float LEPS = 1e-6f;
+    float[] pq, pk;            // φ(q), φ(k) [dim]
+    float[] lkv, lz, lden;     // [H*hw*hw], [H*hw], [H*S]
+    float[] lG, ldz;           // 역전파: ∂L/∂KV, ∂L/∂Z
+    float[] pqB, pkB, lkvB, lzB, ldenB, lGB, ldzB;
+
     LN     ln;
     Linear wq, wk, wv, wo;
 
@@ -781,7 +803,15 @@ private struct AttnLayer {
         xhB = new float[B*dim];   // T*D = (B*items)*w = B*(items*w) = B*dim
         foreach (a; [x1B,qB,kB,vB,aoB,poB,muB,rstdB,dqB,dkB,dvB,daoB,dx1B,dotBufB,xhB])
             a[] = 0f;
-        if (flash) {
+        if (linear) {
+            pqB = new float[B*dim];               pqB[] = 0f;
+            pkB = new float[B*dim];               pkB[] = 0f;
+            lkvB = new float[B*heads*hw*hw];      lkvB[] = 0f;
+            lzB = new float[B*heads*hw];          lzB[] = 0f;
+            ldenB = new float[B*heads*items];     ldenB[] = 0f;
+            lGB = new float[B*heads*hw*hw];       lGB[] = 0f;
+            ldzB = new float[B*heads*hw];         ldzB[] = 0f;
+        } else if (flash) {
             lseB = new float[B*heads*items];      lseB[] = 0f;
             fscB = new float[B*heads*items*FBS];  fscB[] = 0f;
         } else {
@@ -791,9 +821,11 @@ private struct AttnLayer {
         _bcap = B;
     }
 
-    this(int dim_, int items_, int heads_, bool flash_ = false) {
+    // mode: 0 = 스탠다드, 1 = 플래시, 2 = 리니어 (파일의 layC 그대로)
+    this(int dim_, int items_, int heads_, int mode_ = 0) {
         dim = dim_; items = items_; w = dim_ / items_; heads = heads_; hw = w / heads_;
-        flash = flash_;
+        flash = (mode_ == 1);
+        linear = (mode_ == 2);
         ln = LN(w);
         wq = Linear(w, w); wk = Linear(w, w); wv = Linear(w, w); wo = Linear(w, w);
 
@@ -805,7 +837,16 @@ private struct AttnLayer {
         xh = new float[dim];   // T*D = items*w = dim
         dotBuf = new float[heads*items];
         foreach (a; [x1,q,k,v,ao,po,mu,rstd,dq,dk,dv,dao,dx1,xh,dotBuf]) a[] = 0f;
-        if (flash) {
+        if (linear) {
+            // S×S 없이 헤드마다 hw×hw 하나 — S 가 hw 보다 크면 그만큼 작다
+            pq = new float[dim];                pq[] = 0f;
+            pk = new float[dim];                pk[] = 0f;
+            lkv = new float[heads*hw*hw];       lkv[] = 0f;
+            lz = new float[heads*hw];           lz[] = 0f;
+            lden = new float[heads*items];      lden[] = 0f;
+            lG = new float[heads*hw*hw];        lG[] = 0f;
+            ldz = new float[heads*hw];          ldz[] = 0f;
+        } else if (flash) {
             // S×S 를 안 만든다 — 질의마다 logsumexp 하나와 블록 점수 FBS 개뿐이다.
             lse = new float[heads*items];        lse[] = 0f;
             fsc = new float[heads*items*FBS];    fsc[] = 0f;
@@ -841,7 +882,8 @@ private struct AttnLayer {
             }
         });
         float scale = 1f / sqrt(cast(float) hw);
-        if (flash) _fwdFlash(scale);
+        if (linear) _fwdLinear();
+        else if (flash) _fwdFlash(scale);
         else
         _parChunk(heads * items, (int lo, int hi) {
             foreach (ht; lo .. hi) {
@@ -890,7 +932,8 @@ private struct AttnLayer {
 
         float scale = 1f / sqrt(cast(float) hw);
 
-        if (flash) _bwdFlash(scale);
+        if (linear) _bwdLinear();
+        else if (flash) _bwdFlash(scale);
         else {
         // 1단계: datt[h,t,s] 계산 + dot[h,t] 스칼라를 dotBuf 에 캐시 (dq/dk/dv 는 아직 안 건드림)
         _parChunk(heads * items, (int lo, int hi) {
@@ -962,7 +1005,8 @@ private struct AttnLayer {
         wv.batchForward(x1B, vB, BT);
 
         float scale = 1f / sqrt(cast(float) hw);
-        if (flash) _fwdFlashBatch(scale, B);
+        if (linear) _fwdLinearBatch(B);
+        else if (flash) _fwdFlashBatch(scale, B);
         else
         _parChunk(B * heads * items, (int lo, int hi) {
             foreach (bht; lo .. hi) {
@@ -1005,7 +1049,8 @@ private struct AttnLayer {
 
         float scale = 1f / sqrt(cast(float) hw);
 
-        if (flash) _bwdFlashBatch(scale, B);
+        if (linear) _bwdLinearBatch(B);
+        else if (flash) _bwdFlashBatch(scale, B);
         else {
         _parChunk(B * heads * items, (int lo, int hi) {
             foreach (bht; lo .. hi) {
@@ -1066,6 +1111,137 @@ private struct AttnLayer {
         wv.batchAccum(x1B, dvB, dx1B, BT, true, false);
         ln.bwd(X, dx1B, dX, muB, rstdB, xhB, BT);
         foreach (c; 0 .. B*dim) dX[c] += dY[c];           // 잔차 통과분
+    }
+
+    // ── 리니어 어텐션 커널 ────────────────────────────────────────────
+    // φ(x) = elu(x)+1. 양수라서 분모 φ(q)·Z 가 0 이 되지 않는다 (softmax 대신
+    // "양수 가중치로 섞기" 를 보장하는 게 φ 의 역할이다).
+    private static float _phi(float x) nothrow @nogc  { return x > 0f ? x + 1f : exp(x); }
+    private static float _dphi(float x) nothrow @nogc { return x > 0f ? 1f : exp(x); }
+
+    // 헤드 하나의 순전파. per-sample 과 배치가 **둘 다 이 함수를 부른다** — 그래서
+    // 두 경로의 연산 순서가 같고 결과가 비트 단위로 같다 (regression.py 가 지킨다).
+    // off = 이 샘플의 시작 (배치면 b*dim), KV/Z/DEN 은 이 (샘플, 헤드) 몫의 조각.
+    private void _linHeadFwd(const(float)[] Q, const(float)[] K, const(float)[] V,
+                             float[] PQ, float[] PK, float[] AO,
+                             float[] KV, float[] Z, float[] DEN, int off, int h) {
+        immutable int d = hw;
+        KV[] = 0f; Z[] = 0f;
+        // KV = Σ_s φ(k_s) v_sᵀ,  Z = Σ_s φ(k_s) — t 와 무관하게 한 번만 만든다
+        foreach (sx; 0 .. items) {
+            int ko = off + sx*w + h*hw;
+            foreach (i; 0 .. d) PK[ko+i] = _phi(K[ko+i]);
+            foreach (i; 0 .. d) {
+                float bi = PK[ko+i];
+                Z[i] += bi;
+                _saxpy(KV[i*d .. i*d+d], V[ko .. ko+d], bi);
+            }
+        }
+        // o_t = φ(q_t)ᵀ KV / (φ(q_t)·Z)
+        foreach (t; 0 .. items) {
+            int qo = off + t*w + h*hw;
+            foreach (i; 0 .. d) PQ[qo+i] = _phi(Q[qo+i]);
+            float den = LEPS;
+            foreach (i; 0 .. d) den += PQ[qo+i] * Z[i];
+            auto o = AO[qo .. qo+d];
+            o[] = 0f;
+            foreach (i; 0 .. d) _saxpy(o, KV[i*d .. i*d+d], PQ[qo+i]);
+            immutable float inv = 1f / den;
+            foreach (j; 0 .. d) o[j] *= inv;
+            DEN[t] = den;
+        }
+    }
+
+    // 헤드 하나의 역전파.  a=φ(q), b=φ(k), g=∂L/∂o, o=출력 이라 두면
+    //     ∂L/∂a_t = (KV g_t)/den_t − Z (g_t·o_t)/den_t
+    //     ∂L/∂KV  = Σ_t a_t (g_t/den_t)ᵀ          =: G
+    //     ∂L/∂Z   = −Σ_t a_t (g_t·o_t)/den_t      =: dZ
+    //     ∂L/∂b_s = G v_s + dZ,    ∂L/∂v_s = Gᵀ b_s
+    // 그리고 φ' 를 곱해서 q, k 로 보낸다. 전부 O(S·d²) 이고 S×S 가 안 생긴다.
+    private void _linHeadBwd(const(float)[] Q, const(float)[] K, const(float)[] V,
+                             const(float)[] PQ, const(float)[] PK, const(float)[] AO,
+                             const(float)[] DAO, const(float)[] KV, const(float)[] Z,
+                             const(float)[] DEN, float[] G, float[] DZ,
+                             float[] DQ, float[] DK, float[] DV, int off, int h) {
+        immutable int d = hw;
+        G[] = 0f; DZ[] = 0f;
+        foreach (t; 0 .. items) {
+            int qo = off + t*w + h*hw;
+            immutable float inv = 1f / DEN[t];
+            float go = 0f;
+            foreach (j; 0 .. d) go += DAO[qo+j] * AO[qo+j];
+            immutable float c = go * inv;
+            foreach (i; 0 .. d) {
+                float kg = 0f;
+                foreach (j; 0 .. d) kg += KV[i*d+j] * DAO[qo+j];
+                DQ[qo+i] = (kg * inv - Z[i] * c) * _dphi(Q[qo+i]);
+            }
+            foreach (i; 0 .. d) {
+                float ai = PQ[qo+i];
+                _saxpy(G[i*d .. i*d+d], DAO[qo .. qo+d], ai * inv);
+                DZ[i] -= c * ai;
+            }
+        }
+        foreach (sx; 0 .. items) {
+            int ko = off + sx*w + h*hw;
+            auto dvS = DV[ko .. ko+d];
+            dvS[] = 0f;
+            foreach (i; 0 .. d) {
+                float gv = 0f;
+                foreach (j; 0 .. d) gv += G[i*d+j] * V[ko+j];
+                DK[ko+i] = (gv + DZ[i]) * _dphi(K[ko+i]);
+                _saxpy(dvS, G[i*d .. i*d+d], PK[ko+i]);
+            }
+        }
+    }
+
+    private void _fwdLinear() {
+        immutable int hh = hw*hw;
+        _parChunk(heads, (int lo, int hi) {
+            foreach (h; lo .. hi)
+                _linHeadFwd(q, k, v, pq, pk, ao,
+                            lkv[h*hh .. (h+1)*hh], lz[h*hw .. (h+1)*hw],
+                            lden[h*items .. (h+1)*items], 0, h);
+        });
+    }
+
+    private void _bwdLinear() {
+        immutable int hh = hw*hw;
+        _parChunk(heads, (int lo, int hi) {
+            foreach (h; lo .. hi)
+                _linHeadBwd(q, k, v, pq, pk, ao, dao,
+                            lkv[h*hh .. (h+1)*hh], lz[h*hw .. (h+1)*hw],
+                            lden[h*items .. (h+1)*items],
+                            lG[h*hh .. (h+1)*hh], ldz[h*hw .. (h+1)*hw],
+                            dq, dk, dv, 0, h);
+        });
+    }
+
+    // 배치: (샘플, 헤드) 쌍마다 독립이다 — 어텐션은 같은 샘플의 항목끼리만 섞인다.
+    private void _fwdLinearBatch(int B) {
+        immutable int hh = hw*hw;
+        _parChunk(B * heads, (int lo, int hi) {
+            foreach (bh; lo .. hi) {
+                int b = bh / heads, h = bh % heads;
+                _linHeadFwd(qB, kB, vB, pqB, pkB, aoB,
+                            lkvB[bh*hh .. (bh+1)*hh], lzB[bh*hw .. (bh+1)*hw],
+                            ldenB[bh*items .. (bh+1)*items], b*dim, h);
+            }
+        });
+    }
+
+    private void _bwdLinearBatch(int B) {
+        immutable int hh = hw*hw;
+        _parChunk(B * heads, (int lo, int hi) {
+            foreach (bh; lo .. hi) {
+                int b = bh / heads, h = bh % heads;
+                _linHeadBwd(qB, kB, vB, pqB, pkB, aoB, daoB,
+                            lkvB[bh*hh .. (bh+1)*hh], lzB[bh*hw .. (bh+1)*hw],
+                            ldenB[bh*items .. (bh+1)*items],
+                            lGB[bh*hh .. (bh+1)*hh], ldzB[bh*hw .. (bh+1)*hw],
+                            dqB, dkB, dvB, b*dim, h);
+            }
+        });
     }
 
     // ── 플래시 어텐션 커널 ────────────────────────────────────────────
@@ -2074,7 +2250,7 @@ private class Network {
                 // 만들 필요가 없고, 그래서 **파일 포맷 버전도 안 올렸다** — 옛
                 // 바이너리가 이 파일을 읽으면 C 를 무시하고 스탠다드로 돌 뿐이고
                 // 결과는 같다 (느리기만 하다). logic/conv 때와 달리 조용히 깨지지 않는다.
-                attns ~= AttnLayer(prev, specA[i], specB[i], specC[i] == 1);
+                attns ~= AttnLayer(prev, specA[i], specB[i], specC[i]);
                 kinds ~= 1; slot ~= cast(int)(attns.length - 1);
                 _inSz ~= prev; _outSz ~= prev;      // 폭 유지
             } else if (specKind[i] == 5) {
@@ -2582,7 +2758,8 @@ class BlackBoxAI {
             foreach (i; 0..layKind.length) {
                 if (i) r ~= ", ";
                 if      (layKind[i] == 0) r ~= to!string(layA[i]);
-                else if (layKind[i] == 1) r ~= (layC[i] == 1 ? "fattn(" : "attn(")
+                else if (layKind[i] == 1) r ~= (layC[i] == 1 ? "fattn("
+                                                : layC[i] == 2 ? "lattn(" : "attn(")
                                              ~ to!string(layA[i]) ~ "," ~ to!string(layB[i]) ~ ")";
                 else if (layKind[i] == 3) r ~= "logic(" ~ to!string(layA[i]) ~ ")";
                 else if (layKind[i] == 4) r ~= "memory(" ~ to!string(layA[i]) ~ ")";
@@ -3193,11 +3370,18 @@ class BlackBoxAI {
         auto f = File(file, "wb");
         void wu(uint v)  { f.rawWrite((&v)[0..1]); }
         void wf(float v) { f.rawWrite((&v)[0..1]); }
-        // ver 10 = 로직(kind 3), ver 11 = 기억(kind 4), ver 12 = 합성곱(kind 5).
+        // ver 10 = 로직(kind 3), ver 11 = 기억(kind 4), ver 12 = 합성곱(kind 5),
+        // ver 13 = 리니어 어텐션(kind 1 + layC=2).
         // 새 kind 가 든 파일을 옛 바이너리가 읽으면 Each 로 오해해서 조용히 깨지므로
         // kind 를 늘릴 때마다 올린다. ver 12 부터는 층 스펙이 두 칸에서 세 칸으로
-        // 늘었다 (conv 가 출력채널·창·항목수 셋을 쓴다). 9~12 는 전부 읽는다.
-        wu(0xBEEFCAFE); wu(12); wu(cast(uint)opt);
+        // 늘었다 (conv 가 출력채널·창·항목수 셋을 쓴다). 9~13 은 전부 읽는다.
+        //
+        // ver 13 은 새 kind 가 아닌데도 올렸다. 리니어는 kind 1 의 layC 로 표시되는데,
+        // ver 12 바이너리는 kind 1 의 layC 를 "1 이면 플래시, 아니면 스탠다드" 로
+        // 읽는다 — 2 를 만나면 **softmax 로 조용히 다른 함수를 계산한다.** 플래시
+        // (layC=1)는 같은 함수라 그래도 괜찮았지만 리니어는 아니다. 버전을 올려야
+        // 옛 바이너리가 읽기를 거부한다 (.bak 으로 치우고 새로 만든다).
+        wu(0xBEEFCAFE); wu(13); wu(cast(uint)opt);
         wu(cast(uint)net.inputSz);
         wu(cast(uint)layKind.length);
         foreach (i; 0..layKind.length) {
@@ -3263,7 +3447,7 @@ class BlackBoxAI {
         if (ru() != 0xBEEFCAFE) throw new Exception("magic mismatch");
         uint ver = ru();
         if (ver < 9) throw new Exception("예전 포맷입니다. change() 로 변환하세요");
-        if (ver > 12) throw new Exception("더 새 버전에서 저장한 파일입니다 (ver "
+        if (ver > 13) throw new Exception("더 새 버전에서 저장한 파일입니다 (ver "
                                         ~ to!string(ver) ~ ")");
         opt = cast(Opt)ru();
         int inputSz = ru();
@@ -4174,6 +4358,30 @@ class _Fattn:
 fattn = _Fattn()
 
 
+class _Lattn:
+    """리니어 어텐션 층 표시. **attn 과 다른 함수다** — softmax 대신 양수
+    특징맵 φ(x)=elu(x)+1 로 섞는다. 그래서 계산량이 조각 수에 선형이다.
+
+        lattn(64)      -> 폭을 64조각으로 나눠 서로 참조 (헤드 1)
+        lattn(64, 4)   -> 조각 64, 헤드 4
+
+    조각 수가 헤드 폭(조각폭/헤드)보다 클 때 빠르다. 적으면 attn 이 낫다.
+    가중치 구조는 attn 과 같지만 함수가 달라서 서로 바꿔 끼울 수 없다.
+    """
+    __slots__ = ("items", "heads")
+
+    def __init__(self, items=4, heads=1):
+        self.items, self.heads = int(items), int(heads)
+
+    def __call__(self, items, heads=1):
+        return _Lattn(items, heads)
+
+    def __repr__(self):
+        return f"lattn({self.items}, {self.heads})"
+
+lattn = _Lattn()
+
+
 class _Each:
     """항목마다 따로 도는 층. 같은 가중치를 항목 수만큼 돌려쓴다.
 
@@ -4700,8 +4908,9 @@ def make(model_name, layers, outputs, optimizer='adam', *,
     폭 = inputSz
     항목수 = 0        # attn 이나 conv(..., 항목수) 를 만나야 항목 구조가 생긴다
     for i, L in enumerate(layers[1:], 1):
-        if isinstance(L, (_Attn, _Fattn)):
-            이름 = "fattn" if isinstance(L, _Fattn) else "attn"
+        if isinstance(L, (_Attn, _Fattn, _Lattn)):
+            이름 = ("fattn" if isinstance(L, _Fattn)
+                   else "lattn" if isinstance(L, _Lattn) else "attn")
             if 폭 % L.items:
                 raise ValueError(
                     f"{i}번째 층 {이름}({L.items}): 폭 {폭} 이 조각 {L.items} 로 나뉘지 않습니다")
@@ -4712,7 +4921,8 @@ def make(model_name, layers, outputs, optimizer='adam', *,
             # kind 는 둘 다 1 이고 세 번째 칸이 플래시 여부다 — 가중치 구조가 같아서
             # 새 kind 를 만들 이유가 없다 (파일 포맷 버전도 그대로 12).
             lay_kind.append(1); lay_a.append(L.items); lay_b.append(L.heads)
-            lay_c.append(1 if isinstance(L, _Fattn) else 0)
+            # 세 번째 칸: 0 스탠다드 / 1 플래시 / 2 리니어
+            lay_c.append(1 if isinstance(L, _Fattn) else 2 if isinstance(L, _Lattn) else 0)
             항목수 = L.items
             # 폭 그대로
         elif isinstance(L, _Conv):

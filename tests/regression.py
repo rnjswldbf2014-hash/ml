@@ -52,7 +52,7 @@ MODULE_DIR = os.path.join(SCRATCH, "_module")
 
 TOPOLOGIES = ["linear", "each", "attn", "mixed", "logic", "logic2", "logicmix",
               "conv", "conv2", "convmix", "memory", "memorymix",
-              "fattn", "fattn2", "fattnmix"]
+              "fattn", "fattn2", "fattnmix", "lattn", "lattn2", "lattnmix"]
 
 CONFIGS = [
     ("threads1", {"MYML_THREADS": "1"}),
